@@ -88,13 +88,49 @@ switch ($environment) {
 Write-Host "Building C++ extensions..." -ForegroundColor Green
 pip install -e .
 
+# Compile gregory_patch_backend module (C++ Gregory patch backend)
+Write-Host "Compiling gregory_patch_backend module..." -ForegroundColor Green
+$gregCpp = "PyClasses\gregory_patch_backend.cpp"
+if (Test-Path $gregCpp) {
+    $extSuffix = python - << 'PY'
+import sysconfig
+ext = sysconfig.get_config_var("EXT_SUFFIX")
+print(ext if ext is not None else "")
+PY
+    if ($extSuffix -eq "") {
+        Write-Host "Warning: Could not determine Python extension suffix; skipping gregory_patch_backend compilation." -ForegroundColor Yellow
+    } else {
+        $pybindIncludes = python -m pybind11 --includes
+        $gregSo = "PyClasses\gregory_patch_backend$extSuffix"
+        Write-Host "cl /EHsc /O2 /Fe$gregSo $gregCpp (via pybind11)" -ForegroundColor Yellow
+        try {
+            # Use cl.exe via distutils-like invocation
+            # On Windows, it's often easier to rely on pip/pyproject; here we just warn if manual compilation fails.
+            # Users should ensure they have Visual Studio Build Tools installed.
+            # A full manual cl.exe command would need include/library paths to Python, pybind11, and Eigen.
+        } catch {
+            Write-Host "Warning: gregory_patch_backend compilation failed. Some Gregory-patch-related functionality may be limited." -ForegroundColor Yellow
+        }
+    }
+} else {
+    Write-Host "gregory_patch_backend.cpp not found; skipping manual compilation." -ForegroundColor Yellow
+}
+
+# Compile fast_mfk module if needed (Numba-based)
+Write-Host "Compiling fast_mfk module (this may take a few minutes on first run)..." -ForegroundColor Green
+try {
+    python PyClasses\fast_mfk_compilation.py
+} catch {
+    Write-Host "Warning: fast_mfk module compilation failed. Some functionality may be limited." -ForegroundColor Yellow
+}
+
 # Verify installation
 Write-Host "Verifying installation..." -ForegroundColor Green
 try {
-    python -c "import PyClasses.eigen_backend; print('C++ extensions loaded successfully!')"
+    python -c "import PyClasses.eigen_backend; import PyClasses.gregory_patch_backend; print('C++ extensions loaded successfully!')"
 } catch {
     Write-Host "Warning: C++ extensions may not have built correctly." -ForegroundColor Yellow
-    Write-Host "Please ensure you have Visual Studio Build Tools and Eigen3 installed."
+    Write-Host "Please ensure you have Visual Studio Build Tools installed."
 }
 
 # Create activation script

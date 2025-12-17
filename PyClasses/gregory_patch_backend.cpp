@@ -684,9 +684,11 @@ py::tuple find_projection_tr(const Eigen::MatrixXd &CtrlPts,
 // Python-exposed wrapper for many patches / one point TR projection
 // CtrlPtsAll: stacked CtrlPts for all patches, shape (npatches*20, 3)
 // candidate_indices: 1D array of patch indices to consider
+// radii: 1D array of patch bounding-sphere radii, length npatches
 py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
                                    const Eigen::Vector3d &xs,
                                    py::array_t<int> candidate_indices,
+                                   py::array_t<double> radii,
                                    double eps,
                                    double TR_init,
                                    double TR_min,
@@ -706,6 +708,16 @@ py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
     }
     int nPatches = CtrlPtsAll.rows() / rows_per_patch;
 
+    // Radii array
+    auto rbuf = radii.request();
+    if (rbuf.ndim != 1) {
+        throw std::runtime_error("radii must be a 1D array");
+    }
+    if (static_cast<int>(rbuf.shape[0]) != nPatches) {
+        throw std::runtime_error("radii length must match number of patches");
+    }
+    double *r_ptr = static_cast<double*>(rbuf.ptr);
+
     double best_m = std::numeric_limits<double>::infinity();
     Eigen::Vector2d best_t(-1.0, -1.0);
     int best_patch = -1;
@@ -715,12 +727,43 @@ py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
         if (p_id < 0 || p_id >= nPatches) {
             throw std::runtime_error("candidate index out of range");
         }
+        double r = r_ptr[p_id];
+
         // View of CtrlPts for this patch: 20x3 block
         Eigen::MatrixXd CtrlPts = CtrlPtsAll.block(p_id * rows_per_patch, 0, rows_per_patch, 3);
         TRProjResult res = projection_tr_core(CtrlPts, xs, eps, TR_init, TR_min, TR_max);
-        if (res.m < best_m) {
-            best_m = res.m;
-            best_t = res.t;
+
+        Eigen::Vector2d t = res.t;
+        double u = t.x();
+        double v = t.y();
+
+        // If TR core did not find a valid seed, skip this patch
+        if (u < 0.0 || v < 0.0) {
+            continue;
+        }
+
+        // Geometric final check equivalent to proj_final_check in Python
+        bool inside = (u > 0.0 && u < 1.0 && v > 0.0 && v < 1.0);
+        if (!inside) {
+            double uc = std::min(1.0, std::max(0.0, u));
+            double vc = std::min(1.0, std::max(0.0, v));
+            Eigen::Vector3d xc0 = Grg(CtrlPts, uc, vc, eps);
+            Eigen::Vector3d nor0 = D3Grg(CtrlPts, uc, vc, eps, true);
+            Eigen::Vector3d diff0 = xs - xc0;
+            Eigen::Vector3d x_tang = diff0 - diff0.dot(nor0) * nor0;
+            if (x_tang.norm() > 2.0 * r / 100.0) {
+                // Equivalent to returning [-1,-1] and being discarded in Python
+                continue;
+            }
+        }
+
+        // Compute squared distance at the accepted parameters (as in Python)
+        Eigen::Vector3d xc = Grg(CtrlPts, u, v, eps);
+        double m_val = (xs - xc).squaredNorm();
+
+        if (m_val < best_m) {
+            best_m = m_val;
+            best_t = t;
             best_patch = p_id;
         }
     }

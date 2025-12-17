@@ -79,6 +79,7 @@ TR_max = 1.0
 # Precompute BS centers and flattened CtrlPts for all patches
 xm_matrix = np.array([patch.BS.x for patch in patches])                # (npatches, 3)
 CtrlPts_all = np.vstack([np.array(patch.flatCtrlPts()) for patch in patches])  # (npatches*20, 3)
+radii = np.array([patch.BS.r for patch in patches], dtype=np.float64)  # (npatches,)
 
 # Fully vectorized distance matrix for candidate selection
 distance_matrix = np.linalg.norm(xm_matrix[:, np.newaxis, :] - xs[np.newaxis, :, :], axis=2)  # (npatches, npoints)
@@ -97,6 +98,7 @@ for i, xsi in enumerate(xs):
         CtrlPts_all,
         xsi.astype(np.float64),
         candidates_i,
+        radii,
         patches[0].eps,
         TR_init,
         TR_min,
