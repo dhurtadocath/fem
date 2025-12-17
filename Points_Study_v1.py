@@ -76,36 +76,36 @@ TR_init = 1e-6   # initial radius as in original Python experiment
 TR_min = 1e-2
 TR_max = 1.0
 
-# Precompute BS centers and flattened CtrlPts for all patches
-xm_matrix = np.array([patch.BS.x for patch in patches])                # (npatches, 3)
-CtrlPts_all = np.vstack([np.array(patch.flatCtrlPts()) for patch in patches])  # (npatches*20, 3)
-
-# Fully vectorized distance matrix for candidate selection
-distance_matrix = np.linalg.norm(xm_matrix[:, np.newaxis, :] - xs[np.newaxis, :, :], axis=2)  # (npatches, npoints)
-
 OUTMAT_final = np.zeros((len(xs),23))
 
 stt = time()
 for i, xsi in enumerate(xs):
-    # Candidate patches for this point (nearest BS centers)
-    sorted_indices = np.argsort(distance_matrix[:, i])
-    candidates_i = sorted_indices[:45].astype(np.int32)  # choose nearest 45 patches
+    # Compute candidate patches for this point only (nearest BS centers)
+    xm_matrix = np.array([patch.BS.x for patch in patches])
+    raw_distances = np.linalg.norm(xm_matrix - xsi, axis=1)
+    sorted_indices = np.argsort(raw_distances)
+    candidates_i = sorted_indices[:45]  # choose nearest 45 patches
 
-    # Use C++ backend to get best patch and parameters among candidates
-    from PyClasses import gregory_patch_backend as gb
-    best_patch, t1, t2, m_best = gb.find_projection_tr_multi(
-        CtrlPts_all,
-        xsi.astype(np.float64),
-        candidates_i,
-        patches[0].eps,
-        TR_init,
-        TR_min,
-        TR_max,
-    )
+    OUTMAT = np.zeros((len(candidates_i), 4))
 
-    p_id = int(best_patch)
+    for ip, patch_id in enumerate(candidates_i):
+        t_proj = patches[patch_id].findProjection_TR(
+            xsi,
+            TR_init=TR_init,
+            TR_min=TR_min,
+            TR_max=TR_max,
+        )
+        if (t_proj < 0).any():
+            OUTMAT[ip, :] = [1e10, -1.0, -1.0, patch_id]
+        else:
+            xc_candidate = patches[patch_id].Grg0(t_proj)
+            m_val = np.linalg.norm(xsi - xc_candidate)**2
+            OUTMAT[ip, :] = [m_val, t_proj[0], t_proj[1], patch_id]
+
+    idx_min = np.argmin(OUTMAT[:, 0])
+    p_id = int(OUTMAT[idx_min, 3])
     print("Closest patch id:", p_id)
-    t1t2_min = np.array([t1, t2])
+    t1t2_min = OUTMAT[idx_min, 1:3]
     xc_min, dxcdt, d2xcd2t = patches[p_id].Grg(t1t2_min, deriv=2)
     D1p, D2p = dxcdt.T
     D3p = np.cross(D1p,D2p)

@@ -488,13 +488,19 @@ py::tuple find_projection(const Eigen::MatrixXd &CtrlPts, const Eigen::Vector3d 
     return py::make_tuple(t.x(), t.y());
 }
 
-// Trust-region projection with 9 fixed seeds (t1t2_init) and TR-CG step
-py::tuple find_projection_tr(const Eigen::MatrixXd &CtrlPts,
-                             const Eigen::Vector3d &xs,
-                             double eps,
-                             double TR_init,
-                             double TR_min,
-                             double TR_max)
+// Internal result struct for TR projection
+struct TRProjResult {
+    Eigen::Vector2d t;
+    double m;
+};
+
+// Core trust-region projection with 9 fixed seeds (t1t2_init) and TR-CG step
+TRProjResult projection_tr_core(const Eigen::MatrixXd &CtrlPts,
+                                const Eigen::Vector3d &xs,
+                                double eps,
+                                double TR_init,
+                                double TR_min,
+                                double TR_max)
 {
     // Fixed 3x3 grid seeds in parameter space
     static const double seeds[9][2] = {
@@ -508,6 +514,12 @@ py::tuple find_projection_tr(const Eigen::MatrixXd &CtrlPts,
     double best_m = std::numeric_limits<double>::infinity();
     Eigen::Vector2d best_t(-1.0, -1.0);
 
+    // Objects reused across iterations to avoid repeated allocations
+    Eigen::Matrix<double, 3, 2> dxcdt;
+    Eigen::Vector2d f;
+    Eigen::Matrix2d K;
+    Eigen::Vector2d r, p, q, h;
+
     // Loop over the 9 initial seeds
     for (int s = 0; s < 9; ++s) {
         Eigen::Vector2d t(seeds[s][0], seeds[s][1]);
@@ -518,10 +530,6 @@ py::tuple find_projection_tr(const Eigen::MatrixXd &CtrlPts,
         double m_old = 1.0e10;
         double TR_radius = TR_init;
         bool flag_new_u = true;
-
-        // Gradient and Hessian storage (reused when only TR radius changes)
-        Eigen::Vector2d f;
-        Eigen::Matrix2d K;
 
         // Outer TR loop: stop when objective stops decreasing or trust region becomes too small/outside domain
         while (m_new < m_old) {
@@ -535,7 +543,6 @@ py::tuple find_projection_tr(const Eigen::MatrixXd &CtrlPts,
                 Eigen::Vector3d D1D2p = derivs2[4].cast<Eigen::Vector3d>();
                 Eigen::Vector3d D2D2p = derivs2[5].cast<Eigen::Vector3d>();
 
-                Eigen::Matrix<double, 3, 2> dxcdt;
                 dxcdt.col(0) = D1p;
                 dxcdt.col(1) = D2p;
 
@@ -552,10 +559,10 @@ py::tuple find_projection_tr(const Eigen::MatrixXd &CtrlPts,
             }
 
             // Trust-region CG step for this (f, K)
-            Eigen::Vector2d r = -f;
-            Eigen::Vector2d p = r;
-            Eigen::Vector2d q = p;
-            Eigen::Vector2d h = Eigen::Vector2d::Zero();
+            r = -f;
+            p = r;
+            q = p;
+            h.setZero();
             bool flag_boundary_reached = false;
 
             // Inner CG loop
@@ -656,7 +663,69 @@ py::tuple find_projection_tr(const Eigen::MatrixXd &CtrlPts,
         }
     } // end loop over seeds
 
-    return py::make_tuple(best_t.x(), best_t.y(), best_m);
+    TRProjResult result;
+    result.t = best_t;
+    result.m = best_m;
+    return result;
+}
+
+// Python-exposed wrapper for single-patch TR projection
+py::tuple find_projection_tr(const Eigen::MatrixXd &CtrlPts,
+                             const Eigen::Vector3d &xs,
+                             double eps,
+                             double TR_init,
+                             double TR_min,
+                             double TR_max)
+{
+    TRProjResult res = projection_tr_core(CtrlPts, xs, eps, TR_init, TR_min, TR_max);
+    return py::make_tuple(res.t.x(), res.t.y(), res.m);
+}
+
+// Python-exposed wrapper for many patches / one point TR projection
+// CtrlPtsAll: stacked CtrlPts for all patches, shape (npatches*20, 3)
+// candidate_indices: 1D array of patch indices to consider
+py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
+                                   const Eigen::Vector3d &xs,
+                                   py::array_t<int> candidate_indices,
+                                   double eps,
+                                   double TR_init,
+                                   double TR_min,
+                                   double TR_max)
+{
+    auto buf = candidate_indices.request();
+    if (buf.ndim != 1) {
+        throw std::runtime_error("candidate_indices must be a 1D array");
+    }
+    int nCand = static_cast<int>(buf.shape[0]);
+    int *idx_ptr = static_cast<int*>(buf.ptr);
+
+    // Each patch contributes 20 control points
+    const int rows_per_patch = 20;
+    if (CtrlPtsAll.rows() % rows_per_patch != 0) {
+        throw std::runtime_error("CtrlPtsAll.rows() must be a multiple of 20");
+    }
+    int nPatches = CtrlPtsAll.rows() / rows_per_patch;
+
+    double best_m = std::numeric_limits<double>::infinity();
+    Eigen::Vector2d best_t(-1.0, -1.0);
+    int best_patch = -1;
+
+    for (int k = 0; k < nCand; ++k) {
+        int p_id = idx_ptr[k];
+        if (p_id < 0 || p_id >= nPatches) {
+            throw std::runtime_error("candidate index out of range");
+        }
+        // View of CtrlPts for this patch: 20x3 block
+        Eigen::MatrixXd CtrlPts = CtrlPtsAll.block(p_id * rows_per_patch, 0, rows_per_patch, 3);
+        TRProjResult res = projection_tr_core(CtrlPts, xs, eps, TR_init, TR_min, TR_max);
+        if (res.m < best_m) {
+            best_m = res.m;
+            best_t = res.t;
+            best_patch = p_id;
+        }
+    }
+
+    return py::make_tuple(best_patch, best_t.x(), best_t.y(), best_m);
 }
 
 // BoundingSphere ContainsNode function - rigorous translation of Python logic
@@ -781,6 +850,7 @@ PYBIND11_MODULE(gregory_patch_backend, m) {
           "A function that calculates the minimum distance with full parameters");
     m.def("find_projection", &find_projection, "A function that finds the projection of a point onto a Gregory patch");
     m.def("find_projection_tr", &find_projection_tr, "Trust-region projection of a point onto a Gregory patch");
+    m.def("find_projection_tr_multi", &find_projection_tr_multi, "Trust-region projection for many patches and one point");
     m.def("D3Grg", &D3Grg, "Calculate the normal vector at (u,v) on Gregory patch", py::arg("CtrlPts"), py::arg("u"), py::arg("v"), py::arg("eps"), py::arg("normalize")=true);
     m.def("ContainsNode", &ContainsNode, "Check if a point is contained within a bounding sphere");
     m.def("ContainsNodes", &ContainsNodes, "Vectorized check if multiple points are contained within a bounding sphere");
