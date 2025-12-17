@@ -3,6 +3,7 @@
 #include <Eigen/Dense>
 #include <Eigen/LU>
 #include <cmath>
+#include <limits>
 
 namespace py = pybind11;
 
@@ -487,6 +488,177 @@ py::tuple find_projection(const Eigen::MatrixXd &CtrlPts, const Eigen::Vector3d 
     return py::make_tuple(t.x(), t.y());
 }
 
+// Trust-region projection with 9 fixed seeds (t1t2_init) and TR-CG step
+py::tuple find_projection_tr(const Eigen::MatrixXd &CtrlPts,
+                             const Eigen::Vector3d &xs,
+                             double eps,
+                             double TR_init,
+                             double TR_min,
+                             double TR_max)
+{
+    // Fixed 3x3 grid seeds in parameter space
+    static const double seeds[9][2] = {
+        {0.0, 0.0}, {0.5, 0.0}, {1.0, 0.0},
+        {0.0, 0.5}, {0.5, 0.5}, {1.0, 0.5},
+        {0.0, 1.0}, {0.5, 1.0}, {1.0, 1.0}
+    };
+
+    const double eps_min = 1e-15;   // parameter bounds tolerance (as in Python)
+
+    double best_m = std::numeric_limits<double>::infinity();
+    Eigen::Vector2d best_t(-1.0, -1.0);
+
+    // Loop over the 9 initial seeds
+    for (int s = 0; s < 9; ++s) {
+        Eigen::Vector2d t(seeds[s][0], seeds[s][1]);
+
+        // Initial objective at seed
+        Eigen::Vector3d xc0 = Grg(CtrlPts, t.x(), t.y(), eps);
+        double m_new = (xs - xc0).squaredNorm();
+        double m_old = 1.0e10;
+        double TR_radius = TR_init;
+        bool flag_new_u = true;
+
+        // Gradient and Hessian storage (reused when only TR radius changes)
+        Eigen::Vector2d f;
+        Eigen::Matrix2d K;
+
+        // Outer TR loop: stop when objective stops decreasing or trust region becomes too small/outside domain
+        while (m_new < m_old) {
+            if (flag_new_u) {
+                // Compute xc, first and second derivatives
+                py::tuple derivs2 = Grg_derivs2(CtrlPts, t.x(), t.y(), eps);
+                Eigen::Vector3d xc = derivs2[0].cast<Eigen::Vector3d>();
+                Eigen::Vector3d D1p = derivs2[1].cast<Eigen::Vector3d>();
+                Eigen::Vector3d D2p = derivs2[2].cast<Eigen::Vector3d>();
+                Eigen::Vector3d D1D1p = derivs2[3].cast<Eigen::Vector3d>();
+                Eigen::Vector3d D1D2p = derivs2[4].cast<Eigen::Vector3d>();
+                Eigen::Vector3d D2D2p = derivs2[5].cast<Eigen::Vector3d>();
+
+                Eigen::Matrix<double, 3, 2> dxcdt;
+                dxcdt.col(0) = D1p;
+                dxcdt.col(1) = D2p;
+
+                Eigen::Vector3d diff = xc - xs;
+
+                // Gradient of m(t) = ||x(t) - xs||^2 in parameter space
+                f = 2.0 * dxcdt.transpose() * diff;
+
+                // Hessian of m(t) as in Python: 2*(J^T J + sum_i diff_i * H_i)
+                K(0,0) = 2.0 * (D1p.dot(D1p) + diff.dot(D1D1p));
+                K(0,1) = 2.0 * (D1p.dot(D2p) + diff.dot(D1D2p));
+                K(1,0) = K(0,1);
+                K(1,1) = 2.0 * (D2p.dot(D2p) + diff.dot(D2D2p));
+            }
+
+            // Trust-region CG step for this (f, K)
+            Eigen::Vector2d r = -f;
+            Eigen::Vector2d p = r;
+            Eigen::Vector2d q = p;
+            Eigen::Vector2d h = Eigen::Vector2d::Zero();
+            bool flag_boundary_reached = false;
+
+            // Inner CG loop
+            while (true) {
+                double pKp = p.transpose() * K * p;
+                if (pKp <= 0.0) {
+                    // Negative curvature: go to boundary in direction p
+                    flag_boundary_reached = true;
+                    double a = p.squaredNorm();
+                    double b = 2.0 * p.dot(h);
+                    double c = h.squaredNorm() - TR_radius * TR_radius;
+                    double disc = b * b - 4.0 * a * c;
+                    if (disc < 0.0) disc = 0.0;
+                    double alpha = (-b + std::sqrt(disc)) / (2.0 * a);
+                    h += alpha * p;
+                    break;
+                }
+
+                double rq = r.dot(q);
+                double alpha = rq / pKp;
+
+                // Check if proposed step exceeds trust region
+                Eigen::Vector2d h_trial = h + alpha * p;
+                if (h_trial.squaredNorm() >= TR_radius * TR_radius) {
+                    flag_boundary_reached = true;
+                    double a = p.squaredNorm();
+                    double b = 2.0 * p.dot(h);
+                    double c = h.squaredNorm() - TR_radius * TR_radius;
+                    double disc = b * b - 4.0 * a * c;
+                    if (disc < 0.0) disc = 0.0;
+                    double alpha_boundary = (-b + std::sqrt(disc)) / (2.0 * a);
+                    h += alpha_boundary * p;
+                    break;
+                }
+
+                h = h_trial;
+                double phi = r.dot(p);
+                r -= alpha * (K * p);
+
+                double norm_r = r.norm();
+                double norm_f = f.norm();
+                double tol_r = std::max(1e-15, 1e-5 * norm_f);
+                if (norm_r < tol_r) {
+                    break;
+                }
+
+                q = r;
+                double beta = r.dot(q) / phi;
+                p = q + beta * p;
+            } // end CG loop
+
+            // Evaluate new objective at t + h
+            Eigen::Vector2d t_new = t + h;
+            Eigen::Vector3d xc_new = Grg(CtrlPts, t_new.x(), t_new.y(), eps);
+            double m_new_plus_h = (xs - xc_new).squaredNorm();
+
+            // Predicted reduction from quadratic model
+            double hKh = (h.transpose() * K * h)(0,0);
+            double pred = -f.dot(h) - 0.5 * hKh;
+            double ratio;
+            if (std::abs(pred) < 1e-30) {
+                ratio = 0.0;
+            } else {
+                ratio = (m_new - m_new_plus_h) / pred;
+            }
+
+            if (ratio < 0.25) {
+                TR_radius *= 0.25;
+                flag_new_u = false;
+            } else {
+                t = t_new;
+                if (ratio > 0.75 && flag_boundary_reached) {
+                    TR_radius = std::min(2.0 * TR_radius, TR_max);
+                }
+                flag_new_u = true;
+            }
+
+            // Stopping criteria: small TR radius or t too far from patch
+            if (TR_radius < TR_min ||
+                t.x() < -0.5 || t.x() > 1.5 ||
+                t.y() < -0.5 || t.y() > 1.5) {
+                break;
+            }
+
+            if (flag_new_u) {
+                m_old = m_new;
+                m_new = m_new_plus_h;
+            }
+        } // end outer TR loop for this seed
+
+        // Keep best (within [eps_min, 1] for both parameters)
+        if (t.x() >= eps_min && t.x() <= 1.0 &&
+            t.y() >= eps_min && t.y() <= 1.0) {
+            if (m_new < best_m) {
+                best_m = m_new;
+                best_t = t;
+            }
+        }
+    } // end loop over seeds
+
+    return py::make_tuple(best_t.x(), best_t.y(), best_m);
+}
+
 // BoundingSphere ContainsNode function - rigorous translation of Python logic
 bool ContainsNode(const Eigen::Vector3d &sphere_center, double sphere_radius, const Eigen::Vector3d &point) {
     // Exact translation of: return norm(xp-self.x) <= self.r
@@ -608,6 +780,7 @@ PYBIND11_MODULE(gregory_patch_backend, m) {
     m.def("MinDist", py::overload_cast<const Eigen::MatrixXd&, const Eigen::Vector3d&, int, double, double, double, double, double, bool, int, double, double>(&MinDist), 
           "A function that calculates the minimum distance with full parameters");
     m.def("find_projection", &find_projection, "A function that finds the projection of a point onto a Gregory patch");
+    m.def("find_projection_tr", &find_projection_tr, "Trust-region projection of a point onto a Gregory patch");
     m.def("D3Grg", &D3Grg, "Calculate the normal vector at (u,v) on Gregory patch", py::arg("CtrlPts"), py::arg("u"), py::arg("v"), py::arg("eps"), py::arg("normalize")=true);
     m.def("ContainsNode", &ContainsNode, "Check if a point is contained within a bounding sphere");
     m.def("ContainsNodes", &ContainsNodes, "Vectorized check if multiple points are contained within a bounding sphere");

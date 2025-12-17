@@ -394,6 +394,48 @@ class GrgPatch:
 
         return t if decimals is None else t.round(decimals)
 
+    def findProjection_TR(self, xs, TR_init=1e-3, TR_min=1e-12, TR_max=1.0, decimals=None):
+        """Trust-region based projection using 9 fixed seeds in (t1, t2).
+
+        Parameters
+        ----------
+        xs : array_like
+            Point in R^3 to project.
+        TR_init : float, optional
+            Initial trust-region radius used in the C++ TR solver.
+        TR_min : float, optional
+            Minimum trust-region radius used in the C++ TR solver.
+        TR_max : float, optional
+            Maximum trust-region radius used in the C++ TR solver.
+        decimals : int or None, optional
+            If not None, round the returned parameters to this many decimals.
+        """
+
+        def proj_final_check(xs_local, t_local):
+            # final check (for points at/beyond edges) - same as in findProjection
+            if not (0 < t_local[0] < 1 and 0 < t_local[1] < 1):  # Camilo
+                t1 = min(max(0.0, t_local[0]), 1.0)
+                t2 = min(max(0.0, t_local[1]), 1.0)
+                xc0 = self.Grg0([t1, t2])
+                nor0 = self.D3Grg([t1, t2])
+                x_tang = (xs_local - xc0) - (xs_local - xc0) @ nor0
+                if norm(x_tang) > 2 * self.BS.r / 100:
+                    return np.array([-1.0, -1.0])
+            return t_local
+
+        u, v, _ = gregory_patch_backend.find_projection_tr(
+            np.array(self.flatCtrlPts()),
+            xs.astype(np.float64),
+            self.eps,
+            TR_init,
+            TR_min,
+            TR_max
+        )
+
+        t = np.array([u, v])
+        t = proj_final_check(xs, t)
+        return t if decimals is None else t.round(decimals)
+
     # xc derivs
     def dxcdxi(self,t):     # 20 scalars to be converted into diagonal matrices each
         t1,t2 = t
