@@ -26,3 +26,5 @@ PyClasses/__pycache__/
 *.prof
 */build
 oldScriptsVersions/
+for_HPC
+Legacy/

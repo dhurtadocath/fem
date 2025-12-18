@@ -72,8 +72,8 @@ patches = model.bodies[0].surf.patches
 npatches = len(patches)
 
 # Trust-region parameters for projection
-TR_init = 1e-6   # initial radius as in original Python experiment
-TR_min = 1e-2
+TR_init = 0.1   # initial radius as in original Python experiment
+TR_min = 1e-12
 TR_max = 1.0
 
 # Precompute BS centers and flattened CtrlPts for all patches
@@ -90,7 +90,7 @@ stt = time()
 for i, xsi in enumerate(xs):
     # Candidate patches for this point (nearest BS centers)
     sorted_indices = np.argsort(distance_matrix[:, i])
-    candidates_i = sorted_indices[:45].astype(np.int32)  # choose nearest 45 patches
+    candidates_i = sorted_indices[:5].astype(np.int32)  # choose nearest 45 patches
 
     # Use C++ backend to get best patch and parameters among candidates
     from PyClasses import gregory_patch_backend as gb

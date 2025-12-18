@@ -5,7 +5,8 @@ import sys, os, pickle
 import numpy as np
 from time import time
 import matplotlib.pyplot as plt
-
+from PyClasses import gregory_patch_backend as gb
+gb.reset_tr_stats()
 # POTATO
 [ptt] = pickle.load(open("PointsCreation/PotatoAssembly.dat","rb"))
 ptt.isRigid = True     # faster solving when True
@@ -72,19 +73,21 @@ patches = model.bodies[0].surf.patches
 npatches = len(patches)
 
 # Trust-region parameters for projection
-TR_init = 1e-6   # initial radius as in original Python experiment
-TR_min = 1e-2
+TR_init = 0.1   # initial radius as in original Python experiment
+TR_min = 1e-12
 TR_max = 1.0
 
 OUTMAT_final = np.zeros((len(xs),23))
 
+# Precompute BS centers once (used for candidate selection)
+xm_matrix = np.array([patch.BS.x for patch in patches])
+
 stt = time()
 for i, xsi in enumerate(xs):
     # Compute candidate patches for this point only (nearest BS centers)
-    xm_matrix = np.array([patch.BS.x for patch in patches])
     raw_distances = np.linalg.norm(xm_matrix - xsi, axis=1)
     sorted_indices = np.argsort(raw_distances)
-    candidates_i = sorted_indices[:45]  # choose nearest 45 patches
+    candidates_i = sorted_indices[:5]  # choose nearest 45 patches
 
     OUTMAT = np.zeros((len(candidates_i), 4))
 
@@ -126,3 +129,4 @@ for i, xsi in enumerate(xs):
                          nor[0], nor[1], nor[2], \
                          dndxs[0,0], dndxs[0,1], dndxs[0,2], dndxs[1,0], dndxs[1,1], dndxs[1,2], dndxs[2,0], dndxs[2,1], dndxs[2,2] ]
 print("Total time for point projection:", time() - stt)
+print("TR stats (C++):", gb.get_tr_stats())

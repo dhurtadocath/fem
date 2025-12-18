@@ -84,7 +84,7 @@ for i,xsi in enumerate(xs):
     
     raw_distances = distance_matrix[:,i]
     sorted_indices = np.argsort(raw_distances)
-    candidates.append(sorted_indices[0:45])
+    candidates.append(sorted_indices[0:5])
 candidates = np.array(candidates)
 
 # TR method to find closest point on surface patch
@@ -92,9 +92,12 @@ t1t2_init = [[0,0],[0.5,0],[1,0],[0,0.5],[0.5,0.5],[1,0.5],[0,1.0],[0.5,1.0],[1,
 eps_min = 1e-15
 
 TR_max = 1.0
-TR_min = 1e-2 #1e-12
+TR_min = 1e-12 #1e-2 #1e-12
 TR_init = 0.1
 OUTMAT_final = np.zeros((len(xs),23))
+
+# Diagnostics: count total outer TR iterations (for profiling)
+TR_outer_iters_total = 0
 
 stt = time()
 for i,xsi in enumerate(xs):
@@ -111,9 +114,10 @@ for i,xsi in enumerate(xs):
             flag_new_u = 1.0
             cnt1 = 0
             
-            TR_radius = 0.000001#0.01
+            TR_radius = TR_init #0.000001#0.01
             while m_new < m_old:
                 cnt1 += 1
+                TR_outer_iters_total += 1
                 #print("cnt1", cnt1)
                 # print("t1t2", t1t2)
                 if flag_new_u ==1:
@@ -221,3 +225,4 @@ for i,xsi in enumerate(xs):
                          nor[0], nor[1], nor[2], \
                          dndxs[0,0], dndxs[0,1], dndxs[0,2], dndxs[1,0], dndxs[1,1], dndxs[1,2], dndxs[2,0], dndxs[2,1], dndxs[2,2] ]
 print("Total time for point projection:", time() - stt)
+print("Total TR outer iterations (v0):", TR_outer_iters_total)
