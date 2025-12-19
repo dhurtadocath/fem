@@ -124,11 +124,28 @@ Eigen::Vector3d Grg(const Eigen::MatrixXd &CtrlPts, double u, double v, double e
     return p;
 }
 
-// Grg_derivs function
-py::tuple Grg_derivs(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps) {
-    Eigen::Vector3d p = Eigen::Vector3d::Zero();
-    Eigen::Vector3d D1p = Eigen::Vector3d::Zero();
-    Eigen::Vector3d D2p = Eigen::Vector3d::Zero();
+// Structs for derivative results (pure C++)
+struct GrgDerivsResult {
+    Eigen::Vector3d p;
+    Eigen::Vector3d D1p;
+    Eigen::Vector3d D2p;
+};
+
+struct GrgDerivs2Result {
+    Eigen::Vector3d p;
+    Eigen::Vector3d D1p;
+    Eigen::Vector3d D2p;
+    Eigen::Vector3d D1D1p;
+    Eigen::Vector3d D1D2p;
+    Eigen::Vector3d D2D2p;
+};
+
+// Internal implementation of Grg_derivs (no pybind types)
+GrgDerivsResult Grg_derivs_impl(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps) {
+    GrgDerivsResult res;
+    res.p.setZero();
+    res.D1p.setZero();
+    res.D2p.setZero();
     int n = 3;
     int m = 3;
 
@@ -139,8 +156,7 @@ py::tuple Grg_derivs(const Eigen::MatrixXd &CtrlPts, double u, double v, double 
             Eigen::Vector3d D2xij = Eigen::Vector3d::Zero();
 
             if (i >= 1 && i <= 2 && j >= 1 && j <= 2) {
-                Eigen::Vector3d cp1;
-                Eigen::Vector3d cp2;
+                Eigen::Vector3d cp1, cp2;
 
                 if (i == 1 && j == 1) {
                     cp1 = CtrlPts.row(12);
@@ -188,25 +204,32 @@ py::tuple Grg_derivs(const Eigen::MatrixXd &CtrlPts, double u, double v, double 
 
             double Bi = Bernstein(n, i, u);
             double Bj = Bernstein(m, j, v);
-            double D1Bi = dnBernstein(n, i, u, 1);  // Match original Python exactly
-            double D2Bj = dnBernstein(m, j, v, 1);  // Match original Python exactly
+            double D1Bi = dnBernstein(n, i, u, 1);
+            double D2Bj = dnBernstein(m, j, v, 1);
 
-            p += Bi * Bj * xij;
-            D1p += D1Bi * Bj * xij + Bi * Bj * D1xij;
-            D2p += Bi * D2Bj * xij + Bi * Bj * D2xij;
+            res.p += Bi * Bj * xij;
+            res.D1p += D1Bi * Bj * xij + Bi * Bj * D1xij;
+            res.D2p += Bi * D2Bj * xij + Bi * Bj * D2xij;
         }
     }
-    return py::make_tuple(p, D1p, D2p);
+    return res;
 }
 
-// Grg_derivs2 function
-py::tuple Grg_derivs2(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps) {
-    Eigen::Vector3d p = Eigen::Vector3d::Zero();
-    Eigen::Vector3d D1p = Eigen::Vector3d::Zero();
-    Eigen::Vector3d D2p = Eigen::Vector3d::Zero();
-    Eigen::Vector3d D1D1p = Eigen::Vector3d::Zero();
-    Eigen::Vector3d D1D2p = Eigen::Vector3d::Zero();
-    Eigen::Vector3d D2D2p = Eigen::Vector3d::Zero();
+// pybind wrapper for Grg_derivs
+py::tuple Grg_derivs(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps) {
+    GrgDerivsResult res = Grg_derivs_impl(CtrlPts, u, v, eps);
+    return py::make_tuple(res.p, res.D1p, res.D2p);
+}
+
+// Internal implementation of Grg_derivs2 (no pybind types)
+GrgDerivs2Result Grg_derivs2_impl(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps) {
+    GrgDerivs2Result res;
+    res.p.setZero();
+    res.D1p.setZero();
+    res.D2p.setZero();
+    res.D1D1p.setZero();
+    res.D1D2p.setZero();
+    res.D2D2p.setZero();
     int n = 3;
     int m = 3;
 
@@ -220,8 +243,7 @@ py::tuple Grg_derivs2(const Eigen::MatrixXd &CtrlPts, double u, double v, double
             Eigen::Vector3d D22xij = Eigen::Vector3d::Zero();
 
             if (i >= 1 && i <= 2 && j >= 1 && j <= 2) {
-                Eigen::Vector3d cp1;
-                Eigen::Vector3d cp2;
+                Eigen::Vector3d cp1, cp2;
 
                 if (i == 1 && j == 1) {
                     cp1 = CtrlPts.row(12);
@@ -281,20 +303,27 @@ py::tuple Grg_derivs2(const Eigen::MatrixXd &CtrlPts, double u, double v, double
 
             double Bi = Bernstein(n, i, u);
             double Bj = Bernstein(m, j, v);
-            double D1Bi = dnBernstein(n, i, u, 1);  // Match original Python exactly
-            double D2Bj = dnBernstein(m, j, v, 1);  // Match original Python exactly
-            double DD1Bi = dnBernstein(n, i, u, 2);  // Match original Python exactly
-            double DD2Bj = dnBernstein(m, j, v, 2);  // Match original Python exactly
+            double D1Bi = dnBernstein(n, i, u, 1);
+            double D2Bj = dnBernstein(m, j, v, 1);
+            double DD1Bi = dnBernstein(n, i, u, 2);
+            double DD2Bj = dnBernstein(m, j, v, 2);
 
-            p += Bi * Bj * xij;
-            D1p += D1Bi * Bj * xij + Bi * Bj * D1xij;
-            D2p += Bi * D2Bj * xij + Bi * Bj * D2xij;
-            D1D1p += (DD1Bi * xij + 2 * D1Bi * D1xij + Bi * D11xij) * Bj;
-            D1D2p += D1Bi * D2Bj * xij + D1Bi * Bj * D2xij + Bi * D2Bj * D1xij + Bi * Bj * D12xij;
-            D2D2p += (DD2Bj * xij + 2 * D2Bj * D2xij + Bj * D22xij) * Bi;
+            res.p      += Bi * Bj * xij;
+            res.D1p    += D1Bi * Bj * xij + Bi * Bj * D1xij;
+            res.D2p    += Bi * D2Bj * xij + Bi * Bj * D2xij;
+            res.D1D1p  += (DD1Bi * xij + 2.0 * D1Bi * D1xij + Bi * D11xij) * Bj;
+            res.D1D2p  += D1Bi * D2Bj * xij + D1Bi * Bj * D2xij + Bi * D2Bj * D1xij + Bi * Bj * D12xij;
+            res.D2D2p  += (DD2Bj * xij + 2.0 * D2Bj * D2xij + Bj * D22xij) * Bi;
         }
     }
-    return py::make_tuple(p, D1p, D2p, D1D1p, D1D2p, D2D2p);
+
+    return res;
+}
+
+// pybind wrapper for Grg_derivs2
+py::tuple Grg_derivs2(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps) {
+    GrgDerivs2Result res = Grg_derivs2_impl(CtrlPts, u, v, eps);
+    return py::make_tuple(res.p, res.D1p, res.D2p, res.D1D1p, res.D1D2p, res.D2D2p);
 }
 
 // Micro-optimized MinDist - maintains exact Python logic with performance improvements
@@ -494,6 +523,71 @@ struct TRProjResult {
     double m;
 };
 
+// Helper for TR subproblem (Steihaug-CG), ported from legacy backend
+std::pair<Eigen::Vector2d, bool> tr_subproblem(const Eigen::Vector2d &f,
+                                               const Eigen::Matrix2d &K,
+                                               double delta) {
+    Eigen::Vector2d r = -f;
+    Eigen::Vector2d p = r;
+    Eigen::Vector2d q = r;
+    Eigen::Vector2d h = Eigen::Vector2d::Zero();
+
+    // Early exit if gradient is already small
+    if (r.norm() < std::max(1e-15, 1e-5 * f.norm())) {
+        return std::make_pair(h, false);
+    }
+
+    int iter = 0;
+    while (true) {
+        if (iter++ > 10) break;  // Safety cap as in legacy implementation
+
+        double pKp = p.dot(K * p);
+        if (pKp <= 0.0) {
+            // Negative curvature: step to boundary
+            double a_coeff = p.squaredNorm();
+            double b_coeff = 2.0 * h.dot(p);
+            double c_coeff = h.squaredNorm() - delta * delta;
+            double disc = b_coeff * b_coeff - 4.0 * a_coeff * c_coeff;
+            if (disc < 0.0) disc = 0.0;
+            double alpha = (-b_coeff + std::sqrt(disc)) / (2.0 * a_coeff);
+            h += alpha * p;
+            return std::make_pair(h, true);
+        }
+
+        double alpha = r.dot(q) / pKp;
+
+        // Check if proposed step hits boundary
+        Eigen::Vector2d h_trial = h + alpha * p;
+        if (h_trial.squaredNorm() >= delta * delta) {
+            double a_coeff = p.squaredNorm();
+            double b_coeff = 2.0 * h.dot(p);
+            double c_coeff = h.squaredNorm() - delta * delta;
+            double disc = b_coeff * b_coeff - 4.0 * a_coeff * c_coeff;
+            if (disc < 0.0) disc = 0.0;
+            double alpha_bd = (-b_coeff + std::sqrt(disc)) / (2.0 * a_coeff);
+            h += alpha_bd * p;
+            return std::make_pair(h, true);
+        }
+
+        h = h_trial;
+        double phi = r.dot(p);
+
+        Eigen::Vector2d r_new = r - alpha * (K * p);
+        if (r_new.norm() < std::max(1e-15, 1e-5 * f.norm())) {
+            break;
+        }
+
+        double numerator = r_new.dot(r_new);
+        double beta = numerator / phi;
+        p = r_new + beta * p;
+
+        r = r_new;
+        q = r;
+    }
+
+    return std::make_pair(h, false);
+}
+
 // Core trust-region projection with 9 fixed seeds (t1t2_init) and TR-CG step
 TRProjResult projection_tr_core(const Eigen::MatrixXd &CtrlPts,
                                 const Eigen::Vector3d &xs,
@@ -518,7 +612,6 @@ TRProjResult projection_tr_core(const Eigen::MatrixXd &CtrlPts,
     Eigen::Matrix<double, 3, 2> dxcdt;
     Eigen::Vector2d f;
     Eigen::Matrix2d K;
-    Eigen::Vector2d r, p, q, h;
 
     // Loop over the 9 initial seeds
     for (int s = 0; s < 9; ++s) {
@@ -534,17 +627,12 @@ TRProjResult projection_tr_core(const Eigen::MatrixXd &CtrlPts,
         // Outer TR loop: stop when objective stops decreasing or trust region becomes too small/outside domain
         while (m_new < m_old) {
             if (flag_new_u) {
-                // Compute xc, first and second derivatives
-                py::tuple derivs2 = Grg_derivs2(CtrlPts, t.x(), t.y(), eps);
-                Eigen::Vector3d xc = derivs2[0].cast<Eigen::Vector3d>();
-                Eigen::Vector3d D1p = derivs2[1].cast<Eigen::Vector3d>();
-                Eigen::Vector3d D2p = derivs2[2].cast<Eigen::Vector3d>();
-                Eigen::Vector3d D1D1p = derivs2[3].cast<Eigen::Vector3d>();
-                Eigen::Vector3d D1D2p = derivs2[4].cast<Eigen::Vector3d>();
-                Eigen::Vector3d D2D2p = derivs2[5].cast<Eigen::Vector3d>();
+                // Compute xc, first and second derivatives using the pure C++ core
+                GrgDerivs2Result d2 = Grg_derivs2_impl(CtrlPts, t.x(), t.y(), eps);
+                Eigen::Vector3d xc = d2.p;
 
-                dxcdt.col(0) = D1p;
-                dxcdt.col(1) = D2p;
+                dxcdt.col(0) = d2.D1p;
+                dxcdt.col(1) = d2.D2p;
 
                 Eigen::Vector3d diff = xc - xs;
 
@@ -552,67 +640,16 @@ TRProjResult projection_tr_core(const Eigen::MatrixXd &CtrlPts,
                 f = 2.0 * dxcdt.transpose() * diff;
 
                 // Hessian of m(t) as in Python: 2*(J^T J + sum_i diff_i * H_i)
-                K(0,0) = 2.0 * (D1p.dot(D1p) + diff.dot(D1D1p));
-                K(0,1) = 2.0 * (D1p.dot(D2p) + diff.dot(D1D2p));
+                K(0,0) = 2.0 * (d2.D1p.dot(d2.D1p) + diff.dot(d2.D1D1p));
+                K(0,1) = 2.0 * (d2.D1p.dot(d2.D2p) + diff.dot(d2.D1D2p));
                 K(1,0) = K(0,1);
-                K(1,1) = 2.0 * (D2p.dot(D2p) + diff.dot(D2D2p));
+                K(1,1) = 2.0 * (d2.D2p.dot(d2.D2p) + diff.dot(d2.D2D2p));
             }
 
-            // Trust-region CG step for this (f, K)
-            r = -f;
-            p = r;
-            q = p;
-            h.setZero();
-            bool flag_boundary_reached = false;
-
-            // Inner CG loop
-            while (true) {
-                double pKp = p.transpose() * K * p;
-                if (pKp <= 0.0) {
-                    // Negative curvature: go to boundary in direction p
-                    flag_boundary_reached = true;
-                    double a = p.squaredNorm();
-                    double b = 2.0 * p.dot(h);
-                    double c = h.squaredNorm() - TR_radius * TR_radius;
-                    double disc = b * b - 4.0 * a * c;
-                    if (disc < 0.0) disc = 0.0;
-                    double alpha = (-b + std::sqrt(disc)) / (2.0 * a);
-                    h += alpha * p;
-                    break;
-                }
-
-                double rq = r.dot(q);
-                double alpha = rq / pKp;
-
-                // Check if proposed step exceeds trust region
-                Eigen::Vector2d h_trial = h + alpha * p;
-                if (h_trial.squaredNorm() >= TR_radius * TR_radius) {
-                    flag_boundary_reached = true;
-                    double a = p.squaredNorm();
-                    double b = 2.0 * p.dot(h);
-                    double c = h.squaredNorm() - TR_radius * TR_radius;
-                    double disc = b * b - 4.0 * a * c;
-                    if (disc < 0.0) disc = 0.0;
-                    double alpha_boundary = (-b + std::sqrt(disc)) / (2.0 * a);
-                    h += alpha_boundary * p;
-                    break;
-                }
-
-                h = h_trial;
-                double phi = r.dot(p);
-                r -= alpha * (K * p);
-
-                double norm_r = r.norm();
-                double norm_f = f.norm();
-                double tol_r = std::max(1e-15, 1e-5 * norm_f);
-                if (norm_r < tol_r) {
-                    break;
-                }
-
-                q = r;
-                double beta = r.dot(q) / phi;
-                p = q + beta * p;
-            } // end CG loop
+            // Trust-region CG step for this (f, K) via legacy Steihaug-CG helper
+            auto sub_result = tr_subproblem(f, K, TR_radius);
+            Eigen::Vector2d h = sub_result.first;
+            bool flag_boundary_reached = sub_result.second;
 
             // Evaluate new objective at t + h
             Eigen::Vector2d t_new = t + h;
@@ -757,9 +794,8 @@ py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
             }
         }
 
-        // Compute squared distance at the accepted parameters (as in Python)
-        Eigen::Vector3d xc = Grg(CtrlPts, u, v, eps);
-        double m_val = (xs - xc).squaredNorm();
+        // Use squared distance returned by TR core at the accepted parameters
+        double m_val = res.m;
 
         if (m_val < best_m) {
             best_m = m_val;

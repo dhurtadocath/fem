@@ -6,7 +6,7 @@ import numpy as np
 from time import time
 import matplotlib.pyplot as plt
 from PyClasses import gregory_patch_backend as gb
-gb.reset_tr_stats()
+
 # POTATO
 [ptt] = pickle.load(open("PointsCreation/PotatoAssembly.dat","rb"))
 ptt.isRigid = True     # faster solving when True
@@ -129,4 +129,3 @@ for i, xsi in enumerate(xs):
                          nor[0], nor[1], nor[2], \
                          dndxs[0,0], dndxs[0,1], dndxs[0,2], dndxs[1,0], dndxs[1,1], dndxs[1,2], dndxs[2,0], dndxs[2,1], dndxs[2,2] ]
 print("Total time for point projection:", time() - stt)
-print("TR stats (C++):", gb.get_tr_stats())
