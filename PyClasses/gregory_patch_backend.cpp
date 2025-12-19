@@ -57,8 +57,10 @@ double dnBernstein(int n, int k, double x, int p) {
 }
 
 
-// Grg function
-Eigen::Vector3d Grg(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps) {
+// Grg function: core implementation templated on the control-point storage
+template <typename Derived>
+Eigen::Vector3d Grg_impl(const Eigen::DenseBase<Derived> &CtrlPts_base, double u, double v, double eps) {
+    const auto &CtrlPts = CtrlPts_base.derived();
     Eigen::Vector3d p = Eigen::Vector3d::Zero();
     int n = 3; // Degree of Bernstein polynomial in u
     int m = 3; // Degree of Bernstein polynomial in v
@@ -122,6 +124,11 @@ Eigen::Vector3d Grg(const Eigen::MatrixXd &CtrlPts, double u, double v, double e
         }
     }
     return p;
+}
+
+// Public Grg wrapper used by Python/pybind, keeps original signature
+Eigen::Vector3d Grg(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps) {
+    return Grg_impl(CtrlPts, u, v, eps);
 }
 
 // Structs for derivative results (pure C++)
@@ -221,8 +228,10 @@ py::tuple Grg_derivs(const Eigen::MatrixXd &CtrlPts, double u, double v, double 
     return py::make_tuple(res.p, res.D1p, res.D2p);
 }
 
-// Internal implementation of Grg_derivs2 (no pybind types)
-GrgDerivs2Result Grg_derivs2_impl(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps) {
+// Internal implementation of Grg_derivs2 (no pybind types) – generic core
+template <typename Derived>
+GrgDerivs2Result Grg_derivs2_impl_generic(const Eigen::DenseBase<Derived> &CtrlPts_base, double u, double v, double eps) {
+    const auto &CtrlPts = CtrlPts_base.derived();
     GrgDerivs2Result res;
     res.p.setZero();
     res.D1p.setZero();
@@ -318,6 +327,11 @@ GrgDerivs2Result Grg_derivs2_impl(const Eigen::MatrixXd &CtrlPts, double u, doub
     }
 
     return res;
+}
+
+// MatrixXd-specific wrapper used by existing callers / pybind
+GrgDerivs2Result Grg_derivs2_impl(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps) {
+    return Grg_derivs2_impl_generic(CtrlPts, u, v, eps);
 }
 
 // pybind wrapper for Grg_derivs2
@@ -589,13 +603,16 @@ std::pair<Eigen::Vector2d, bool> tr_subproblem(const Eigen::Vector2d &f,
 }
 
 // Core trust-region projection with 9 fixed seeds (t1t2_init) and TR-CG step
-TRProjResult projection_tr_core(const Eigen::MatrixXd &CtrlPts,
+// Templated on the control-point storage to avoid copies (e.g. blocks of a bigger matrix)
+template <typename Derived>
+TRProjResult projection_tr_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
                                 const Eigen::Vector3d &xs,
                                 double eps,
                                 double TR_init,
                                 double TR_min,
                                 double TR_max)
 {
+    const auto &CtrlPts = CtrlPts_base.derived();
     // Fixed 3x3 grid seeds in parameter space
     static const double seeds[9][2] = {
         {0.0, 0.0}, {0.5, 0.0}, {1.0, 0.0},
@@ -627,8 +644,8 @@ TRProjResult projection_tr_core(const Eigen::MatrixXd &CtrlPts,
         // Outer TR loop: stop when objective stops decreasing or trust region becomes too small/outside domain
         while (m_new < m_old) {
             if (flag_new_u) {
-                // Compute xc, first and second derivatives using the pure C++ core
-                GrgDerivs2Result d2 = Grg_derivs2_impl(CtrlPts, t.x(), t.y(), eps);
+                // Compute xc, first and second derivatives using the pure C++ core (generic)
+                GrgDerivs2Result d2 = Grg_derivs2_impl_generic(CtrlPts, t.x(), t.y(), eps);
                 Eigen::Vector3d xc = d2.p;
 
                 dxcdt.col(0) = d2.D1p;
@@ -653,7 +670,7 @@ TRProjResult projection_tr_core(const Eigen::MatrixXd &CtrlPts,
 
             // Evaluate new objective at t + h
             Eigen::Vector2d t_new = t + h;
-            Eigen::Vector3d xc_new = Grg(CtrlPts, t_new.x(), t_new.y(), eps);
+            Eigen::Vector3d xc_new = Grg_impl(CtrlPts, t_new.x(), t_new.y(), eps);
             double m_new_plus_h = (xs - xc_new).squaredNorm();
 
             // Predicted reduction from quadratic model
@@ -766,9 +783,16 @@ py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
         }
         double r = r_ptr[p_id];
 
-        // View of CtrlPts for this patch: 20x3 block
-        Eigen::MatrixXd CtrlPts = CtrlPtsAll.block(p_id * rows_per_patch, 0, rows_per_patch, 3);
-        TRProjResult res = projection_tr_core(CtrlPts, xs, eps, TR_init, TR_min, TR_max);
+        // View of CtrlPts for this patch: 20x3 block (no heap allocation)
+        auto CtrlPts = CtrlPtsAll.block(p_id * rows_per_patch, 0, rows_per_patch, 3);
+        TRProjResult res = projection_tr_core(
+            CtrlPts,
+            xs,
+            eps,
+            TR_init,
+            TR_min,
+            TR_max
+        );
 
         Eigen::Vector2d t = res.t;
         double u = t.x();
@@ -784,7 +808,7 @@ py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
         if (!inside) {
             double uc = std::min(1.0, std::max(0.0, u));
             double vc = std::min(1.0, std::max(0.0, v));
-            Eigen::Vector3d xc0 = Grg(CtrlPts, uc, vc, eps);
+            Eigen::Vector3d xc0 = Grg_impl(CtrlPts, uc, vc, eps);
             Eigen::Vector3d nor0 = D3Grg(CtrlPts, uc, vc, eps, true);
             Eigen::Vector3d diff0 = xs - xc0;
             Eigen::Vector3d x_tang = diff0 - diff0.dot(nor0) * nor0;
@@ -836,17 +860,21 @@ py::array_t<bool> ContainsNodes(const Eigen::Vector3d &sphere_center, double sph
 }
 
 // FEAssembly m_el_extra function - rigorous translation of Python hyperelastic SED computation
-Eigen::VectorXd m_el_extra(const Eigen::MatrixXd &X_hexa, const Eigen::MatrixXd &u_hexa, 
-                          double Youngsmodulus, double Poissonsratio) {
+// Use fixed-size Eigen types (8 nodes, 3 components) to avoid heap allocations.
+Eigen::Matrix<double, 8, 1> m_el_extra(const Eigen::Matrix<double, 8, 3> &X_hexa,
+                                       const Eigen::Matrix<double, 8, 3> &u_hexa,
+                                       double Youngsmodulus,
+                                       double Poissonsratio) {
     // X_hexa: 8x3 matrix of hexahedron node coordinates
     // u_hexa: 8x3 matrix of displacements (matches Python u[self.DoFs[hexa]] output)
-    
+
     // Exact translation of Python material parameters
-    double d1 = Youngsmodulus * Poissonsratio / (2 * (1 + Poissonsratio) * (1 - 2 * Poissonsratio));
-    double c10 = Youngsmodulus / (4 * (1 + Poissonsratio));
-    
+    double d1 = Youngsmodulus * Poissonsratio
+                / (2.0 * (1.0 + Poissonsratio) * (1.0 - 2.0 * Poissonsratio));
+    double c10 = Youngsmodulus / (4.0 * (1.0 + Poissonsratio));
+
     // Gauss points - exact translation of Python array
-    Eigen::MatrixXd gauss_points(8, 3);
+    Eigen::Matrix<double, 8, 3> gauss_points;
     double gp = 1.0 / std::sqrt(3.0);
     gauss_points << -gp, -gp, -gp,
                      gp, -gp, -gp,
@@ -856,20 +884,18 @@ Eigen::VectorXd m_el_extra(const Eigen::MatrixXd &X_hexa, const Eigen::MatrixXd 
                      gp, -gp,  gp,
                      gp,  gp,  gp,
                     -gp,  gp,  gp;
-    
-    Eigen::VectorXd SED(8);
-    Eigen::MatrixXd NN(8, 8);
-    
-    // u_hexa is already in 8x3 format from Python u[self.DoFs[hexa]]
-    
+
+    Eigen::Matrix<double, 8, 1> SED;
+    Eigen::Matrix<double, 8, 8> NN;
+
     // Loop over 8 Gauss points - exact translation of Python logic
     for (int g_i = 0; g_i < 8; ++g_i) {
         double g1 = gauss_points(g_i, 0);
-        double g2 = gauss_points(g_i, 1);  
+        double g2 = gauss_points(g_i, 1);
         double g3 = gauss_points(g_i, 2);
-        
+
         // Shape function derivatives - exact translation of Python dNd_xi
-        Eigen::MatrixXd dNd_xi(8, 3);
+        Eigen::Matrix<double, 8, 3> dNd_xi;
         dNd_xi << -(1 - g2) * (1 - g3), -(1 - g1) * (1 - g3), -(1 - g1) * (1 - g2),
                    (1 - g2) * (1 - g3), -(1 + g1) * (1 - g3), -(1 + g1) * (1 - g2),
                    (1 + g2) * (1 - g3),  (1 + g1) * (1 - g3), -(1 + g1) * (1 + g2),
@@ -878,29 +904,30 @@ Eigen::VectorXd m_el_extra(const Eigen::MatrixXd &X_hexa, const Eigen::MatrixXd 
                    (1 - g2) * (1 + g3), -(1 + g1) * (1 + g3),  (1 + g1) * (1 - g2),
                    (1 + g2) * (1 + g3),  (1 + g1) * (1 + g3),  (1 + g1) * (1 + g2),
                   -(1 + g2) * (1 + g3),  (1 - g1) * (1 + g3),  (1 - g1) * (1 + g2);
-        dNd_xi *= 1.0/8.0;
-        
+        dNd_xi *= 1.0 / 8.0;
+
         // Jacobian computation - exact translation: J = np.dot(dNd_xi.T, X)
         Eigen::Matrix3d J = dNd_xi.transpose() * X_hexa;
-        
+
         // Jacobian inverse - exact translation: invJ = np.linalg.inv(J)
         Eigen::Matrix3d invJ = J.inverse();
-        
+
         // Global derivatives - exact translation: dNdx = np.dot(dNd_xi, invJ.T)
-        Eigen::MatrixXd dNdx = dNd_xi * invJ.transpose();
-        
+        Eigen::Matrix<double, 8, 3> dNdx = dNd_xi * invJ.transpose();
+
         // Deformation gradient - exact translation: F = np.eye(len(dNdx.T)) + np.dot(dNdx.T, u).T
-        Eigen::Matrix3d F = Eigen::Matrix3d::Identity() + (dNdx.transpose() * u_hexa).transpose();
-        
+        Eigen::Matrix3d F =
+            Eigen::Matrix3d::Identity() + (dNdx.transpose() * u_hexa).transpose();
+
         // Determinant - exact translation: detF = np.linalg.det(F)
         double detF = F.determinant();
-        
+
         // SED computation - exact translation of Python hyperelastic formula
         // SED[g_i] = c10 * (np.trace(F.T @ F) - 3 - 2 * np.log(detF)) + d1 * (np.log(detF))**2
         double trace_FtF = (F.transpose() * F).trace();
         double log_detF = std::log(detF);
         SED(g_i) = c10 * (trace_FtF - 3.0 - 2.0 * log_detF) + d1 * log_detF * log_detF;
-        
+
         // Shape functions for extrapolation - exact translation of Python NN[g_i]
         NN(g_i, 0) = (1 - g1) * (1 - g2) * (1 - g3);
         NN(g_i, 1) = (1 + g1) * (1 - g2) * (1 - g3);
@@ -910,11 +937,14 @@ Eigen::VectorXd m_el_extra(const Eigen::MatrixXd &X_hexa, const Eigen::MatrixXd 
         NN(g_i, 5) = (1 + g1) * (1 - g2) * (1 + g3);
         NN(g_i, 6) = (1 + g1) * (1 + g2) * (1 + g3);
         NN(g_i, 7) = (1 - g1) * (1 + g2) * (1 + g3);
-        NN.row(g_i) *= 1.0/8.0;
+        NN.row(g_i) *= 1.0 / 8.0;
     }
-    
-    // Final extrapolation - exact translation: return SED@np.linalg.inv(NN)
-    return SED.transpose() * NN.inverse();
+
+    // Final extrapolation - exact translation of: return SED @ np.linalg.inv(NN)
+    // Python row-vector formulation y^T = SED^T * inv(NN)
+    // Column-vector equivalent: y = inv(NN)^T * SED
+    Eigen::Matrix<double, 8, 1> nodal_sed = NN.inverse().transpose() * SED;
+    return nodal_sed;
 }
 
 
