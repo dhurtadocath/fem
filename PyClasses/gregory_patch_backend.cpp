@@ -859,6 +859,41 @@ py::array_t<bool> ContainsNodes(const Eigen::Vector3d &sphere_center, double sph
     return result;
 }
 
+// Helper: precompute NN^{-1} once for m_el_extra (depends only on Gauss points)
+static const Eigen::Matrix<double, 8, 8> &precomputed_NN_inv() {
+    static const Eigen::Matrix<double, 8, 8> NN_inv = []() {
+        Eigen::Matrix<double, 8, 3> gauss_points;
+        double gp = 1.0 / std::sqrt(3.0);
+        gauss_points << -gp, -gp, -gp,
+                         gp, -gp, -gp,
+                         gp,  gp, -gp,
+                        -gp,  gp, -gp,
+                        -gp, -gp,  gp,
+                         gp, -gp,  gp,
+                         gp,  gp,  gp,
+                        -gp,  gp,  gp;
+
+        Eigen::Matrix<double, 8, 8> NN;
+        for (int g_i = 0; g_i < 8; ++g_i) {
+            double g1 = gauss_points(g_i, 0);
+            double g2 = gauss_points(g_i, 1);
+            double g3 = gauss_points(g_i, 2);
+
+            NN(g_i, 0) = (1 - g1) * (1 - g2) * (1 - g3);
+            NN(g_i, 1) = (1 + g1) * (1 - g2) * (1 - g3);
+            NN(g_i, 2) = (1 + g1) * (1 + g2) * (1 - g3);
+            NN(g_i, 3) = (1 - g1) * (1 + g2) * (1 - g3);
+            NN(g_i, 4) = (1 - g1) * (1 - g2) * (1 + g3);
+            NN(g_i, 5) = (1 + g1) * (1 - g2) * (1 + g3);
+            NN(g_i, 6) = (1 + g1) * (1 + g2) * (1 + g3);
+            NN(g_i, 7) = (1 - g1) * (1 + g2) * (1 + g3);
+            NN.row(g_i) *= 1.0 / 8.0;
+        }
+        return NN.inverse();
+    }();
+    return NN_inv;
+}
+
 // FEAssembly m_el_extra function - rigorous translation of Python hyperelastic SED computation
 // Use fixed-size Eigen types (8 nodes, 3 components) to avoid heap allocations.
 Eigen::Matrix<double, 8, 1> m_el_extra(const Eigen::Matrix<double, 8, 3> &X_hexa,
@@ -886,7 +921,6 @@ Eigen::Matrix<double, 8, 1> m_el_extra(const Eigen::Matrix<double, 8, 3> &X_hexa
                     -gp,  gp,  gp;
 
     Eigen::Matrix<double, 8, 1> SED;
-    Eigen::Matrix<double, 8, 8> NN;
 
     // Loop over 8 Gauss points - exact translation of Python logic
     for (int g_i = 0; g_i < 8; ++g_i) {
@@ -928,22 +962,14 @@ Eigen::Matrix<double, 8, 1> m_el_extra(const Eigen::Matrix<double, 8, 3> &X_hexa
         double log_detF = std::log(detF);
         SED(g_i) = c10 * (trace_FtF - 3.0 - 2.0 * log_detF) + d1 * log_detF * log_detF;
 
-        // Shape functions for extrapolation - exact translation of Python NN[g_i]
-        NN(g_i, 0) = (1 - g1) * (1 - g2) * (1 - g3);
-        NN(g_i, 1) = (1 + g1) * (1 - g2) * (1 - g3);
-        NN(g_i, 2) = (1 + g1) * (1 + g2) * (1 - g3);
-        NN(g_i, 3) = (1 - g1) * (1 + g2) * (1 - g3);
-        NN(g_i, 4) = (1 - g1) * (1 - g2) * (1 + g3);
-        NN(g_i, 5) = (1 + g1) * (1 - g2) * (1 + g3);
-        NN(g_i, 6) = (1 + g1) * (1 + g2) * (1 + g3);
-        NN(g_i, 7) = (1 - g1) * (1 + g2) * (1 + g3);
-        NN.row(g_i) *= 1.0 / 8.0;
+        // Shape functions NN are handled in precomputed_NN_inv()
     }
 
     // Final extrapolation - exact translation of: return SED @ np.linalg.inv(NN)
     // Python row-vector formulation y^T = SED^T * inv(NN)
     // Column-vector equivalent: y = inv(NN)^T * SED
-    Eigen::Matrix<double, 8, 1> nodal_sed = NN.inverse().transpose() * SED;
+    const Eigen::Matrix<double, 8, 8> &NN_inv = precomputed_NN_inv();
+    Eigen::Matrix<double, 8, 1> nodal_sed = NN_inv.transpose() * SED;
     return nodal_sed;
 }
 
