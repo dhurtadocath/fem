@@ -619,6 +619,97 @@ std::pair<Eigen::Vector2d, bool> tr_subproblem(const Eigen::Vector2d &f,
     return std::make_pair(h, false);
 }
 
+// Small Newton refinement on m(t) = ||x(t) - xs||^2 in parameter space.
+// Uses the same gradient/Hessian definitions as in TR and keeps (u,v) in [0,1]^2.
+template <typename Derived>
+void newton_refine_t_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
+                          const Eigen::Vector3d &xs,
+                          double eps,
+                          Eigen::Vector2d &t,
+                          double &m) {
+    const auto &CtrlPts = CtrlPts_base.derived();
+
+    // If current m is not finite, do not attempt refinement
+    if (!std::isfinite(m)) {
+        return;
+    }
+
+    const int max_iter = 5000;
+    const double grad_tol = 1e-10;
+    const double step_tol = 1e-15;
+
+    // Ensure we start inside the [0,1]^2 box
+    t.x() = std::min(1.0, std::max(0.0, t.x()));
+    t.y() = std::min(1.0, std::max(0.0, t.y()));
+
+    // Initial objective value at starting point
+    GrgDerivs2Result d2 = Grg_derivs2_impl_generic(CtrlPts, t.x(), t.y(), eps);
+    Eigen::Vector3d diff = d2.p - xs;
+    double m_old = diff.squaredNorm();
+
+    Eigen::Matrix<double, 3, 2> dxcdt;
+    Eigen::Vector2d g;
+    Eigen::Matrix2d K;
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        // Geometry and derivatives at current (u, v)
+        d2 = Grg_derivs2_impl_generic(CtrlPts, t.x(), t.y(), eps);
+        diff = d2.p - xs;
+
+        dxcdt.col(0) = d2.D1p;
+        dxcdt.col(1) = d2.D2p;
+
+        // Gradient g = 2 * J^T * diff
+        g = 2.0 * dxcdt.transpose() * diff;
+        double gnorm = g.norm();
+        if (gnorm < grad_tol) {
+            break;
+        }
+
+        // Hessian H = 2 * (J^T J + sum_i diff_i * H_i)
+        K(0,0) = 2.0 * (d2.D1p.dot(d2.D1p) + diff.dot(d2.D1D1p));
+        K(0,1) = 2.0 * (d2.D1p.dot(d2.D2p) + diff.dot(d2.D1D2p));
+        K(1,0) = K(0,1);
+        K(1,1) = 2.0 * (d2.D2p.dot(d2.D2p) + diff.dot(d2.D2D2p));
+
+        // Solve for Newton step: K * dt = -g
+        Eigen::Vector2d dt = -K.ldlt().solve(g);
+        double dt_norm = dt.norm();
+        if (dt_norm < step_tol) {
+            break;
+        }
+
+        // Backtracking line search in (u,v), enforcing [0,1]^2 and monotone m
+        double alpha = 1.0;
+        bool accepted = false;
+        for (int ls = 0; ls < 6; ++ls) {
+            Eigen::Vector2d t_trial = t + alpha * dt;
+            t_trial.x() = std::min(1.0, std::max(0.0, t_trial.x()));
+            t_trial.y() = std::min(1.0, std::max(0.0, t_trial.y()));
+
+            Eigen::Vector3d xc_trial = Grg_impl(CtrlPts, t_trial.x(), t_trial.y(), eps);
+            Eigen::Vector3d diff_trial = xc_trial - xs;
+            double m_trial = diff_trial.squaredNorm();
+
+            if (m_trial < m_old) {
+                t = t_trial;
+                m_old = m_trial;
+                accepted = true;
+                break;
+            }
+
+            alpha *= 0.5;
+        }
+
+        if (!accepted) {
+            // No acceptable step found; stop refinement
+            break;
+        }
+    }
+
+    m = m_old;
+}
+
 // Core trust-region projection with 9 fixed seeds (t1t2_init) and TR-CG step
 // Templated on the control-point storage to avoid copies (e.g. blocks of a bigger matrix)
 template <typename Derived>
@@ -753,6 +844,14 @@ TRProjResult projection_tr_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
     TRProjResult result;
     result.t = best_t;
     result.m = best_m;
+
+    // Final local Newton refinement on the best patch, if we found a valid candidate
+    if (best_t.x() >= eps_min && best_t.x() <= 1.0 &&
+        best_t.y() >= eps_min && best_t.y() <= 1.0 &&
+        std::isfinite(best_m)) {
+        newton_refine_t_core(CtrlPts_base, xs, eps, result.t, result.m);
+    }
+
     return result;
 }
 

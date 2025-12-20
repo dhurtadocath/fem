@@ -7,6 +7,7 @@ import numpy as np
 from time import time
 import matplotlib.pyplot as plt
 
+
 # POTATO
 [ptt] = pickle.load(open("PointsCreation/PotatoAssembly.dat","rb"))
 ptt.isRigid = True     # faster solving when True
@@ -53,8 +54,6 @@ edges = [
 # plt.show()
 
 
-
-
 ####################################################-------------------------
 
 # Testing points 
@@ -87,42 +86,83 @@ distance_matrix = np.linalg.norm(xm_matrix[:, np.newaxis, :] - xs[np.newaxis, :,
 
 OUTMAT_final = np.zeros((len(xs),23))
 
+# Parameters for geometric candidate selection (mirrors batch script)
+base_ncand = 30       # nearest BS centers used to define base radius
+min_ncand = 10        # minimum candidates
+max_ncand = 50      # maximum candidates
+radius_factor_initial = 1.5
+
 stt = time()
 for i, xsi in enumerate(xs):
-    # Candidate patches for this point (nearest BS centers)
-    sorted_indices = np.argsort(distance_matrix[:, i])
-    candidates_i = sorted_indices[:5].astype(np.int32)  # choose nearest 45 patches
+    distances = distance_matrix[:, i]
+    sorted_indices = np.argsort(distances)
 
-    # Use C++ backend to get best patch and parameters among candidates
-    # Optimized: returns signed distance (gn) and normal (gradient) directly
-    gn, nx, ny, nz, best_patch, t1, t2 = gb.find_signed_distance(
-        CtrlPts_all,
-        xsi.astype(np.float64),
-        candidates_i,
-        radii,
-        patches[0].eps,
-        TR_init,
-        TR_min,
-        TR_max,
-    )
+    best_patch = -1
+    t1 = t2 = np.nan
+    m_best = np.nan
 
-    if best_patch == -1:
-        # print(f"Warning: No projection found for point {i}")
-        continue
+    radius_factor = radius_factor_initial
+    for attempt in range(2):
+        base_idx = min(base_ncand - 1, npatches - 1)
+        base_radius = distances[sorted_indices[base_idx]]
+        radius = base_radius * radius_factor
+
+        # Candidates: all patches whose BS-center distance <= radius
+        mask = distances <= radius
+        candidates_i = np.nonzero(mask)[0]
+
+        # Ensure at least a minimum number of candidates
+        if candidates_i.size < min_ncand:
+            candidates_i = sorted_indices[: min(min_ncand, npatches)]
+
+        # Cap the number of candidates for efficiency
+        if candidates_i.size > max_ncand:
+            candidates_i = sorted_indices[:max_ncand]
+
+        candidates_i = candidates_i.astype(np.int32)
+
+        best_patch, t1, t2, m_best = gb.find_projection_tr_multi(
+            CtrlPts_all,
+            xsi.astype(np.float64),
+            candidates_i,
+            radii,
+            patches[0].eps,
+            TR_init,
+            TR_min,
+            TR_max,
+        )
+
+        if int(best_patch) >= 0:
+            break
+
+        radius_factor *= 2.0
 
     p_id = int(best_patch)
+    if p_id < 0:
+        # No valid projection found for this point
+        continue
+
     print("Closest patch id:", p_id)
-    t1t2_min = np.array([t1, t2])
-    
+
+    # (u,v) returned by C++ TR core already includes a small Newton refinement
+    t1t2_min = np.array([t1, t2], dtype=np.float64)
+
     # Retrieve 2nd derivatives for sensitivity analysis (K matrix vars)
     xc_min, dxcdt, d2xcd2t = patches[p_id].Grg(t1t2_min, deriv=2)
-    
-    # Use C++ computed normal and distance
-    normal_min = np.array([nx, ny, nz])
-    nor = normal_min
-    gns_min = gn
-    gns_min_check = gn
-    #
+
+    # Compute normals and signed distance from geometry
+    D1p, D2p = dxcdt.T
+    D3p = np.cross(D1p, D2p)
+    nor = D3p / np.linalg.norm(D3p)
+
+    normal_min = (
+        patches[p_id].D3Grg(t1t2_min)
+        / np.linalg.norm(patches[p_id].D3Grg(t1t2_min))
+    )
+
+    gns_min = (xsi - xc_min) @ nor
+    gns_min_check = (xsi - xc_min) @ normal_min
+
     dfdt =  -2*np.tensordot(xsi-xc_min,d2xcd2t,axes=1) + 2*(dxcdt.T @ dxcdt)
     dfdxs = -2*dxcdt.T
     dtdxs = np.linalg.solve(-dfdt,dfdxs)
@@ -130,7 +170,30 @@ for i, xsi in enumerate(xs):
     # Vars for K---------------------------------------------------
     dndt = patches[p_id].dndt(t1t2_min)
     dndxs = dndt@dtdxs
-    OUTMAT_final[i,:] = [int(p_id), t1t2_min[0], t1t2_min[1], xc_min[0], xc_min[1], xc_min[2], gns_min, gns_min_check, normal_min[0], normal_min[1], normal_min[2], \
-                         nor[0], nor[1], nor[2], \
-                         dndxs[0,0], dndxs[0,1], dndxs[0,2], dndxs[1,0], dndxs[1,1], dndxs[1,2], dndxs[2,0], dndxs[2,1], dndxs[2,2] ]
+    OUTMAT_final[i,:] = [
+        int(p_id),
+        t1t2_min[0],
+        t1t2_min[1],
+        xc_min[0],
+        xc_min[1],
+        xc_min[2],
+        gns_min,
+        gns_min_check,
+        normal_min[0],
+        normal_min[1],
+        normal_min[2],
+        nor[0],
+        nor[1],
+        nor[2],
+        dndxs[0,0],
+        dndxs[0,1],
+        dndxs[0,2],
+        dndxs[1,0],
+        dndxs[1,1],
+        dndxs[1,2],
+        dndxs[2,0],
+        dndxs[2,1],
+        dndxs[2,2],
+    ]
+
 print("Total time for point projection:", time() - stt)
