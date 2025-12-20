@@ -7,7 +7,7 @@
 
 namespace py = pybind11;
 
-// Bernstein basis functions
+// Bernstein basis functions (generic)
 double Bernstein(int n, int k, double t) {
     if (k < 0 || k > n) {
         return 0; 
@@ -56,6 +56,40 @@ double dnBernstein(int n, int k, double x, int p) {
     return coef * dnB;
 }
 
+// Optimized Bernstein basis for cubic case n = 3
+inline void cubic_bernstein(double t, double B[4]) {
+    double omt = 1.0 - t;
+    double omt2 = omt * omt;
+    double omt3 = omt2 * omt;
+    double t2 = t * t;
+    double t3 = t2 * t;
+
+    B[0] = omt3;              // (1 - t)^3
+    B[1] = 3.0 * t * omt2;    // 3 t (1 - t)^2
+    B[2] = 3.0 * t2 * omt;    // 3 t^2 (1 - t)
+    B[3] = t3;                // t^3
+}
+
+inline void cubic_bernstein_deriv(double t, double dB[4]) {
+    double omt = 1.0 - t;
+    double omt2 = omt * omt;
+    double t2 = t * t;
+
+    dB[0] = -3.0 * omt2;                      // d/dt (1 - t)^3
+    dB[1] = 3.0 * omt2 - 6.0 * t * omt;       // d/dt [3 t (1 - t)^2]
+    dB[2] = 6.0 * t * omt - 3.0 * t2;         // d/dt [3 t^2 (1 - t)]
+    dB[3] = 3.0 * t2;                         // d/dt t^3
+}
+
+inline void cubic_bernstein_second_deriv(double t, double ddB[4]) {
+    double omt = 1.0 - t;
+
+    ddB[0] = 6.0 * omt;               // d2/dt2 (1 - t)^3
+    ddB[1] = -12.0 + 18.0 * t;        // d2/dt2 [3 t (1 - t)^2]
+    ddB[2] = 6.0 - 18.0 * t;          // d2/dt2 [3 t^2 (1 - t)]
+    ddB[3] = 6.0 * t;                 // d2/dt2 t^3
+}
+
 
 // Grg function: core implementation templated on the control-point storage
 template <typename Derived>
@@ -64,6 +98,11 @@ Eigen::Vector3d Grg_impl(const Eigen::DenseBase<Derived> &CtrlPts_base, double u
     Eigen::Vector3d p = Eigen::Vector3d::Zero();
     int n = 3; // Degree of Bernstein polynomial in u
     int m = 3; // Degree of Bernstein polynomial in v
+
+    // Precompute cubic Bernstein basis values for u and v
+    double Bu[4], Bv[4];
+    cubic_bernstein(u, Bu);
+    cubic_bernstein(v, Bv);
 
     for (int i = 0; i <= n; ++i) {
         for (int j = 0; j <= m; ++j) {
@@ -118,8 +157,8 @@ Eigen::Vector3d Grg_impl(const Eigen::DenseBase<Derived> &CtrlPts_base, double u
                 else if (i == 0 && j == 1) xij = CtrlPts.row(11);
             }
             
-            double Bi = Bernstein(n, i, u);
-            double Bj = Bernstein(m, j, v);
+            double Bi = Bu[i];
+            double Bj = Bv[j];
             p += Bi * Bj * xij;
         }
     }
@@ -155,6 +194,14 @@ GrgDerivsResult Grg_derivs_impl(const Eigen::MatrixXd &CtrlPts, double u, double
     res.D2p.setZero();
     int n = 3;
     int m = 3;
+
+    // Precompute cubic Bernstein basis and first derivatives for u and v
+    double Bu[4], Bv[4];
+    double dBu[4], dBv[4];
+    cubic_bernstein(u, Bu);
+    cubic_bernstein(v, Bv);
+    cubic_bernstein_deriv(u, dBu);
+    cubic_bernstein_deriv(v, dBv);
 
     for (int i = 0; i <= n; ++i) {
         for (int j = 0; j <= m; ++j) {
@@ -209,10 +256,10 @@ GrgDerivsResult Grg_derivs_impl(const Eigen::MatrixXd &CtrlPts, double u, double
                 else if (i == 0 && j == 1) xij = CtrlPts.row(11);
             }
 
-            double Bi = Bernstein(n, i, u);
-            double Bj = Bernstein(m, j, v);
-            double D1Bi = dnBernstein(n, i, u, 1);
-            double D2Bj = dnBernstein(m, j, v, 1);
+            double Bi = Bu[i];
+            double Bj = Bv[j];
+            double D1Bi = dBu[i];
+            double D2Bj = dBv[j];
 
             res.p += Bi * Bj * xij;
             res.D1p += D1Bi * Bj * xij + Bi * Bj * D1xij;
@@ -241,6 +288,17 @@ GrgDerivs2Result Grg_derivs2_impl_generic(const Eigen::DenseBase<Derived> &CtrlP
     res.D2D2p.setZero();
     int n = 3;
     int m = 3;
+
+    // Precompute cubic Bernstein basis and derivatives for u and v
+    double Bu[4], Bv[4];
+    double dBu[4], dBv[4];
+    double ddBu[4], ddBv[4];
+    cubic_bernstein(u, Bu);
+    cubic_bernstein(v, Bv);
+    cubic_bernstein_deriv(u, dBu);
+    cubic_bernstein_deriv(v, dBv);
+    cubic_bernstein_second_deriv(u, ddBu);
+    cubic_bernstein_second_deriv(v, ddBv);
 
     for (int i = 0; i <= n; ++i) {
         for (int j = 0; j <= m; ++j) {
@@ -310,12 +368,12 @@ GrgDerivs2Result Grg_derivs2_impl_generic(const Eigen::DenseBase<Derived> &CtrlP
                 else if (i == 0 && j == 1) xij = CtrlPts.row(11);
             }
 
-            double Bi = Bernstein(n, i, u);
-            double Bj = Bernstein(m, j, v);
-            double D1Bi = dnBernstein(n, i, u, 1);
-            double D2Bj = dnBernstein(m, j, v, 1);
-            double DD1Bi = dnBernstein(n, i, u, 2);
-            double DD2Bj = dnBernstein(m, j, v, 2);
+            double Bi = Bu[i];
+            double Bj = Bv[j];
+            double D1Bi = dBu[i];
+            double D2Bj = dBv[j];
+            double DD1Bi = ddBu[i];
+            double DD2Bj = ddBv[j];
 
             res.p      += Bi * Bj * xij;
             res.D1p    += D1Bi * Bj * xij + Bi * Bj * D1xij;
@@ -461,6 +519,27 @@ Eigen::Vector3d D3Grg_internal(const Eigen::DenseBase<Derived> &CtrlPts_base, do
         D3p /= norm_D3p;
     }
     return D3p;
+}
+
+// Combined point and normal helper to avoid redundant evaluation:
+// computes p(u,v) and unit normal n(u,v) in a single pass.
+template <typename Derived>
+void point_and_normal_internal(const Eigen::DenseBase<Derived> &CtrlPts_base,
+                               double u,
+                               double v,
+                               double eps,
+                               Eigen::Vector3d &p,
+                               Eigen::Vector3d &normal) {
+    GrgDerivsResult d = Grg_derivs_impl(CtrlPts_base.derived(), u, v, eps);
+    Eigen::Vector3d D3p = d.D1p.cross(d.D2p);
+    double norm_D3p = D3p.norm();
+    if (norm_D3p == 0.0) {
+        normal.setZero();
+        p = d.p;
+        return;
+    }
+    normal = D3p / norm_D3p;
+    p = d.p;
 }
 
 // find_projection function
@@ -940,8 +1019,8 @@ py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
         if (!inside) {
             double uc = std::min(1.0, std::max(0.0, u));
             double vc = std::min(1.0, std::max(0.0, v));
-            Eigen::Vector3d xc0 = Grg_impl(CtrlPts, uc, vc, eps);
-            Eigen::Vector3d nor0 = D3Grg_internal(CtrlPts, uc, vc, eps, true);
+            Eigen::Vector3d xc0, nor0;
+            point_and_normal_internal(CtrlPts, uc, vc, eps, xc0, nor0);
             Eigen::Vector3d diff0 = xs - xc0;
             Eigen::Vector3d x_tang = diff0 - diff0.dot(nor0) * nor0;
             if (x_tang.norm() > 2.0 * r / 100.0) {
@@ -992,11 +1071,10 @@ py::tuple find_signed_distance(const Eigen::MatrixXd &CtrlPtsAll,
     const int rows_per_patch = 20;
     auto CtrlPts = CtrlPtsAll.block(best_patch * rows_per_patch, 0, rows_per_patch, 3);
     
-    // Compute Normal (n = gradient of signed distance w.r.t query point)
-    Eigen::Vector3d normal = D3Grg_internal(CtrlPts, u, v, eps, true);
-    
-    // Compute Point on Surface
-    Eigen::Vector3d p = Grg_impl(CtrlPts, u, v, eps);
+    // Compute point and normal in a single pass
+    Eigen::Vector3d p;
+    Eigen::Vector3d normal;
+    point_and_normal_internal(CtrlPts, u, v, eps, p, normal);
     
     // Compute Signed Distance
     // gn = (xs - p) . n

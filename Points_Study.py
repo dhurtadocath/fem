@@ -57,7 +57,7 @@ edges = [
 ####################################################-------------------------
 
 # Testing points 
-points_per_side = 2
+points_per_side = 10
 xs = np.zeros((points_per_side*points_per_side*points_per_side , 3))
 
 # Generate set of points in space
