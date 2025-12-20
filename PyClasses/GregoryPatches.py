@@ -3509,7 +3509,10 @@ class GrgPatch:
         ax.set_xlim3d((xyz_lims[0][0],xyz_lims[0][1] ))
         ax.set_ylim3d((xyz_lims[1][0],xyz_lims[1][1] ))
         ax.set_zlim3d((xyz_lims[2][0],xyz_lims[2][1] ))
-        ax.set_aspect('equal', 'box')
+        try:
+            ax.set_aspect('equal', 'box')
+        except NotImplementedError:
+            pass
 
 
         self.plot(ax, color =(0,0,1, 0.75),ref=ref)
