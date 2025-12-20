@@ -714,7 +714,7 @@ void newton_refine_t_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
     }
 
     const int max_iter = 5000;
-    const double grad_tol = 1e-10;
+    const double grad_tol = 1e-12;
     const double step_tol = 1e-15;
 
     // Ensure we start inside the [0,1]^2 box
@@ -828,7 +828,7 @@ TRProjResult projection_tr_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
         double TR_radius = TR_init;
         bool flag_new_u = true;
         int tr_iter = 0;
-        const int max_tr_iter = 20;
+        const int max_tr_iter = 500;
 
         // Outer TR loop: stop when objective stops decreasing or trust region becomes too small/outside domain
         while (m_new < m_old && tr_iter < max_tr_iter) {
@@ -848,7 +848,7 @@ TRProjResult projection_tr_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
 
                 // If the gradient in parameter space is already very small, we are at
                 // a stationary point of the distance functional on this patch.
-                if (f.norm() < 1e-10) {
+                if (f.norm() < 1e-12) {
                     break;
                 }
 
