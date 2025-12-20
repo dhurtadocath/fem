@@ -6,6 +6,7 @@ import sys, os, pickle
 import numpy as np
 from time import time
 import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
 
 
 # POTATO
@@ -57,7 +58,7 @@ edges = [
 ####################################################-------------------------
 
 # Testing points 
-points_per_side = 10
+points_per_side = 2
 xs = np.zeros((points_per_side*points_per_side*points_per_side , 3))
 
 # Generate set of points in space
@@ -82,20 +83,48 @@ CtrlPts_all = np.vstack([np.array(patch.flatCtrlPts()) for patch in patches])  #
 radii = np.array([patch.BS.r for patch in patches], dtype=np.float64)  # (npatches,)
 
 # Fully vectorized distance matrix for candidate selection
-distance_matrix = np.linalg.norm(xm_matrix[:, np.newaxis, :] - xs[np.newaxis, :, :], axis=2)  # (npatches, npoints)
+distance_matrix = np.linalg.norm(
+    xm_matrix[:, np.newaxis, :] - xs[np.newaxis, :, :],
+    axis=2,
+)  # (npatches, npoints)
+
+# Precompute a coarse sampling of the surface for KD-tree based candidate selection
+sample_u = np.linspace(0.0, 1.0, 50)
+sample_v = np.linspace(0.0, 1.0, 50)
+surf_points = []
+surf_patch_ids = []
+for p_id, patch in enumerate(patches):
+    for u in sample_u:
+        for v in sample_v:
+            x_surf = patch.Grg0(np.array([u, v], dtype=np.float64))
+            surf_points.append(x_surf)
+
+            surf_patch_ids.append(p_id)
+
+surf_points = np.asarray(surf_points, dtype=np.float64)
+surf_patch_ids = np.asarray(surf_patch_ids, dtype=np.int32)
+surf_kdtree = cKDTree(surf_points)
 
 OUTMAT_final = np.zeros((len(xs),23))
 
 # Parameters for geometric candidate selection (mirrors batch script)
 base_ncand = 30       # nearest BS centers used to define base radius
 min_ncand = 10        # minimum candidates
-max_ncand = 50      # maximum candidates
+max_ncand = 200       # maximum candidates
 radius_factor_initial = 1.5
+k_surf = 20           # nearest surface samples for KD-tree candidates
 
 stt = time()
 for i, xsi in enumerate(xs):
     distances = distance_matrix[:, i]
     sorted_indices = np.argsort(distances)
+
+    # KD-tree candidates from sampled surface points (geometry-based)
+    n_samples = surf_patch_ids.shape[0]
+    k_query = min(k_surf, n_samples)
+    d_surf, idx_surf = surf_kdtree.query(xsi, k=k_query)
+    idx_surf = np.atleast_1d(idx_surf)
+    kd_patch_ids = np.unique(surf_patch_ids[idx_surf])
 
     best_patch = -1
     t1 = t2 = np.nan
@@ -109,17 +138,24 @@ for i, xsi in enumerate(xs):
 
         # Candidates: all patches whose BS-center distance <= radius
         mask = distances <= radius
-        candidates_i = np.nonzero(mask)[0]
+        candidates_bs = np.nonzero(mask)[0]
 
         # Ensure at least a minimum number of candidates
-        if candidates_i.size < min_ncand:
-            candidates_i = sorted_indices[: min(min_ncand, npatches)]
+        if candidates_bs.size < min_ncand:
+            candidates_bs = sorted_indices[: min(min_ncand, npatches)]
 
-        # Cap the number of candidates for efficiency
-        if candidates_i.size > max_ncand:
-            candidates_i = sorted_indices[:max_ncand]
+        # Merge BS-based and KD-based candidate patch ids
+        merged = np.unique(
+            np.concatenate(
+                [candidates_bs.astype(np.int32), kd_patch_ids.astype(np.int32)]
+            )
+        )
 
-        candidates_i = candidates_i.astype(np.int32)
+        # Cap the number of candidates for efficiency: keep closest in BS distance
+        if merged.size > max_ncand:
+            merged = merged[np.argsort(distances[merged])[:max_ncand]]
+
+        candidates_i = merged.astype(np.int32)
 
         best_patch, t1, t2, m_best = gb.find_projection_tr_multi(
             CtrlPts_all,
