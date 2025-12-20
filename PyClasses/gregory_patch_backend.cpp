@@ -657,9 +657,12 @@ TRProjResult projection_tr_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
         double m_old = 1.0e10;
         double TR_radius = TR_init;
         bool flag_new_u = true;
+        int tr_iter = 0;
+        const int max_tr_iter = 20;
 
         // Outer TR loop: stop when objective stops decreasing or trust region becomes too small/outside domain
-        while (m_new < m_old) {
+        while (m_new < m_old && tr_iter < max_tr_iter) {
+            ++tr_iter;
             if (flag_new_u) {
                 // Compute xc, first and second derivatives using the pure C++ core (generic)
                 GrgDerivs2Result d2 = Grg_derivs2_impl_generic(CtrlPts, t.x(), t.y(), eps);
@@ -673,6 +676,12 @@ TRProjResult projection_tr_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
                 // Gradient of m(t) = ||x(t) - xs||^2 in parameter space
                 f = 2.0 * dxcdt.transpose() * diff;
 
+                // If the gradient in parameter space is already very small, we are at
+                // a stationary point of the distance functional on this patch.
+                if (f.norm() < 1e-10) {
+                    break;
+                }
+
                 // Hessian of m(t) as in Python: 2*(J^T J + sum_i diff_i * H_i)
                 K(0,0) = 2.0 * (d2.D1p.dot(d2.D1p) + diff.dot(d2.D1D1p));
                 K(0,1) = 2.0 * (d2.D1p.dot(d2.D2p) + diff.dot(d2.D1D2p));
@@ -685,13 +694,20 @@ TRProjResult projection_tr_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
             Eigen::Vector2d h = sub_result.first;
             bool flag_boundary_reached = sub_result.second;
 
-            // Evaluate new objective at t + h
+            // Evaluate new objective at t + h, enforcing the [0,1]^2 box in (u,v)
             Eigen::Vector2d t_new = t + h;
-            Eigen::Vector3d xc_new = Grg_impl(CtrlPts, t_new.x(), t_new.y(), eps);
+            Eigen::Vector2d t_new_clamped = t_new;
+            t_new_clamped.x() = std::min(1.0, std::max(0.0, t_new_clamped.x()));
+            t_new_clamped.y() = std::min(1.0, std::max(0.0, t_new_clamped.y()));
+
+            // Effective step actually taken after enforcing the box
+            Eigen::Vector2d h_eff = t_new_clamped - t;
+
+            Eigen::Vector3d xc_new = Grg_impl(CtrlPts, t_new_clamped.x(), t_new_clamped.y(), eps);
             double m_new_plus_h = (xs - xc_new).squaredNorm();
 
             // Predicted reduction from quadratic model
-            double hKh = (h.transpose() * K * h)(0,0);
+            double hKh = (h_eff.transpose() * K * h_eff)(0,0);
             double pred = -f.dot(h) - 0.5 * hKh;
             double ratio;
             if (std::abs(pred) < 1e-30) {
@@ -704,7 +720,7 @@ TRProjResult projection_tr_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
                 TR_radius *= 0.25;
                 flag_new_u = false;
             } else {
-                t = t_new;
+                t = t_new_clamped;
                 if (ratio > 0.75 && flag_boundary_reached) {
                     TR_radius = std::min(2.0 * TR_radius, TR_max);
                 }
