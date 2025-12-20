@@ -430,6 +430,7 @@ Eigen::Vector3d D3Grg(const Eigen::MatrixXd &CtrlPts, double u, double v, double
     double norm_D3p = D3p.norm();
     if (norm_D3p == 0.0) {
         // In C++, we can't set_trace(), but we should handle this case
+        // Fallback or throw? For strict equivalency with "set_trace", throw.
         throw std::runtime_error("D3p norm is zero in D3Grg - would trigger set_trace in Python");
     }
     
@@ -444,6 +445,22 @@ Eigen::Vector3d D3Grg(const Eigen::MatrixXd &CtrlPts, double u, double v, double
 // Helper function for backward compatibility
 Eigen::Vector3d D3Grg_helper(const Eigen::MatrixXd &CtrlPts, double u, double v, double eps, bool normalize) {
     return D3Grg(CtrlPts, u, v, eps, normalize);
+}
+
+// D3Grg template helper for internal use (avoids pybind tuple overhead)
+template <typename Derived>
+Eigen::Vector3d D3Grg_internal(const Eigen::DenseBase<Derived> &CtrlPts_base, double u, double v, double eps, bool normalize = true) {
+    GrgDerivsResult d = Grg_derivs_impl(CtrlPts_base.derived(), u, v, eps);
+    Eigen::Vector3d D3p = d.D1p.cross(d.D2p);
+    double norm_D3p = D3p.norm();
+    if (norm_D3p == 0.0) {
+         // handle singularity gracefully if possible, or throw
+         return Eigen::Vector3d::Zero(); 
+    }
+    if (normalize) {
+        D3p /= norm_D3p;
+    }
+    return D3p;
 }
 
 // find_projection function
@@ -809,7 +826,7 @@ py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
             double uc = std::min(1.0, std::max(0.0, u));
             double vc = std::min(1.0, std::max(0.0, v));
             Eigen::Vector3d xc0 = Grg_impl(CtrlPts, uc, vc, eps);
-            Eigen::Vector3d nor0 = D3Grg(CtrlPts, uc, vc, eps, true);
+            Eigen::Vector3d nor0 = D3Grg_internal(CtrlPts, uc, vc, eps, true);
             Eigen::Vector3d diff0 = xs - xc0;
             Eigen::Vector3d x_tang = diff0 - diff0.dot(nor0) * nor0;
             if (x_tang.norm() > 2.0 * r / 100.0) {
@@ -830,6 +847,49 @@ py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
 
     return py::make_tuple(best_patch, best_t.x(), best_t.y(), best_m);
 }
+
+// Function to find the signed distance and its gradient (normal)
+// Reuses the efficient TR multi-patch projection logic
+// Returns: (gn, nx, ny, nz, patch_id, u, v)
+py::tuple find_signed_distance(const Eigen::MatrixXd &CtrlPtsAll,
+                               const Eigen::Vector3d &xs,
+                               py::array_t<int> candidate_indices,
+                               py::array_t<double> radii,
+                               double eps,
+                               double TR_init,
+                               double TR_min,
+                               double TR_max)
+{
+    // Reuse the projection logic to find the closest point
+    py::tuple proj = find_projection_tr_multi(CtrlPtsAll, xs, candidate_indices, radii, eps, TR_init, TR_min, TR_max);
+    
+    int best_patch = proj[0].cast<int>();
+    double u = proj[1].cast<double>();
+    double v = proj[2].cast<double>();
+    
+    // If no valid projection was found
+    if (best_patch == -1) {
+        double inf = std::numeric_limits<double>::infinity();
+        return py::make_tuple(inf, 0.0, 0.0, 0.0, -1, -1.0, -1.0);
+    }
+    
+    // Reconstruct geometry for the optimal patch
+    const int rows_per_patch = 20;
+    auto CtrlPts = CtrlPtsAll.block(best_patch * rows_per_patch, 0, rows_per_patch, 3);
+    
+    // Compute Normal (n = gradient of signed distance w.r.t query point)
+    Eigen::Vector3d normal = D3Grg_internal(CtrlPts, u, v, eps, true);
+    
+    // Compute Point on Surface
+    Eigen::Vector3d p = Grg_impl(CtrlPts, u, v, eps);
+    
+    // Compute Signed Distance
+    // gn = (xs - p) . n
+    double gn = (xs - p).dot(normal);
+    
+    return py::make_tuple(gn, normal.x(), normal.y(), normal.z(), best_patch, u, v);
+}
+
 
 // BoundingSphere ContainsNode function - rigorous translation of Python logic
 bool ContainsNode(const Eigen::Vector3d &sphere_center, double sphere_radius, const Eigen::Vector3d &point) {
@@ -986,6 +1046,7 @@ PYBIND11_MODULE(gregory_patch_backend, m) {
     m.def("find_projection", &find_projection, "A function that finds the projection of a point onto a Gregory patch");
     m.def("find_projection_tr", &find_projection_tr, "Trust-region projection of a point onto a Gregory patch");
     m.def("find_projection_tr_multi", &find_projection_tr_multi, "Trust-region projection for many patches and one point");
+    m.def("find_signed_distance", &find_signed_distance, "Find signed distance, normal (gradient), and projection");
     m.def("D3Grg", &D3Grg, "Calculate the normal vector at (u,v) on Gregory patch", py::arg("CtrlPts"), py::arg("u"), py::arg("v"), py::arg("eps"), py::arg("normalize")=true);
     m.def("ContainsNode", &ContainsNode, "Check if a point is contained within a bounding sphere");
     m.def("ContainsNodes", &ContainsNodes, "Vectorized check if multiple points are contained within a bounding sphere");

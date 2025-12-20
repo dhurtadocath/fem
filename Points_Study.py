@@ -1,6 +1,7 @@
 from PyClasses.FEAssembly import *
 from PyClasses.Contacts import *
 from PyClasses.FEModel import *
+from PyClasses import gregory_patch_backend as gb
 import sys, os, pickle
 import numpy as np
 from time import time
@@ -93,8 +94,8 @@ for i, xsi in enumerate(xs):
     candidates_i = sorted_indices[:5].astype(np.int32)  # choose nearest 45 patches
 
     # Use C++ backend to get best patch and parameters among candidates
-    from PyClasses import gregory_patch_backend as gb
-    best_patch, t1, t2, m_best = gb.find_projection_tr_multi(
+    # Optimized: returns signed distance (gn) and normal (gradient) directly
+    gn, nx, ny, nz, best_patch, t1, t2 = gb.find_signed_distance(
         CtrlPts_all,
         xsi.astype(np.float64),
         candidates_i,
@@ -105,17 +106,22 @@ for i, xsi in enumerate(xs):
         TR_max,
     )
 
+    if best_patch == -1:
+        # print(f"Warning: No projection found for point {i}")
+        continue
+
     p_id = int(best_patch)
     print("Closest patch id:", p_id)
     t1t2_min = np.array([t1, t2])
+    
+    # Retrieve 2nd derivatives for sensitivity analysis (K matrix vars)
     xc_min, dxcdt, d2xcd2t = patches[p_id].Grg(t1t2_min, deriv=2)
-    D1p, D2p = dxcdt.T
-    D3p = np.cross(D1p,D2p)
-    nor = D3p/np.linalg.norm(D3p)
-    normal_min = patches[p_id].D3Grg(t1t2_min)/np.linalg.norm(patches[p_id].D3Grg(t1t2_min))
-    #
-    gns_min = (xsi - xc_min) @ nor
-    gns_min_check = (xsi - xc_min) @ normal_min
+    
+    # Use C++ computed normal and distance
+    normal_min = np.array([nx, ny, nz])
+    nor = normal_min
+    gns_min = gn
+    gns_min_check = gn
     #
     dfdt =  -2*np.tensordot(xsi-xc_min,d2xcd2t,axes=1) + 2*(dxcdt.T @ dxcdt)
     dfdxs = -2*dxcdt.T
