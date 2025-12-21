@@ -3,6 +3,7 @@ from PyClasses.Utilities import *
 from PyClasses.FEAssembly import *
 from PyClasses.BoundingSpheres import *
 from scipy import sparse
+from scipy.spatial import cKDTree
 import concurrent.futures
 
 
@@ -84,6 +85,22 @@ class Contact:
 
         patch_classifier_name = "final_patch_model_edges-shape-512-512-bs-64"
         # self.patch_classifier = PatchClassificationModel(name=patch_classifier_name)
+
+        # Structures for TR multi-patch projection (BS + surface KD-tree)
+        self._tr_structures_built = False
+        self._tr_xm_matrix = None
+        self._tr_ctrlpts_all = None
+        self._tr_radii = None
+        self._tr_surf_points = None
+        self._tr_surf_patch_ids = None
+        self._tr_surf_kdtree = None
+
+        # Candidate-selection parameters for TR multi (mirrors HPC scripts)
+        self.tr_base_ncand = 30
+        self.tr_min_ncand = 10
+        self.tr_max_ncand = 200
+        self.tr_radius_factor_initial = 1.5
+        self.tr_k_surf = 20
 
 
 
@@ -187,6 +204,145 @@ class Contact:
         
         printif(TimeDisp,"collisions checked in "+str(time.time()-t0)+ " s")
 
+    def _build_tr_search_structures(self):
+        """
+        Build geometry structures needed for multi-patch TR projection:
+          - xm_matrix: BS centers for all master patches
+          - ctrlpts_all: stacked 20x3 control points per patch
+          - radii: BS radii
+          - surf_kdtree: KD-tree on coarsely sampled surface points
+        Assumes masterSurf.patches have been initialized (e.g. via ComputeGrgPatches).
+        """
+        if self._tr_structures_built:
+            return
+
+        patches = self.masterSurf.patches
+        if any(p is None for p in patches):
+            raise RuntimeError(
+                "TR multi-patch projection requires all master patches to be initialized."
+            )
+
+        # BS centers and radii for all patches
+        xm_matrix = np.array([p.BS.x for p in patches], dtype=np.float64)
+        radii = np.array([p.BS.r for p in patches], dtype=np.float64)
+
+        # Stacked control points (20x3 per patch) in the same order
+        ctrlpts_all = np.vstack(
+            [np.array(p.flatCtrlPts(), dtype=np.float64) for p in patches]
+        )  # (npatches*20, 3)
+
+        # Coarse surface sampling for KD-tree (geometry-based candidates)
+        sample_u = np.linspace(0.0, 1.0, 4)
+        sample_v = np.linspace(0.0, 1.0, 4)
+        surf_points = []
+        surf_patch_ids = []
+        for p_id, patch in enumerate(patches):
+            for u in sample_u:
+                for v in sample_v:
+                    x_surf = patch.Grg0(np.array([u, v], dtype=np.float64))
+                    surf_points.append(x_surf)
+                    surf_patch_ids.append(p_id)
+
+        surf_points = np.asarray(surf_points, dtype=np.float64)
+        surf_patch_ids = np.asarray(surf_patch_ids, dtype=np.int32)
+        surf_kdtree = cKDTree(surf_points)
+
+        self._tr_xm_matrix = xm_matrix
+        self._tr_ctrlpts_all = ctrlpts_all
+        self._tr_radii = radii
+        self._tr_surf_points = surf_points
+        self._tr_surf_patch_ids = surf_patch_ids
+        self._tr_surf_kdtree = surf_kdtree
+        self._tr_structures_built = True
+
+    def _compute_mf_TR_multi(self, u, Model):
+        """
+        Frictionless contact energy and force using multi-patch TR projection
+        for every slave node, with BS + surface-KD candidate selection and the
+        C++ TR+Newton core (objective SDF).
+        """
+        from ._contact_tr_multi_helpers import project_point_tr_multi
+        from PyClasses import gregory_patch_backend  # ensure module is loaded
+
+        # Ensure TR geometry structures are built (only for rigid masters)
+        self._build_tr_search_structures()
+
+        xm_matrix = self._tr_xm_matrix
+        ctrlpts_all = self._tr_ctrlpts_all
+        radii = self._tr_radii
+        surf_kdtree = self._tr_surf_kdtree
+        surf_patch_ids = self._tr_surf_patch_ids
+
+        patches = self.masterSurf.patches
+        eps = patches[0].eps
+
+        m = 0.0
+        force = np.zeros(Model.fint.shape)
+        sDoFs  = self.slaveBody.DoFs[self.slaveNodes]
+        xs_all = np.array(self.slaveBody.X )[self.slaveNodes ] + np.array(u[sDoFs ])
+        self.xs = xs_all
+
+        eventList_iter = []
+
+        for idx in range(self.nsn):
+            xsi = xs_all[idx]
+            kn  = self.alpha_p[idx] * self.kn
+
+            p_id, t1, t2, m_best = project_point_tr_multi(
+                xsi,
+                xm_matrix,
+                ctrlpts_all,
+                radii,
+                eps,
+                self.TR_init,
+                self.TR_min,
+                self.TR_max,
+                surf_kdtree,
+                surf_patch_ids,
+                self.tr_base_ncand,
+                self.tr_min_ncand,
+                self.tr_max_ncand,
+                self.tr_radius_factor_initial,
+                self.tr_k_surf,
+            )
+
+            if p_id < 0:
+                # No valid projection / contact
+                if self.actives[idx] is not None:
+                    eventList_iter.append(f"{idx}: {self.actives[idx]}-->None")
+                self.actives[idx] = None
+                continue
+
+            t = np.array([t1, t2], dtype=np.float64)
+            patch = patches[p_id]
+
+            # Geometry at TR-minimized parameters
+            xc = patch.Grg0(t)
+            normal = patch.D3Grg(t, normalize=True)
+            gn = (xsi - xc) @ normal
+
+            if gn >= 0.0:
+                # No compression -> no contact
+                if self.actives[idx] is not None:
+                    eventList_iter.append(f"{idx}: {self.actives[idx]}-->None")
+                self.actives[idx] = None
+                continue
+
+            # Update active set and projection record
+            if self.actives[idx] != p_id:
+                if self.actives[idx] is not None:
+                    eventList_iter.append(f"{idx}: {self.actives[idx]}-->{p_id}")
+                self.actives[idx] = p_id
+
+            self.proj[idx] = np.array([p_id, t[0], t[1], gn])
+
+            # Contact potential and force (only slave node DOFs for rigid master)
+            m += 0.5 * kn * gn**2
+            force[sDoFs[idx]] += kn * gn * normal
+
+        self.patch_changes = eventList_iter
+        return m, force
+
     def updateActive(self):
         for idx in range(self.nsn):
             if self.actives[idx] is not None:
@@ -246,10 +402,15 @@ class Contact:
 
 
     def compute_mf(self, u, Model):
+        # If TR multi-patch projection is enabled and master is rigid, use the
+        # BS + surface-KD candidate selection with C++ multi-patch TR core.
+        if self.use_TR_projection and self.masterBody.isRigid:
+            return self._compute_mf_TR_multi(u, Model)
+
         surf = self.masterSurf
 
-        m=0
-        force=np.zeros(Model.fint.shape)
+        m = 0.0
+        force = np.zeros(Model.fint.shape)
         sDoFs  = self.slaveBody.DoFs[self.slaveNodes]
         xs_all = np.array(self.slaveBody.X )[self.slaveNodes ] + np.array(u[sDoFs ])
 
@@ -273,14 +434,6 @@ class Contact:
                 while not is_patch_correct:
                     patch = surf.patches[patch_id]
 
-                    # if useANN:
-                    #     t0 = [T1[idx,patch_id],T2[idx,patch_id]]
-                    #     # If it's a decent candidate, evaluate
-                    #     if (0-opaANN<t0[0]<1+opaANN and 0-opaANN<t0[1]<1+opaANN):
-                    #         fintC,gn,t = patch.fintC_fless_rigidMaster(xs,kn,cubicT=self.cubicT, ANNapprox=useANN,t0=t0)
-                    #         is_patch_correct = 0-opa<t[0]<1+opa and 0-opa<t[1]<1+opa    #boolean
-
-                    # else:
                     if self.use_TR_projection:
                         mC, fintC, gn, t = patch.mf_fless_rigidMaster_TR(
                             xs,
@@ -305,10 +458,6 @@ class Contact:
                             elif tried_updating_candidates>1:
                                 looper = 0
                                 ANNapprox = True
-                                
-                                # TODO: add more elif<2,3,.. cases in which other methods are adopted to make sure we find projections for the slave
-                                # for example include parameter "search_seeding" which in findProjections is 'recursive' to increase the search seeding 
-
 
                             elif tried_updating_candidates>2:
                                 set_trace()
@@ -316,29 +465,20 @@ class Contact:
                                 break                               # ... and should be the last resource...
                             
                             self.getCandidates(u)
-                            # set_trace()
-                            # self.candids[idx] = self.patch_classifier.Predict(points=[xs+ np.array([-6,0,0])], n=9)[0,:,0].astype(int).tolist()
                             tried_updating_candidates += 1
                             looper = 0
-                            # continue
 
                         changed = True
                         if len(self.candids[idx])>0:
                             patch_id = self.candids[idx][looper]    # this calls the next candidate patch
                             looper += 1
                         else:
-                            # At this point the distortion brings the node too far from any patch
-                            # patch_id = None
                             is_patch_correct = True
                             break
 
                 if is_patch_correct:        # if patch changed
-                    # node_id = self.slaveNodes[idx]
                     if changed:
                         eventList_iter.append(str(idx)+": "+str(self.actives[idx])+"-->"+str(patch_id))
-
-                    # if abs(gn)>10:
-                    #     set_trace()
 
                     if gn>0:
                         if changed:
@@ -347,14 +487,13 @@ class Contact:
                             eventList_iter.append(str(idx)+": out")     # ... or if only went out
 
                     self.actives[idx] = patch_id
-                    # self.t1t2cache[idx] = t
 
                 m += mC
                 force[sDoFs[idx]] += fintC[:3]      # only for the slave node DoFs
 
-        self.patch_changes=eventList_iter
+        self.patch_changes = eventList_iter
 
-        return m,force
+        return m, force
     
 
     def compute_mf_unilateral(self, u, Model):
