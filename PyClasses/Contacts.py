@@ -232,8 +232,8 @@ class Contact:
         )  # (npatches*20, 3)
 
         # Coarse surface sampling for KD-tree (geometry-based candidates)
-        sample_u = np.linspace(0.0, 1.0, 4)
-        sample_v = np.linspace(0.0, 1.0, 4)
+        sample_u = np.linspace(0.0, 1.0, 100)
+        sample_v = np.linspace(0.0, 1.0, 100)
         surf_points = []
         surf_patch_ids = []
         for p_id, patch in enumerate(patches):
