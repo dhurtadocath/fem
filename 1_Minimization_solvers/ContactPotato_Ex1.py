@@ -110,7 +110,13 @@ print(f"  Material E: {E:.3f}")
 print(f"  Contact stiffness kn: {mesh_adapted_kn:.2f} (was 1e2={1e2:.0f})")
 print(f"  Max penetration maxGN: {maxGN:.4f} (was 0.001)")
 
-contact1 = Contact(slave, master, kn=mesh_adapted_kn, C1Edges = False, maxGN = maxGN, f0=0.1)
+# contact1 = Contact(slave, master, kn=mesh_adapted_kn, C1Edges = False,
+#                     maxGN = maxGN, f0=0.1)
+
+contact1 = Contact(slave, master, kn=mesh_adapted_kn, C1Edges = False,
+                    maxGN = maxGN, f0=0.1, use_TR_projection=True,
+                    TR_init=0.1, TR_min=1e-15, TR_max=1.0,)
+
 
 ### MODEL ###
 subname = "_"+("plastic" if plastic else "elastic")+"_"+minimization_method+"_"+str(mesh)

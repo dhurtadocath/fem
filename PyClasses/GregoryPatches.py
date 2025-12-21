@@ -1138,8 +1138,6 @@ class GrgPatch:
             set_trace()
 
 
-
-
     def mf_fless_rigidMaster(self, xs, kn, seeding=10, cubicT=None, OPA=1e-8, xs_check=None, ANNapprox = False,t0=None,recursive_seeding=1):       #Chain rule by hand
         """Frictionless contact force"""
         Ne = len(self.squad)
@@ -1170,7 +1168,43 @@ class GrgPatch:
             return kn/2*(2*gn*dgndu - cubicT*dgndu), gn, t
         else:
             return kn/(2*cubicT)*gn**2*dgndu, gn, t
-        
+
+    def mf_fless_rigidMaster_TR(
+        self,
+        xs,
+        kn,
+        cubicT=None,
+        OPA=1e-8,
+        xs_check=None,
+        TR_init=0.1,
+        TR_min=1e-12,
+        TR_max=1.0,
+    ):
+        """Frictionless contact force using trust-region based projection."""
+        Ne = len(self.squad)
+
+        # Trust-region projection in parameter space
+        t = self.findProjection_TR(xs, TR_init=TR_init, TR_min=TR_min, TR_max=TR_max)
+        xc = self.Grg0(t)
+        normal = self.D3Grg(t, normalize=True)
+        gn = (xs - xc) @ normal
+
+        opa = 0
+        if not (0 - opa <= t[0] <= 1 + opa and 0 - opa <= t[1] <= 1 + opa):
+            return 0.0, np.zeros(3 * (Ne + 1)), gn, t
+
+        dgndu = np.zeros(3 * (Ne + 1))
+        # only the terms related to the slave node. Also dgndxc@dxcdxs = dgndn@dndxs = 0
+        dgndu[:3] = normal
+
+        if cubicT is None:
+            fintCN = kn * gn * dgndu
+            mC = 0.5 * kn * gn**2
+            return mC, fintCN, gn, t
+        elif gn < cubicT:
+            return kn / 2 * (2 * gn * dgndu - cubicT * dgndu), gn, t
+        else:
+            return kn / (2 * cubicT) * gn**2 * dgndu, gn, t
 
     def fintC_fless_rigidMaster(self, xs, kn, seeding=10, cubicT=None, OPA=1e-8, xs_check=None, ANNapprox = False,t0=None,recursive_seeding=1,test_gns=False):       #Chain rule by hand
         """Frictionless contact force"""

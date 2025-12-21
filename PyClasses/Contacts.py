@@ -15,7 +15,8 @@ from pdb import set_trace
 
 class Contact:
     def __init__(self,slave, master, kn=1.0, kt=None,
-                    cubicT=None, C1Edges=True, OutPatchAllowance=0.0, maxGN=None, mu=0, f0=0, ANNmodel = None):          # initialized either with bodies or surfaces. Finally internally handled slave/master pair are surfaces.
+                    cubicT=None, C1Edges=True, OutPatchAllowance=0.0, maxGN=None, mu=0, f0=0, ANNmodel = None,
+                    use_TR_projection=False, TR_init=0.1, TR_min=1e-12, TR_max=1.0):          # initialized either with bodies or surfaces. Finally internally handled slave/master pair are surfaces.
 
         if type(slave) == list:        # pair [ body/surf , subsurf_nodes ]
             self.slaveBody = slave[0] if type(slave[0])==FEAssembly else slave[0].body
@@ -49,6 +50,12 @@ class Contact:
         self.OPA = OutPatchAllowance            # extended patch surface to avoid chattering effect at edges. (In surface coordinates). currently not in use
         self.maxGN = maxGN
         self.minGN = None if maxGN is None else maxGN/2.0
+
+        # Trust-region projection control
+        self.use_TR_projection = use_TR_projection
+        self.TR_init = TR_init
+        self.TR_min = TR_min
+        self.TR_max = TR_max
 
         # projeccion search 
         self.candids = [[] for _ in range(nsn)]     # each node can have several candidates, hence we need DIFFERENT/UNIQUE empty lists
@@ -214,7 +221,15 @@ class Contact:
         if useANN and not patch.BS.ContainsNode(xs):   # This discards far nodes
             return False
 
-        t = patch.findProjection(xs, seeding=10, ANNapprox = useANN, t0=t0)
+        if self.use_TR_projection:
+            t = patch.findProjection_TR(
+                xs,
+                TR_init=self.TR_init,
+                TR_min=self.TR_min,
+                TR_max=self.TR_max,
+            )
+        else:
+            t = patch.findProjection(xs, seeding=10, ANNapprox = useANN, t0=t0)
         eps = self.OPA if OPA is None else OPA
         if not (0-eps<t[0]<1+eps and 0-eps<t[1]<1+eps):
             return False
@@ -266,7 +281,17 @@ class Contact:
                     #         is_patch_correct = 0-opa<t[0]<1+opa and 0-opa<t[1]<1+opa    #boolean
 
                     # else:
-                    mC,fintC,gn,t = patch.mf_fless_rigidMaster(xs,kn,cubicT=self.cubicT, ANNapprox=ANNapprox,t0=None,recursive_seeding=recursive_seeding)
+                    if self.use_TR_projection:
+                        mC, fintC, gn, t = patch.mf_fless_rigidMaster_TR(
+                            xs,
+                            kn,
+                            cubicT=self.cubicT,
+                            TR_init=self.TR_init,
+                            TR_min=self.TR_min,
+                            TR_max=self.TR_max,
+                        )
+                    else:
+                        mC,fintC,gn,t = patch.mf_fless_rigidMaster(xs,kn,cubicT=self.cubicT, ANNapprox=ANNapprox,t0=None,recursive_seeding=recursive_seeding)
                     is_patch_correct = 0-opa<t[0]<1+opa and 0-opa<t[1]<1+opa    #boolean
 
                     # If not correct, try next candidate
@@ -364,7 +389,17 @@ class Contact:
                 patch = surf.patches[patch_id]
 
                 recursive_seeding = 1
-                mC,fintC,gn,t = patch.mf_fless_rigidMaster(xs,kn,cubicT=self.cubicT, ANNapprox=False,t0=None,recursive_seeding=recursive_seeding)
+                if self.use_TR_projection:
+                    mC, fintC, gn, t = patch.mf_fless_rigidMaster_TR(
+                        xs,
+                        kn,
+                        cubicT=self.cubicT,
+                        TR_init=self.TR_init,
+                        TR_min=self.TR_min,
+                        TR_max=self.TR_max,
+                    )
+                else:
+                    mC,fintC,gn,t = patch.mf_fless_rigidMaster(xs,kn,cubicT=self.cubicT, ANNapprox=False,t0=None,recursive_seeding=recursive_seeding)
                 is_patch_correct = 0-opa<t[0]<1+opa and 0-opa<t[1]<1+opa    #boolean
 
                 if is_patch_correct:
@@ -1126,4 +1161,3 @@ class Contact:
                     if not only_actives or active is not None:
                         print("node ",slavenode,": \tcandidates :",candids,
                             "" if active is None else ("\tactive: "+str(active)) )
-
