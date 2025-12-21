@@ -162,7 +162,7 @@ class FEModel:
         # ax.set_ylim3d((-4, 4))
         # ax.set_zlim3d((-2, 6))
 
-        ax.set_aspect("equal")
+        ax.set_aspect("auto")
         ax.xaxis._axinfo["grid"].update({"linewidth":0.1, "color" : "gray"})
         ax.yaxis._axinfo["grid"].update({"linewidth":0.1, "color" : "gray"})
         ax.zaxis._axinfo["grid"].update({"linewidth":0.1, "color" : "gray"})

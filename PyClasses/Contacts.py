@@ -154,6 +154,73 @@ class Contact:
         sDoFs  = self.slaveBody.DoFs[self.slaveNodes]
         xs = np.array(self.slaveBody.X )[self.slaveNodes ] + np.array(u[sDoFs ])
         self.xs = xs
+        # TR multi-patch mode: when CheckActive is requested with a rigid
+        # master, recompute actives using the same BS+surface-KD candidate
+        # selection and C++ multi-patch TR core used in _compute_mf_TR_multi.
+        # This keeps the active set consistent between the solve and the
+        # post-check in FEModel while still allowing contact to evolve as
+        # the slave body moves.
+        if CheckActive and self.use_TR_projection and self.masterBody.isRigid:
+            from ._contact_tr_multi_helpers import project_point_tr_multi
+
+            t0 = time.time()
+            # Ensure TR geometry structures are built
+            self._build_tr_search_structures()
+
+            xm_matrix = self._tr_xm_matrix
+            ctrlpts_all = self._tr_ctrlpts_all
+            radii = self._tr_radii
+            surf_kdtree = self._tr_surf_kdtree
+            surf_patch_ids = self._tr_surf_patch_ids
+
+            patches = self.masterSurf.patches
+            eps = patches[0].eps
+
+            self.candids = [[] for _ in range(self.nsn)]
+            self.actives = [None] * self.nsn
+
+            for idx in range(self.nsn):
+                xsi = xs[idx]
+
+                p_id, t1, t2, m_best = project_point_tr_multi(
+                    xsi,
+                    xm_matrix,
+                    ctrlpts_all,
+                    radii,
+                    eps,
+                    self.TR_init,
+                    self.TR_min,
+                    self.TR_max,
+                    surf_kdtree,
+                    surf_patch_ids,
+                    self.tr_base_ncand,
+                    self.tr_min_ncand,
+                    self.tr_max_ncand,
+                    self.tr_radius_factor_initial,
+                    self.tr_k_surf,
+                )
+
+                if p_id < 0:
+                    self.proj[idx] = np.zeros((4,))
+                    continue
+
+                t = np.array([t1, t2], dtype=np.float64)
+                patch = patches[p_id]
+
+                xc = patch.Grg0(t)
+                normal = patch.D3Grg(t, normalize=True)
+                gn = (xsi - xc) @ normal
+
+                if gn >= 0.0:
+                    self.proj[idx] = np.zeros((4,))
+                    continue
+
+                self.actives[idx] = p_id
+                self.proj[idx] = np.array([p_id, t[0], t[1], gn])
+                self.candids[idx].append(p_id)
+
+            printif(TimeDisp, "TR collisions checked in " + str(time.time() - t0) + " s")
+            return
 
 
         if self.ANNmodel is not None:
