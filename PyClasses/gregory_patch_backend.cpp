@@ -639,7 +639,6 @@ std::pair<Eigen::Vector2d, bool> tr_subproblem(const Eigen::Vector2d &f,
                                                double delta) {
     Eigen::Vector2d r = -f;
     Eigen::Vector2d p = r;
-    Eigen::Vector2d q = r;
     Eigen::Vector2d h = Eigen::Vector2d::Zero();
 
     // Early exit if gradient is already small
@@ -651,6 +650,8 @@ std::pair<Eigen::Vector2d, bool> tr_subproblem(const Eigen::Vector2d &f,
     while (true) {
         if (iter++ > 10) break;  // Safety cap as in legacy implementation
 
+        // Standard Steihaug-CG: alpha = (r^T r) / (p^T K p)
+        double rr = r.dot(r);
         double pKp = p.dot(K * p);
         if (pKp <= 0.0) {
             // Negative curvature: step to boundary
@@ -664,7 +665,7 @@ std::pair<Eigen::Vector2d, bool> tr_subproblem(const Eigen::Vector2d &f,
             return std::make_pair(h, true);
         }
 
-        double alpha = r.dot(q) / pKp;
+        double alpha = rr / pKp;
 
         // Check if proposed step hits boundary
         Eigen::Vector2d h_trial = h + alpha * p;
@@ -680,19 +681,17 @@ std::pair<Eigen::Vector2d, bool> tr_subproblem(const Eigen::Vector2d &f,
         }
 
         h = h_trial;
-        double phi = r.dot(p);
 
         Eigen::Vector2d r_new = r - alpha * (K * p);
+        double rr_new = r_new.dot(r_new);
         if (r_new.norm() < std::max(1e-15, 1e-5 * f.norm())) {
             break;
         }
 
-        double numerator = r_new.dot(r_new);
-        double beta = numerator / phi;
+        // Standard CG recursion: beta = (r_new^T r_new) / (r^T r)
+        double beta = rr_new / rr;
         p = r_new + beta * p;
-
         r = r_new;
-        q = r;
     }
 
     return std::make_pair(h, false);
@@ -876,9 +875,10 @@ TRProjResult projection_tr_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
             Eigen::Vector3d xc_new = Grg_impl(CtrlPts, t_new_clamped.x(), t_new_clamped.y(), eps);
             double m_new_plus_h = (xs - xc_new).squaredNorm();
 
-            // Predicted reduction from quadratic model
+            // Predicted reduction from quadratic model evaluated at the
+            // effective step h_eff (after clamping to the box)
             double hKh = (h_eff.transpose() * K * h_eff)(0,0);
-            double pred = -f.dot(h) - 0.5 * hKh;
+            double pred = -f.dot(h_eff) - 0.5 * hKh;
             double ratio;
             if (std::abs(pred) < 1e-30) {
                 ratio = 0.0;
