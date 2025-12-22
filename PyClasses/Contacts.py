@@ -575,16 +575,61 @@ class Contact:
         surf = self.masterSurf
         useANN = self.ANNmodel is not None
 
-
-        m=0
+        m = 0.0
         eventList_iter = []
 
-        force=np.zeros(Model.fint.shape)
+        force = np.zeros(Model.fint.shape)
         sDoFs  = self.slaveBody.DoFs[self.slaveNodes]
-        # xs_all = np.array(self.slaveBody.X )[self.slaveNodes ] + np.array(u[sDoFs ])
 
-        self.getCandidates(u)   # this updates self.xs and candidates. We don't use 'actives' here
+        # Always refresh candidates and TR caches for the current configuration.
+        # In TR+rigid mode this will also populate self.tr_xs_surf and
+        # self.tr_normals via the C++ multi-patch TR core.
+        self.getCandidates(u)   # this updates self.xs and candidates. We don't use 'actives' here in the old path.
 
+        # Optimized TR unilateral path: when TR projection is enabled, the
+        # master is rigid, and no cubic regularization is requested, reuse
+        # the C++ TR results (gn and normals) instead of re-projecting per
+        # patch in Python.
+        if self.use_TR_projection and self.masterBody.isRigid and self.cubicT is None:
+            opa = self.OPA
+            for idx in range(self.nsn):
+                # ANN-based candidate filtering is not used together with TR.
+                xs = self.xs[idx]
+                kn = self.alpha_p[idx] * self.kn
+                p_id = self.actives[idx]
+
+                if p_id is None:
+                    continue
+
+                # Projection data and geometry from the TR batch call:
+                t1, t2, gn = self.proj[idx]
+                normal = self.tr_normals[idx]
+
+                # Sanity check on parametric location as in the original code.
+                if not (0 - opa < t1 < 1 + opa and 0 - opa < t2 < 1 + opa):
+                    continue
+
+                if gn >= 0.0:
+                    # No compression -> no contact contribution in unilateral mode.
+                    continue
+
+                # Build dgndu with the same structure as mf_fless_rigidMaster_TR:
+                patch = surf.patches[p_id]
+                Ne = len(patch.squad)
+                dgndu = np.zeros(3 * (Ne + 1))
+                dgndu[:3] = normal  # only slave node DOFs contribute
+
+                # Quadratic normal contact: mC = 0.5 * kn * gn^2, fint = kn * gn * dgndu
+                fintCN = kn * gn * dgndu
+                mC = 0.5 * kn * gn ** 2
+
+                m += mC
+                force[sDoFs[idx]] += fintCN[:3]  # only for the slave node DoFs
+
+            self.patch_changes = eventList_iter
+            return m, force
+
+        # Legacy unilateral path (Newton projection or non-TR cases)
         opa = self.OPA
         for idx in range(self.nsn):
 
