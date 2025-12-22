@@ -103,3 +103,81 @@ def project_point_tr_multi(
         radius_factor *= 2.0
 
     return int(best_patch), t1, t2, gn, normal
+
+
+def project_points_tr_multi_batch(
+    xs_all,
+    xm_matrix,
+    ctrlpts_all,
+    radii,
+    eps,
+    tr_init,
+    tr_min,
+    tr_max,
+    surf_kdtree,
+    surf_patch_ids,
+    base_ncand,
+    min_ncand,
+    max_ncand,
+    radius_factor_initial,
+    k_surf,
+):
+    """
+    Multi-point variant of project_point_tr_multi using the C++ batch helper.
+
+    Parameters
+    ----------
+    xs_all : (npoints, 3) array_like
+        Slave points in global coordinates.
+
+    Returns
+    -------
+    patch_ids : (npoints,) int32
+    t1, t2    : (npoints,) float64
+    gn        : (npoints,) float64
+    normals   : (npoints, 3) float64
+    """
+    xs_all = np.asarray(xs_all, dtype=np.float64)
+    npatches = xm_matrix.shape[0]
+    npoints = xs_all.shape[0]
+
+    if npoints == 0 or npatches == 0:
+        return (
+            np.full(0, -1, dtype=np.int32),
+            np.full(0, np.nan, dtype=np.float64),
+            np.full(0, np.nan, dtype=np.float64),
+            np.full(0, np.nan, dtype=np.float64),
+            np.zeros((0, 3), dtype=np.float64),
+        )
+
+    # KD-tree candidates from sampled surface points (geometry-based), vectorized
+    n_samples = surf_patch_ids.shape[0]
+    k_query = min(k_surf, n_samples)
+    d_surf, idx_surf = surf_kdtree.query(xs_all, k=k_query)
+    idx_surf = np.atleast_2d(idx_surf)
+    kd_patch_ids = surf_patch_ids[idx_surf].astype(np.int32)
+
+    # Delegate per-point TR search over candidates to the C++ batch helper
+    patch_ids, t1, t2, gn, normals = gb.find_signed_distance_multi_points(
+        ctrlpts_all,
+        xs_all,
+        xm_matrix,
+        kd_patch_ids,
+        radii,
+        eps,
+        tr_init,
+        tr_min,
+        tr_max,
+        base_ncand,
+        min_ncand,
+        max_ncand,
+        radius_factor_initial,
+    )
+
+    return (
+        np.asarray(patch_ids, dtype=np.int32),
+        np.asarray(t1, dtype=np.float64),
+        np.asarray(t2, dtype=np.float64),
+        np.asarray(gn, dtype=np.float64),
+        np.asarray(normals, dtype=np.float64),
+    )

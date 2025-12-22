@@ -161,7 +161,7 @@ class Contact:
         # post-check in FEModel while still allowing contact to evolve as
         # the slave body moves.
         if CheckActive and self.use_TR_projection and self.masterBody.isRigid:
-            from ._contact_tr_multi_helpers import project_point_tr_multi
+            from ._contact_tr_multi_helpers import project_points_tr_multi_batch
 
             t0 = time.time()
             # Ensure TR geometry structures are built
@@ -178,35 +178,42 @@ class Contact:
 
             self.candids = [[] for _ in range(self.nsn)]
             self.actives = [None] * self.nsn
+            # Batch TR projection for all slave nodes using the same BS+KD
+            # candidate selection semantics as project_point_tr_multi.
+            (
+                patch_ids,
+                t1_all,
+                t2_all,
+                gn_all,
+                normals_all,
+            ) = project_points_tr_multi_batch(
+                xs,
+                xm_matrix,
+                ctrlpts_all,
+                radii,
+                eps,
+                self.TR_init,
+                self.TR_min,
+                self.TR_max,
+                surf_kdtree,
+                surf_patch_ids,
+                self.tr_base_ncand,
+                self.tr_min_ncand,
+                self.tr_max_ncand,
+                self.tr_radius_factor_initial,
+                self.tr_k_surf,
+            )
 
             for idx in range(self.nsn):
-                xsi = xs[idx]
-
-                # TR multi-patch projection with BS + surface-KD candidates.
-                # Use the helper that returns patch id, parameters, signed
-                # distance, and normal directly from the C++ TR core.
-                p_id, t1, t2, gn, normal = project_point_tr_multi(
-                    xsi,
-                    xm_matrix,
-                    ctrlpts_all,
-                    radii,
-                    eps,
-                    self.TR_init,
-                    self.TR_min,
-                    self.TR_max,
-                    surf_kdtree,
-                    surf_patch_ids,
-                    self.tr_base_ncand,
-                    self.tr_min_ncand,
-                    self.tr_max_ncand,
-                    self.tr_radius_factor_initial,
-                    self.tr_k_surf,
-                )
+                p_id = int(patch_ids[idx])
+                gn = float(gn_all[idx])
 
                 if p_id < 0 or gn >= 0.0:
                     self.proj[idx] = np.zeros((4,))
                     continue
 
+                t1 = float(t1_all[idx])
+                t2 = float(t2_all[idx])
                 self.actives[idx] = p_id
                 self.proj[idx] = np.array([p_id, t1, t2, gn])
                 self.candids[idx].append(p_id)

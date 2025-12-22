@@ -4,6 +4,8 @@
 #include <Eigen/LU>
 #include <cmath>
 #include <limits>
+#include <vector>
+#include <algorithm>
 
 namespace py = pybind11;
 
@@ -1083,6 +1085,252 @@ py::tuple find_signed_distance(const Eigen::MatrixXd &CtrlPtsAll,
     return py::make_tuple(gn, normal.x(), normal.y(), normal.z(), best_patch, u, v);
 }
 
+// Batch TR signed-distance evaluation for many points, with BS + KD-based
+// candidate selection per point.
+//
+// Inputs:
+//   - CtrlPtsAll: stacked control points, shape (npatches*20, 3)
+//   - xs_all:     query points, shape (npoints, 3)
+//   - xm_matrix:  BS centers per patch, shape (npatches, 3)
+//   - kd_patch_ids: int array of shape (npoints, k_surf) giving KD-based
+//                   candidate patch ids per point
+//   - radii:      1D array of BS radii, length npatches
+//   - eps, TR_init, TR_min, TR_max: TR+geometry parameters
+//   - base_ncand, min_ncand, max_ncand, radius_factor_initial:
+//       candidate selection parameters (same semantics as Python helper)
+//
+// Returns:
+//   (patch_ids, t1, t2, gn, normals) where:
+//     - patch_ids: int array length npoints
+//     - t1, t2, gn: double arrays length npoints
+//     - normals: double array shape (npoints, 3)
+py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
+                                            const Eigen::MatrixXd &xs_all,
+                                            const Eigen::MatrixXd &xm_matrix,
+                                            py::array_t<int> kd_patch_ids,
+                                            py::array_t<double> radii,
+                                            double eps,
+                                            double TR_init,
+                                            double TR_min,
+                                            double TR_max,
+                                            int base_ncand,
+                                            int min_ncand,
+                                            int max_ncand,
+                                            double radius_factor_initial)
+{
+    // Basic shape checks
+    if (xs_all.cols() != 3) {
+        throw std::runtime_error("xs_all must have shape (npoints, 3)");
+    }
+    if (xm_matrix.cols() != 3) {
+        throw std::runtime_error("xm_matrix must have shape (npatches, 3)");
+    }
+
+    const int rows_per_patch = 20;
+    if (CtrlPtsAll.rows() % rows_per_patch != 0) {
+        throw std::runtime_error("CtrlPtsAll.rows() must be a multiple of 20");
+    }
+    int nPatches = static_cast<int>(CtrlPtsAll.rows() / rows_per_patch);
+
+    if (xm_matrix.rows() != nPatches) {
+        throw std::runtime_error("xm_matrix.rows() must equal number of patches");
+    }
+
+    int nPoints = static_cast<int>(xs_all.rows());
+
+    // Radii array
+    auto rbuf = radii.request();
+    if (rbuf.ndim != 1) {
+        throw std::runtime_error("radii must be a 1D array");
+    }
+    if (static_cast<int>(rbuf.shape[0]) != nPatches) {
+        throw std::runtime_error("radii length must match number of patches");
+    }
+    // double *r_ptr = static_cast<double*>(rbuf.ptr);
+
+    // KD-based patch ids per point
+    auto kdbuf = kd_patch_ids.request();
+    if (kdbuf.ndim != 2) {
+        throw std::runtime_error("kd_patch_ids must have shape (npoints, k_surf)");
+    }
+    if (static_cast<int>(kdbuf.shape[0]) != nPoints) {
+        throw std::runtime_error("kd_patch_ids.shape[0] must equal npoints");
+    }
+    int k_surf = static_cast<int>(kdbuf.shape[1]);
+    int *kd_ptr = static_cast<int*>(kdbuf.ptr);
+
+    // Output arrays
+    py::array_t<int> patch_ids(nPoints);
+    py::array_t<double> t1_arr(nPoints);
+    py::array_t<double> t2_arr(nPoints);
+    py::array_t<double> gn_arr(nPoints);
+    py::array_t<double> normals_arr({nPoints, 3});
+
+    auto patch_buf = patch_ids.request();
+    auto t1_buf = t1_arr.request();
+    auto t2_buf = t2_arr.request();
+    auto gn_buf = gn_arr.request();
+    auto normals_buf = normals_arr.request();
+
+    int *patch_data = static_cast<int*>(patch_buf.ptr);
+    double *t1_data = static_cast<double*>(t1_buf.ptr);
+    double *t2_data = static_cast<double*>(t2_buf.ptr);
+    double *gn_data = static_cast<double*>(gn_buf.ptr);
+    double *normals_data = static_cast<double*>(normals_buf.ptr);
+
+    // Temporary storage reused across points
+    std::vector<double> distances(nPatches);
+    std::vector<int> sorted_indices(nPatches);
+    std::vector<int> candidates_bs;
+    std::vector<int> merged;
+
+    for (int i = 0; i < nPoints; ++i) {
+        Eigen::Vector3d xsi(xs_all(i, 0), xs_all(i, 1), xs_all(i, 2));
+
+        // BS-center distances for this point
+        for (int p = 0; p < nPatches; ++p) {
+            Eigen::Vector3d center(xm_matrix(p, 0), xm_matrix(p, 1), xm_matrix(p, 2));
+            distances[p] = (center - xsi).norm();
+            sorted_indices[p] = p;
+        }
+        std::sort(sorted_indices.begin(), sorted_indices.end(),
+                  [&](int a, int b) { return distances[a] < distances[b]; });
+
+        // KD-tree based candidate patch ids (per point)
+        const int *kd_row = kd_ptr + i * k_surf;
+
+        int best_patch = -1;
+        Eigen::Vector2d best_t(-1.0, -1.0);
+        double best_m = std::numeric_limits<double>::infinity();
+
+        double radius_factor = radius_factor_initial;
+
+        for (int attempt = 0; attempt < 2 && best_patch < 0; ++attempt) {
+            int base_idx = std::min(base_ncand - 1, nPatches - 1);
+            double base_radius = distances[sorted_indices[base_idx]];
+            double radius = base_radius * radius_factor;
+
+            // BS-based candidates: all patches within radius
+            candidates_bs.clear();
+            candidates_bs.reserve(nPatches);
+            for (int p = 0; p < nPatches; ++p) {
+                if (distances[p] <= radius) {
+                    candidates_bs.push_back(p);
+                }
+            }
+
+            // Ensure a minimum number of candidates
+            if (static_cast<int>(candidates_bs.size()) < min_ncand) {
+                int nTake = std::min(min_ncand, nPatches);
+                candidates_bs.assign(sorted_indices.begin(),
+                                     sorted_indices.begin() + nTake);
+            }
+
+            // Merge BS-based and KD-based candidates
+            merged.clear();
+            merged.reserve(candidates_bs.size() + k_surf);
+            merged.insert(merged.end(), candidates_bs.begin(), candidates_bs.end());
+            for (int j = 0; j < k_surf; ++j) {
+                int pid = kd_row[j];
+                if (pid >= 0 && pid < nPatches) {
+                    merged.push_back(pid);
+                }
+            }
+
+            std::sort(merged.begin(), merged.end());
+            merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+
+            // Cap the number of candidates, keeping closest BS centers
+            if (static_cast<int>(merged.size()) > max_ncand) {
+                std::sort(merged.begin(), merged.end(),
+                          [&](int a, int b) { return distances[a] < distances[b]; });
+                merged.resize(max_ncand);
+            }
+
+            int nCand = static_cast<int>(merged.size());
+            if (nCand == 0) {
+                radius_factor *= 2.0;
+                continue;
+            }
+
+            // Use the existing single-point TR projection and geometry helper
+            // for this point with the merged candidate set.
+            // We call find_projection_tr_multi to get best patch and (u,v),
+            // then compute signed distance and normal as in find_signed_distance.
+            py::array_t<int> cand_idx_py(nCand);
+            auto cand_buf = cand_idx_py.request();
+            int *cand_ptr = static_cast<int*>(cand_buf.ptr);
+            for (int c = 0; c < nCand; ++c) {
+                cand_ptr[c] = merged[c];
+            }
+
+            // Call the existing TR multi-patch projection
+            py::tuple proj = find_projection_tr_multi(
+                CtrlPtsAll,
+                xsi,
+                cand_idx_py,
+                radii,
+                eps,
+                TR_init,
+                TR_min,
+                TR_max
+            );
+
+            int p_id = proj[0].cast<int>();
+            double u = proj[1].cast<double>();
+            double v = proj[2].cast<double>();
+            double m_val = proj[3].cast<double>();
+
+            if (p_id < 0) {
+                radius_factor *= 2.0;
+                continue;
+            }
+
+            // Geometric final check mirrored from find_projection_tr_multi's post-processing
+            Eigen::Vector3d p;
+            Eigen::Vector3d normal;
+            auto CtrlPts = CtrlPtsAll.block(p_id * rows_per_patch, 0, rows_per_patch, 3);
+            point_and_normal_internal(CtrlPts, u, v, eps, p, normal);
+            // double gn = (xsi - p).dot(normal);
+
+            // Accept this point's result from the TR core
+            if (m_val < best_m) {
+                best_m = m_val;
+                best_t = Eigen::Vector2d(u, v);
+                best_patch = p_id;
+            }
+        }
+
+        if (best_patch < 0) {
+            // No valid projection found for this point
+            patch_data[i] = -1;
+            t1_data[i] = std::numeric_limits<double>::quiet_NaN();
+            t2_data[i] = std::numeric_limits<double>::quiet_NaN();
+            gn_data[i] = std::numeric_limits<double>::quiet_NaN();
+            normals_data[3 * i + 0] = 0.0;
+            normals_data[3 * i + 1] = 0.0;
+            normals_data[3 * i + 2] = 0.0;
+            continue;
+        }
+
+        auto CtrlPts = CtrlPtsAll.block(best_patch * rows_per_patch, 0, rows_per_patch, 3);
+        Eigen::Vector3d p;
+        Eigen::Vector3d normal;
+        point_and_normal_internal(CtrlPts, best_t.x(), best_t.y(), eps, p, normal);
+        double gn = (xsi - p).dot(normal);
+
+        patch_data[i] = best_patch;
+        t1_data[i] = best_t.x();
+        t2_data[i] = best_t.y();
+        gn_data[i] = gn;
+        normals_data[3 * i + 0] = normal.x();
+        normals_data[3 * i + 1] = normal.y();
+        normals_data[3 * i + 2] = normal.z();
+    }
+
+    return py::make_tuple(patch_ids, t1_arr, t2_arr, gn_arr, normals_arr);
+}
+
 
 // BoundingSphere ContainsNode function - rigorous translation of Python logic
 bool ContainsNode(const Eigen::Vector3d &sphere_center, double sphere_radius, const Eigen::Vector3d &point) {
@@ -1240,6 +1488,9 @@ PYBIND11_MODULE(gregory_patch_backend, m) {
     m.def("find_projection_tr", &find_projection_tr, "Trust-region projection of a point onto a Gregory patch");
     m.def("find_projection_tr_multi", &find_projection_tr_multi, "Trust-region projection for many patches and one point");
     m.def("find_signed_distance", &find_signed_distance, "Find signed distance, normal (gradient), and projection");
+    m.def("find_signed_distance_multi_points",
+          &find_signed_distance_multi_points,
+          "Batch TR signed distance and normals for many points with BS + KD candidates");
     m.def("D3Grg", &D3Grg, "Calculate the normal vector at (u,v) on Gregory patch", py::arg("CtrlPts"), py::arg("u"), py::arg("v"), py::arg("eps"), py::arg("normalize")=true);
     m.def("ContainsNode", &ContainsNode, "Check if a point is contained within a bounding sphere");
     m.def("ContainsNodes", &ContainsNodes, "Vectorized check if multiple points are contained within a bounding sphere");

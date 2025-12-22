@@ -1,0 +1,133 @@
+================================================================================
+PROFILING RESULTS - TR PROJECTION CONTACT MECHANICS
+================================================================================
+
+CONFIGURATION:
+  Mesh: 5x5x5
+  Time steps: 10
+  Solver: BFGS
+  Total solve time: 58.97s
+
+================================================================================
+TOP 50 FUNCTIONS BY CUMULATIVE TIME
+================================================================================
+         13316685 function calls (13311776 primitive calls) in 52.352 seconds
+
+   Ordered by: cumulative time
+   List reduced from 403 to 50 due to restriction <50>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.114    0.114   52.352   52.352 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEModel.py:1766(Solve)
+       77    0.183    0.002   29.966    0.389 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEModel.py:418(NR)
+      619    0.204    0.000   22.398    0.036 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/Contacts.py:152(getCandidates)
+       64    0.163    0.003   15.865    0.248 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/_contact_tr_multi_helpers.py:108(project_points_tr_multi_batch)
+       64   15.696    0.245   15.696    0.245 {built-in method PyClasses.gregory_patch_backend.find_signed_distance_multi_points}
+      478    0.022    0.000   15.661    0.033 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEModel.py:396(get_K)
+      555    0.035    0.000   10.156    0.018 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEModel.py:367(get_fint)
+      956    0.688    0.001    9.753    0.010 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEAssembly.py:409(compute_k_plastic)
+    59750    7.971    0.000    7.971    0.000 {built-in method PyClasses.fast_mfk.K_el_plastic}
+     1110    0.012    0.000    7.147    0.006 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEAssembly.py:339(compute_mf_plastic)
+      555    0.856    0.002    7.102    0.013 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEAssembly.py:353(process_hexas)
+    67853    6.220    0.000    6.220    0.000 {built-in method PyClasses.fast_mfk.mf_el_plastic}
+       64    1.473    0.023    6.186    0.097 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/Contacts.py:272(_build_tr_search_structures)
+      478    0.220    0.000    5.548    0.012 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/Contacts.py:1113(getKC)
+   972349    0.392    0.000    3.653    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:270(Grg0)
+  1000093    0.800    0.000    3.577    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:252(Grg)
+      555    0.176    0.000    2.968    0.005 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/Contacts.py:858(getfintC)
+20851/15972    0.168    0.000    2.764    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:27(__init__)
+      478    0.012    0.000    2.702    0.006 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/linalg/_dsolve/linsolve.py:144(spsolve)
+      478    2.667    0.006    2.667    0.006 {built-in method scipy.sparse.linalg._dsolve._superlu.gssv}
+     5835    0.020    0.000    2.459    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_base.py:496(__add__)
+    17988    0.133    0.000    2.315    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:1222(fintC_fless_rigidMaster)
+     5357    0.016    0.000    2.261    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:355(_add_sparse)
+     5357    0.080    0.000    2.245    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:1366(_binopt)
+   990337    2.184    0.000    2.184    0.000 {built-in method PyClasses.gregory_patch_backend.Grg}
+     4879    0.292    0.000    2.122    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:2020(KC_fless_rigidMaster)
+    17988    0.111    0.000    1.961    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:380(findProjection)
+     5835    0.079    0.000    1.112    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_coo.py:27(__init__)
+    41224    0.128    0.000    1.064    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_base.py:1303(_get_index_dtype)
+     5357    0.048    0.000    0.959    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_coo.py:318(tocsr)
+     5357    0.017    0.000    0.922    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_base.py:381(asformat)
+    41224    0.457    0.000    0.886    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_sputils.py:149(get_index_dtype)
+     4877    0.173    0.000    0.846    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:308(dndt)
+     5835    0.026    0.000    0.810    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:1239(sum_duplicates)
+     1912    0.005    0.000    0.802    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_csr.py:22(__getitem__)
+     1912    0.011    0.000    0.796    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_index.py:51(__getitem__)
+    17988    0.773    0.000    0.773    0.000 {built-in method PyClasses.gregory_patch_backend.find_projection}
+  1113671    0.734    0.000    0.734    0.000 {built-in method numpy.array}
+     1912    0.010    0.000    0.675    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:742(_get_columnXarray)
+    17988    0.031    0.000    0.612    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:354(MinDist)
+     5357    0.015    0.000    0.576    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:1286(sort_indices)
+     5357    0.575    0.000    0.575    0.000 {built-in method scipy.sparse._sparsetools.csr_plus_csr}
+    17988    0.568    0.000    0.568    0.000 {built-in method PyClasses.gregory_patch_backend.MinDist}
+     5357    0.541    0.000    0.541    0.000 {built-in method scipy.sparse._sparsetools.csr_sort_indices}
+   203594    0.522    0.000    0.522    0.000 {built-in method numpy.asarray}
+     4877    0.432    0.000    0.500    0.000 /home/camicas/.local/lib/python3.10/site-packages/numpy/linalg/linalg.py:329(solve)
+     5357    0.060    0.000    0.491    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_coo.py:350(_coo_to_compressed)
+  1071285    0.337    0.000    0.472    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:224(_flatCtrlPts_array)
+    20851    0.210    0.000    0.433    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:135(check_format)
+    17988    0.158    0.000    0.426    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:382(proj_final_check)
+
+
+
+================================================================================
+TOP 50 FUNCTIONS BY SELF TIME (tottime)
+================================================================================
+         13316685 function calls (13311776 primitive calls) in 52.352 seconds
+
+   Ordered by: internal time
+   List reduced from 403 to 50 due to restriction <50>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       64   15.696    0.245   15.696    0.245 {built-in method PyClasses.gregory_patch_backend.find_signed_distance_multi_points}
+    59750    7.971    0.000    7.971    0.000 {built-in method PyClasses.fast_mfk.K_el_plastic}
+    67853    6.220    0.000    6.220    0.000 {built-in method PyClasses.fast_mfk.mf_el_plastic}
+      478    2.667    0.006    2.667    0.006 {built-in method scipy.sparse.linalg._dsolve._superlu.gssv}
+   990337    2.184    0.000    2.184    0.000 {built-in method PyClasses.gregory_patch_backend.Grg}
+       64    1.473    0.023    6.186    0.097 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/Contacts.py:272(_build_tr_search_structures)
+      555    0.856    0.002    7.102    0.013 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEAssembly.py:353(process_hexas)
+  1000093    0.800    0.000    3.577    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:252(Grg)
+    17988    0.773    0.000    0.773    0.000 {built-in method PyClasses.gregory_patch_backend.find_projection}
+  1113671    0.734    0.000    0.734    0.000 {built-in method numpy.array}
+      956    0.688    0.001    9.753    0.010 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEAssembly.py:409(compute_k_plastic)
+     5357    0.575    0.000    0.575    0.000 {built-in method scipy.sparse._sparsetools.csr_plus_csr}
+    17988    0.568    0.000    0.568    0.000 {built-in method PyClasses.gregory_patch_backend.MinDist}
+     5357    0.541    0.000    0.541    0.000 {built-in method scipy.sparse._sparsetools.csr_sort_indices}
+   203594    0.522    0.000    0.522    0.000 {built-in method numpy.asarray}
+    41224    0.457    0.000    0.886    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_sputils.py:149(get_index_dtype)
+     4877    0.432    0.000    0.500    0.000 /home/camicas/.local/lib/python3.10/site-packages/numpy/linalg/linalg.py:329(solve)
+   972349    0.392    0.000    3.653    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:270(Grg0)
+    60389    0.353    0.000    0.353    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+  1071285    0.337    0.000    0.472    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:224(_flatCtrlPts_array)
+     4879    0.292    0.000    2.122    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:2020(KC_fless_rigidMaster)
+     5357    0.280    0.000    0.280    0.000 {built-in method scipy.sparse._sparsetools.coo_tocsr}
+    35216    0.222    0.000    0.222    0.000 {built-in method PyClasses.gregory_patch_backend.D3Grg}
+      478    0.220    0.000    5.548    0.012 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/Contacts.py:1113(getKC)
+  1980965    0.215    0.000    0.215    0.000 {method 'append' of 'list' objects}
+    20851    0.210    0.000    0.433    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:135(check_format)
+      619    0.204    0.000   22.398    0.036 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/Contacts.py:152(getCandidates)
+       77    0.183    0.002   29.966    0.389 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEModel.py:418(NR)
+      555    0.176    0.000    2.968    0.005 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/Contacts.py:858(getfintC)
+     4877    0.173    0.000    0.846    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:308(dndt)
+20851/15972    0.168    0.000    2.764    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:27(__init__)
+       64    0.163    0.003   15.865    0.248 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/_contact_tr_multi_helpers.py:108(project_points_tr_multi_batch)
+     4877    0.159    0.000    0.389    0.000 /home/camicas/.local/lib/python3.10/site-packages/numpy/core/numeric.py:1468(cross)
+    17988    0.158    0.000    0.426    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:382(proj_final_check)
+  1115813    0.143    0.000    0.143    0.000 {built-in method builtins.hasattr}
+    31565    0.140    0.000    0.297    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_compressed.py:1295(prune)
+    17988    0.133    0.000    2.315    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:1222(fintC_fless_rigidMaster)
+    41224    0.128    0.000    1.064    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_base.py:1303(_get_index_dtype)
+    82448    0.124    0.000    0.124    0.000 /home/camicas/.local/lib/python3.10/site-packages/numpy/core/getlimits.py:685(__init__)
+     5835    0.122    0.000    0.394    0.000 /home/camicas/.local/lib/python3.10/site-packages/scipy/sparse/_coo.py:185(_check)
+     9756    0.122    0.000    0.122    0.000 {built-in method PyClasses.gregory_patch_backend.Grg_derivs2}
+        1    0.114    0.114   52.352   52.352 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/FEModel.py:1766(Solve)
+     1912    0.113    0.000    0.113    0.000 {built-in method scipy.sparse._sparsetools.csr_column_index2}
+    17988    0.111    0.000    1.961    0.000 /home/camicas/Documents/Contact/Optimization/fem/PyClasses/GregoryPatches.py:380(findProjection)
+     4877    0.110    0.000    0.206    0.000 /home/camicas/.local/lib/python3.10/site-packages/numpy/core/numeric.py:932(tensordot)
+     1654    0.089    0.000    0.089    0.000 {method '__exit__' of '_io._IOBase' objects}
+     1677    0.088    0.000    0.089    0.000 {built-in method io.open}
+   651083    0.086    0.000    0.086    0.000 {built-in method builtins.len}
+     5357    0.086    0.000    0.086    0.000 {built-in method scipy.sparse._sparsetools.csr_sum_duplicates}
+    17858    0.086    0.000    0.142    0.000 /home/camicas/.local/lib/python3.10/site-packages/numpy/linalg/linalg.py:2383(norm)
+
+
