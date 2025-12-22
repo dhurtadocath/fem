@@ -182,7 +182,10 @@ class Contact:
             for idx in range(self.nsn):
                 xsi = xs[idx]
 
-                p_id, t1, t2, m_best = project_point_tr_multi(
+                # TR multi-patch projection with BS + surface-KD candidates.
+                # Use the helper that returns patch id, parameters, signed
+                # distance, and normal directly from the C++ TR core.
+                p_id, t1, t2, gn, normal = project_point_tr_multi(
                     xsi,
                     xm_matrix,
                     ctrlpts_all,
@@ -200,23 +203,12 @@ class Contact:
                     self.tr_k_surf,
                 )
 
-                if p_id < 0:
-                    self.proj[idx] = np.zeros((4,))
-                    continue
-
-                t = np.array([t1, t2], dtype=np.float64)
-                patch = patches[p_id]
-
-                xc = patch.Grg0(t)
-                normal = patch.D3Grg(t, normalize=True)
-                gn = (xsi - xc) @ normal
-
-                if gn >= 0.0:
+                if p_id < 0 or gn >= 0.0:
                     self.proj[idx] = np.zeros((4,))
                     continue
 
                 self.actives[idx] = p_id
-                self.proj[idx] = np.array([p_id, t[0], t[1], gn])
+                self.proj[idx] = np.array([p_id, t1, t2, gn])
                 self.candids[idx].append(p_id)
 
             printif(TimeDisp, "TR collisions checked in " + str(time.time() - t0) + " s")
@@ -354,8 +346,10 @@ class Contact:
         for idx in range(self.nsn):
             xsi = xs_all[idx]
             kn  = self.alpha_p[idx] * self.kn
-
-            p_id, t1, t2, m_best = project_point_tr_multi(
+            # Multi-patch TR projection with BS + surface-KD candidates.
+            # project_point_tr_multi now returns the patch id, parameters,
+            # signed distance, and normal directly from the C++ TR core.
+            p_id, t1, t2, gn, normal = project_point_tr_multi(
                 xsi,
                 xm_matrix,
                 ctrlpts_all,
@@ -379,14 +373,6 @@ class Contact:
                     eventList_iter.append(f"{idx}: {self.actives[idx]}-->None")
                 self.actives[idx] = None
                 continue
-
-            t = np.array([t1, t2], dtype=np.float64)
-            patch = patches[p_id]
-
-            # Geometry at TR-minimized parameters
-            xc = patch.Grg0(t)
-            normal = patch.D3Grg(t, normalize=True)
-            gn = (xsi - xc) @ normal
 
             if gn >= 0.0:
                 # No compression -> no contact

@@ -21,7 +21,18 @@ def project_point_tr_multi(
 ):
     """
     Single-point multi-patch TR projection using BS + surface KD candidates.
-    Returns (best_patch, t1, t2, m_best).
+
+    Returns
+    -------
+    best_patch : int
+        Index of the patch providing the minimum TR distance, or -1 if none.
+    t1, t2 : float
+        Parametric coordinates on the selected patch.
+    gn : float
+        Signed distance (xs - xc) · n at the TR-minimized point
+        (negative in compression).
+    normal : ndarray, shape (3,)
+        Unit normal vector at the TR-minimized point.
     """
     npatches = xm_matrix.shape[0]
 
@@ -37,7 +48,8 @@ def project_point_tr_multi(
 
     best_patch = -1
     t1 = t2 = np.nan
-    m_best = np.nan
+    gn = np.nan
+    normal = np.zeros(3, dtype=np.float64)
 
     radius_factor = radius_factor_initial
     for _ in range(2):
@@ -67,7 +79,9 @@ def project_point_tr_multi(
 
         candidates_i = merged.astype(np.int32)
 
-        best_patch, t1, t2, m_best = gb.find_projection_tr_multi(
+        # Use the C++ helper that combines TR projection and geometry
+        # evaluation to obtain signed distance and normal in one pass.
+        gn_val, nx, ny, nz, p_id, u, v = gb.find_signed_distance(
             ctrlpts_all,
             xsi.astype(np.float64),
             candidates_i,
@@ -78,11 +92,14 @@ def project_point_tr_multi(
             tr_max,
         )
 
-        if int(best_patch) >= 0:
+        if int(p_id) >= 0:
+            best_patch = int(p_id)
+            t1, t2 = float(u), float(v)
+            gn = float(gn_val)
+            normal = np.array([nx, ny, nz], dtype=np.float64)
             break
 
         # Otherwise, expand the candidate radius and try once more
         radius_factor *= 2.0
 
-    return int(best_patch), t1, t2, m_best
-
+    return int(best_patch), t1, t2, gn, normal

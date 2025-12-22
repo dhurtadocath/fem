@@ -206,6 +206,10 @@ class GrgPatch:
             # set_trace()
             self.BS = BS(self, eps=0.15)
 
+        # Invalidate cached flattened control points for C++ backend
+        if hasattr(self, "_flatCtrlPts_np"):
+            self._flatCtrlPts_np = None
+
 
     def flatCtrlPts(self):
         cp = self.CtrlPts
@@ -216,6 +220,15 @@ class GrgPatch:
         ]
 
         return CtrlPts
+
+    def _flatCtrlPts_array(self):
+        """
+        Cached NumPy view of the 20x3 control points for C++ calls.
+        Recomputed only when CtrlPts changes (cache invalidated in getCtrlPts).
+        """
+        if not hasattr(self, "_flatCtrlPts_np") or self._flatCtrlPts_np is None:
+            self._flatCtrlPts_np = np.array(self.flatCtrlPts(), dtype=np.float64)
+        return self._flatCtrlPts_np
 
 
     def groupCtrlPts(self, cp = 0):
@@ -232,19 +245,19 @@ class GrgPatch:
 
     def Grg_vectorized(self, t, deriv=0):
         if deriv == 0:
-            return gregory_patch_backend.Grg(np.array(self.flatCtrlPts()), t[0], t[1], self.eps)
+            return gregory_patch_backend.Grg(self._flatCtrlPts_array(), t[0], t[1], self.eps)
         else:
             return self.Grg(t, deriv=deriv)
 
     def Grg(self, t, deriv = 0):                        # Normalized normal vector at (u,v) with treatment for undefinition at nodes
         # Use C++ backend for speed while maintaining exact original Python logic
         if deriv == 0:
-            return gregory_patch_backend.Grg(np.array(self.flatCtrlPts()), t[0], t[1], self.eps)
+            return gregory_patch_backend.Grg(self._flatCtrlPts_array(), t[0], t[1], self.eps)
         elif deriv == 1:
-            p, D1p, D2p = gregory_patch_backend.Grg_derivs(np.array(self.flatCtrlPts()), t[0], t[1], self.eps)
+            p, D1p, D2p = gregory_patch_backend.Grg_derivs(self._flatCtrlPts_array(), t[0], t[1], self.eps)
             return p, np.array([D1p, D2p],dtype=np.float64).T
         elif deriv == 2:
-            p, D1p, D2p, D1D1p, D1D2p, D2D2p = gregory_patch_backend.Grg_derivs2(np.array(self.flatCtrlPts()), t[0], t[1], self.eps)
+            p, D1p, D2p, D1D1p, D1D2p, D2D2p = gregory_patch_backend.Grg_derivs2(self._flatCtrlPts_array(), t[0], t[1], self.eps)
             return p, \
                     np.array([D1p, D2p],dtype=np.float64).T, \
                     np.array([[D1D1p, D1D2p], [D1D2p, D2D2p]],dtype=np.float64).T
@@ -260,7 +273,7 @@ class GrgPatch:
 
     def D3Grg(self,t, normalize = True):                        # Normalized normal vector at (u,v) with treatment for undefinition at nodes
         # Use C++ backend for speed while maintaining exact original Python logic
-        return gregory_patch_backend.D3Grg(np.array(self.flatCtrlPts()), t[0], t[1], self.eps, normalize)
+        return gregory_patch_backend.D3Grg(self._flatCtrlPts_array(), t[0], t[1], self.eps, normalize)
 
     def dndxi(self,t,degree=1):
         _, dxcdt= self.Grg(t, deriv = 1)
@@ -355,7 +368,7 @@ class GrgPatch:
         prev_v = prev_t[1] if prev_t is not None else -1.0
         
         umin, vmin = gregory_patch_backend.MinDist(
-            np.array(self.flatCtrlPts()), x, seeding, self.eps, 
+            self._flatCtrlPts_array(), x, seeding, self.eps, 
             x0, x1, y0, y1, recursive, recursionLevel, prev_u, prev_v
         )
 
@@ -386,7 +399,7 @@ class GrgPatch:
         else:
             t_initial = self.MinDistANN( np.array([xs + np.array([-6.0, 0.0, 0.0],dtype=np.float64)]) , verbose=0 )[0]
 
-        u, v = gregory_patch_backend.find_projection(np.array(self.flatCtrlPts()), xs, tuple(t_initial), self.BS.r, self.eps)
+        u, v = gregory_patch_backend.find_projection(self._flatCtrlPts_array(), xs, tuple(t_initial), self.BS.r, self.eps)
         t = np.array([u, v])
         
         # Apply final boundary check like original Python version
@@ -424,7 +437,7 @@ class GrgPatch:
             return t_local
 
         u, v, _ = gregory_patch_backend.find_projection_tr(
-            np.array(self.flatCtrlPts()),
+            self._flatCtrlPts_array(),
             xs.astype(np.float64),
             self.eps,
             TR_init,
