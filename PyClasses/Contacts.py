@@ -845,14 +845,49 @@ class Contact:
 
     def compute_k(self, u,t=None):
         ndofs = len(u)
-        K = sparse.coo_matrix((ndofs,ndofs),dtype=float)
+        K = sparse.coo_matrix((ndofs, ndofs), dtype=float)
 
         surf = self.masterSurf
         sBody = self.slaveBody
 
         sDoFs  = self.slaveBody.DoFs[self.slaveNodes]
-        xs_temp = np.array(self.slaveBody.X)[self.slaveNodes] + np.array(u[sDoFs ])
+        xs_temp = np.array(self.slaveBody.X)[self.slaveNodes] + np.array(u[sDoFs])
 
+        # Trust-region + rigid master + no cubic regularization:
+        # reuse TR geometry and build a stiffness consistent with the
+        # quadratic normal contact energy 0.5 * kn * gn^2, where gn
+        # depends linearly on the slave-node displacement and the
+        # normal is treated as fixed for the current configuration.
+        if self.use_TR_projection and self.masterBody.isRigid and self.cubicT is None:
+            for idx in range(self.nsn):
+                if self.actives[idx] is None:
+                    continue
+
+                kn = self.alpha_p[idx] * self.kn
+                gn = self.proj[idx, 3]
+                if gn >= 0.0:
+                    # No compression -> no unilateral stiffness contribution.
+                    continue
+
+                normal = self.tr_normals[idx]  # (3,)
+                node_id = self.slaveNodes[idx]
+                dofSlave = sBody.DoFs[node_id]
+
+                # For a rigid master, gn = n · u_s + const, so
+                # dg/du_s = n and d2g/d2u_s = 0. The exact Hessian
+                # of 0.5 * kn * gn^2 is then kn * (n ⊗ n).
+                dgdu = normal  # (3,)
+                K_local = kn * np.outer(dgdu, dgdu)  # (3x3)
+
+                rn = np.repeat(dofSlave, len(dofSlave))
+                cn = np.tile(dofSlave, len(dofSlave))
+                sKC = sparse.coo_matrix((K_local.ravel(), (rn, cn)), shape=K.shape)
+                K += sKC
+
+            return K
+
+        # Legacy path: use per-patch stiffness, including master patch DOFs,
+        # via the analytical KC_fless_rigidMaster expression.
         for idx in range(self.nsn):
             if self.actives[idx] is not None:
                 xs = xs_temp[idx]
@@ -861,14 +896,14 @@ class Contact:
                 node_id = self.slaveNodes[idx]
                 dofSlave = sBody.DoFs[node_id]
                 dofPatch = surf.body.DoFs[patch.squad]
-                dofC = np.append(dofSlave,dofPatch)
-                rn = np.repeat(dofC,len(dofC))
-                cn = np.  tile(dofC,len(dofC))
-                kn = self.alpha_p[idx]*self.kn
+                dofC = np.append(dofSlave, dofPatch)
+                rn = np.repeat(dofC, len(dofC))
+                cn = np.tile(dofC, len(dofC))
+                kn = self.alpha_p[idx] * self.kn
 
                 # KC = patch.KC_fless_rigidMaster(xs,kn,cubicT=self.cubicT, t=self.t1t2cache[idx])
-                KC = patch.KC_fless_rigidMaster(xs,kn,cubicT=self.cubicT, t=None)
-                sKC = sparse.coo_matrix((KC.ravel(),(rn,cn)),shape=K.shape)
+                KC = patch.KC_fless_rigidMaster(xs, kn, cubicT=self.cubicT, t=None)
+                sKC = sparse.coo_matrix((KC.ravel(), (rn, cn)), shape=K.shape)
 
                 K += sKC
 
