@@ -136,6 +136,9 @@ def project_points_tr_multi_batch(
     t1, t2    : (npoints,) float64
     gn        : (npoints,) float64
     normals   : (npoints, 3) float64
+        Unit normals at the closest surface points.
+    xs_surf   : (npoints, 3) float64
+        Closest points on the master surface corresponding to each slave point.
     """
     xs_all = np.asarray(xs_all, dtype=np.float64)
     npatches = xm_matrix.shape[0]
@@ -148,6 +151,7 @@ def project_points_tr_multi_batch(
             np.full(0, np.nan, dtype=np.float64),
             np.full(0, np.nan, dtype=np.float64),
             np.zeros((0, 3), dtype=np.float64),
+            np.zeros((0, 3), dtype=np.float64),
         )
 
     # KD-tree candidates from sampled surface points (geometry-based), vectorized
@@ -158,7 +162,7 @@ def project_points_tr_multi_batch(
     kd_patch_ids = surf_patch_ids[idx_surf].astype(np.int32)
 
     # Delegate per-point TR search over candidates to the C++ batch helper
-    patch_ids, t1, t2, gn, normals = gb.find_signed_distance_multi_points(
+    patch_ids, t1, t2, gn, normals, xs_surf = gb.find_signed_distance_multi_points(
         ctrlpts_all,
         xs_all,
         xm_matrix,
@@ -180,4 +184,5 @@ def project_points_tr_multi_batch(
         np.asarray(t2, dtype=np.float64),
         np.asarray(gn, dtype=np.float64),
         np.asarray(normals, dtype=np.float64),
+        np.asarray(xs_surf, dtype=np.float64),
     )

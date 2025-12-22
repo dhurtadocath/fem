@@ -95,6 +95,13 @@ class Contact:
         self._tr_surf_patch_ids = None
         self._tr_surf_kdtree = None
 
+        # Per-configuration TR geometric caches (only meaningful when
+        # use_TR_projection is True and the master body is rigid). These
+        # store, for each slave node, the closest surface point and normal
+        # as computed by the C++ TR core.
+        self.tr_xs_surf = None   # shape (nsn, 3)
+        self.tr_normals = None   # shape (nsn, 3)
+
         # Candidate-selection parameters for TR multi (mirrors HPC scripts)
         self.tr_base_ncand = 30
         self.tr_min_ncand = 10
@@ -186,6 +193,7 @@ class Contact:
                 t2_all,
                 gn_all,
                 normals_all,
+                xs_surf_all,
             ) = project_points_tr_multi_batch(
                 xs,
                 xm_matrix,
@@ -203,6 +211,12 @@ class Contact:
                 self.tr_radius_factor_initial,
                 self.tr_k_surf,
             )
+
+            # Cache TR geometry for this configuration so that any subsequent
+            # logic in TR+rigid mode can reuse the closest point and normal
+            # without re-evaluating Gregory patches in Python.
+            self.tr_xs_surf = xs_surf_all
+            self.tr_normals = normals_all
 
             for idx in range(self.nsn):
                 p_id = int(patch_ids[idx])
@@ -394,7 +408,8 @@ class Contact:
                     eventList_iter.append(f"{idx}: {self.actives[idx]}-->{p_id}")
                 self.actives[idx] = p_id
 
-            self.proj[idx] = np.array([p_id, t[0], t[1], gn])
+            # Store patch id, parametric coordinates (t1,t2) and gn for this node
+            self.proj[idx] = np.array([p_id, t1, t2, gn])
 
             # Contact potential and force (only slave node DOFs for rigid master)
             m += 0.5 * kn * gn**2

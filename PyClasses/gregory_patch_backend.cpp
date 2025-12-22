@@ -1100,10 +1100,11 @@ py::tuple find_signed_distance(const Eigen::MatrixXd &CtrlPtsAll,
 //       candidate selection parameters (same semantics as Python helper)
 //
 // Returns:
-//   (patch_ids, t1, t2, gn, normals) where:
+//   (patch_ids, t1, t2, gn, normals, xs_surf) where:
 //     - patch_ids: int array length npoints
 //     - t1, t2, gn: double arrays length npoints
-//     - normals: double array shape (npoints, 3)
+//     - normals: double array shape (npoints, 3)  (unit normals)
+//     - xs_surf: double array shape (npoints, 3) (closest surface point p)
 py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
                                             const Eigen::MatrixXd &xs_all,
                                             const Eigen::MatrixXd &xm_matrix,
@@ -1165,6 +1166,7 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
     py::array_t<double> t2_arr(nPoints);
     py::array_t<double> gn_arr(nPoints);
     py::array_t<double> normals_arr({nPoints, 3});
+    py::array_t<double> xs_surf_arr({nPoints, 3});
 
     auto patch_buf = patch_ids.request();
     auto t1_buf = t1_arr.request();
@@ -1177,6 +1179,8 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
     double *t2_data = static_cast<double*>(t2_buf.ptr);
     double *gn_data = static_cast<double*>(gn_buf.ptr);
     double *normals_data = static_cast<double*>(normals_buf.ptr);
+    auto xs_surf_buf = xs_surf_arr.request();
+    double *xs_surf_data = static_cast<double*>(xs_surf_buf.ptr);
 
     // Temporary storage reused across points
     std::vector<double> distances(nPatches);
@@ -1310,6 +1314,9 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
             normals_data[3 * i + 0] = 0.0;
             normals_data[3 * i + 1] = 0.0;
             normals_data[3 * i + 2] = 0.0;
+            xs_surf_data[3 * i + 0] = std::numeric_limits<double>::quiet_NaN();
+            xs_surf_data[3 * i + 1] = std::numeric_limits<double>::quiet_NaN();
+            xs_surf_data[3 * i + 2] = std::numeric_limits<double>::quiet_NaN();
             continue;
         }
 
@@ -1326,9 +1333,12 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
         normals_data[3 * i + 0] = normal.x();
         normals_data[3 * i + 1] = normal.y();
         normals_data[3 * i + 2] = normal.z();
+        xs_surf_data[3 * i + 0] = p.x();
+        xs_surf_data[3 * i + 1] = p.y();
+        xs_surf_data[3 * i + 2] = p.z();
     }
 
-    return py::make_tuple(patch_ids, t1_arr, t2_arr, gn_arr, normals_arr);
+    return py::make_tuple(patch_ids, t1_arr, t2_arr, gn_arr, normals_arr, xs_surf_arr);
 }
 
 
