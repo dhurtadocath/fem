@@ -101,7 +101,7 @@ base_kn = 20.0 * E  # Conservative base stiffness (20x material stiffness)
 mesh_adapted_kn = base_kn
 
 # penetration tolerance 
-maxGN = 0.001
+maxGN = 0.0001
 
 
 print(f"Mesh-adaptive contact parameters for mesh={mesh}:")
@@ -115,7 +115,9 @@ print(f"  Max penetration maxGN: {maxGN:.4f} (was 0.001)")
 
 contact1 = Contact(slave, master, kn=mesh_adapted_kn, C1Edges = False,
                     maxGN = maxGN, f0=0.1, use_TR_projection=True,
-                    TR_init=0.1, TR_min=1e-15, TR_max=1.0,)
+                    TR_init=0.1, TR_min=1e-15, TR_max=1.0,
+                    tr_base_ncand=24, tr_min_ncand=10, tr_max_ncand=96,
+                    tr_radius_factor_initial=1.5, tr_k_surf=15)
 
 
 ### MODEL ###
@@ -139,7 +141,7 @@ t0 = time()
 
 
 # recov = "OUTPUT_202410290908ContactPotato_slideX_elastic_BFGS_10/"+"RecoveryData.dat"
-model.Solve(TimeSteps=100,max_iter=20, recover=False ,minimethod=minimization_method,plot=0)
+model.Solve(TimeSteps=100,max_iter=20, recover=False ,minimethod=minimization_method,plot=1)
 
 
 

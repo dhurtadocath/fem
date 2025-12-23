@@ -6,6 +6,7 @@
 #include <limits>
 #include <vector>
 #include <algorithm>
+#include <numeric>
 
 namespace py = pybind11;
 
@@ -1182,7 +1183,10 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
     auto xs_surf_buf = xs_surf_arr.request();
     double *xs_surf_data = static_cast<double*>(xs_surf_buf.ptr);
 
-    // Temporary storage reused across points
+    // Temporary storage reused across points. We store squared BS-center
+    // distances to avoid repeated square-root evaluations; all radius
+    // comparisons are done in squared form, which is mathematically
+    // equivalent for ordering and thresholding.
     std::vector<double> distances(nPatches);
     std::vector<int> sorted_indices(nPatches);
     std::vector<int> candidates_bs;
@@ -1191,14 +1195,23 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
     for (int i = 0; i < nPoints; ++i) {
         Eigen::Vector3d xsi(xs_all(i, 0), xs_all(i, 1), xs_all(i, 2));
 
-        // BS-center distances for this point
+        // BS-center squared distances for this point
         for (int p = 0; p < nPatches; ++p) {
             Eigen::Vector3d center(xm_matrix(p, 0), xm_matrix(p, 1), xm_matrix(p, 2));
-            distances[p] = (center - xsi).norm();
+            distances[p] = (center - xsi).squaredNorm();
             sorted_indices[p] = p;
         }
-        std::sort(sorted_indices.begin(), sorted_indices.end(),
-                  [&](int a, int b) { return distances[a] < distances[b]; });
+        // We only need the position of the base_ncand-th nearest patch to
+        // define the base radius and, optionally, the set of the closest
+        // min_ncand patches. A partial selection is sufficient here and
+        // avoids a full O(P log P) sort for every point.
+        int base_idx = std::min(base_ncand - 1, nPatches - 1);
+        std::nth_element(
+            sorted_indices.begin(),
+            sorted_indices.begin() + base_idx,
+            sorted_indices.end(),
+            [&](int a, int b) { return distances[a] < distances[b]; });
+        double base_radius_sq = distances[sorted_indices[base_idx]];
 
         // KD-tree based candidate patch ids (per point)
         const int *kd_row = kd_ptr + i * k_surf;
@@ -1210,15 +1223,13 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
         double radius_factor = radius_factor_initial;
 
         for (int attempt = 0; attempt < 2 && best_patch < 0; ++attempt) {
-            int base_idx = std::min(base_ncand - 1, nPatches - 1);
-            double base_radius = distances[sorted_indices[base_idx]];
-            double radius = base_radius * radius_factor;
+            double radius_sq = base_radius_sq * radius_factor * radius_factor;
 
             // BS-based candidates: all patches within radius
             candidates_bs.clear();
             candidates_bs.reserve(nPatches);
             for (int p = 0; p < nPatches; ++p) {
-                if (distances[p] <= radius) {
+                if (distances[p] <= radius_sq) {
                     candidates_bs.push_back(p);
                 }
             }

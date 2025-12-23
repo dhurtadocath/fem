@@ -15,9 +15,31 @@ from pdb import set_trace
 
 
 class Contact:
-    def __init__(self,slave, master, kn=1.0, kt=None,
-                    cubicT=None, C1Edges=True, OutPatchAllowance=0.0, maxGN=None, mu=0, f0=0, ANNmodel = None,
-                    use_TR_projection=False, TR_init=0.1, TR_min=1e-12, TR_max=1.0):          # initialized either with bodies or surfaces. Finally internally handled slave/master pair are surfaces.
+    def __init__(
+        self,
+        slave,
+        master,
+        kn=1.0,
+        kt=None,
+        cubicT=None,
+        C1Edges=True,
+        OutPatchAllowance=0.0,
+        maxGN=None,
+        mu=0,
+        f0=0,
+        ANNmodel=None,
+        use_TR_projection=False,
+        TR_init=0.1,
+        TR_min=1e-12,
+        TR_max=1.0,
+        # Trust-region multi-patch candidate selection parameters. These are
+        # only used when use_TR_projection is True and the master is rigid.
+        tr_base_ncand=30,
+        tr_min_ncand=10,
+        tr_max_ncand=200,
+        tr_radius_factor_initial=1.5,
+        tr_k_surf=20,
+    ):          # initialized either with bodies or surfaces. Finally internally handled slave/master pair are surfaces.
 
         if type(slave) == list:        # pair [ body/surf , subsurf_nodes ]
             self.slaveBody = slave[0] if type(slave[0])==FEAssembly else slave[0].body
@@ -102,12 +124,14 @@ class Contact:
         self.tr_xs_surf = None   # shape (nsn, 3)
         self.tr_normals = None   # shape (nsn, 3)
 
-        # Candidate-selection parameters for TR multi (mirrors HPC scripts)
-        self.tr_base_ncand = 30
-        self.tr_min_ncand = 10
-        self.tr_max_ncand = 200
-        self.tr_radius_factor_initial = 1.5
-        self.tr_k_surf = 20
+        # Candidate-selection parameters for TR multi-patch projection.
+        # Defaults mirror the robust HPC configuration but can be overridden
+        # via constructor arguments when finer control is needed.
+        self.tr_base_ncand = tr_base_ncand
+        self.tr_min_ncand = tr_min_ncand
+        self.tr_max_ncand = tr_max_ncand
+        self.tr_radius_factor_initial = tr_radius_factor_initial
+        self.tr_k_surf = tr_k_surf
 
 
 
@@ -311,9 +335,11 @@ class Contact:
             [np.array(p.flatCtrlPts(), dtype=np.float64) for p in patches]
         )  # (npatches*20, 3)
 
-        # Coarse surface sampling for KD-tree (geometry-based candidates)
-        sample_u = np.linspace(0.0, 1.0, 100)
-        sample_v = np.linspace(0.0, 1.0, 100)
+        # Coarse surface sampling for KD-tree (geometry-based candidates).
+        # For runtime simulations we can use a moderately coarse tensor grid;
+        # finer sampling is reserved for offline HPC scripts.
+        sample_u = np.linspace(0.0, 1.0, 50)
+        sample_v = np.linspace(0.0, 1.0, 50)
         surf_points = []
         surf_patch_ids = []
         for p_id, patch in enumerate(patches):
