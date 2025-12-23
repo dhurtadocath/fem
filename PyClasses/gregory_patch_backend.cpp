@@ -632,8 +632,9 @@ py::tuple find_projection(const Eigen::MatrixXd &CtrlPts, const Eigen::Vector3d 
 
 // Internal result struct for TR projection
 struct TRProjResult {
-    Eigen::Vector2d t;
-    double m;
+    Eigen::Vector2d t;   // parametric coordinates (u,v)
+    double m;            // minimized squared distance
+    int patch_id;        // index of the patch (if applicable), or -1
 };
 
 // Helper for TR subproblem (Steihaug-CG), ported from legacy backend
@@ -926,6 +927,7 @@ TRProjResult projection_tr_core(const Eigen::DenseBase<Derived> &CtrlPts_base,
     TRProjResult result;
     result.t = best_t;
     result.m = best_m;
+    result.patch_id = -1;
 
     // Final local Newton refinement on the best patch, if we found a valid candidate
     if (best_t.x() >= eps_min && best_t.x() <= 1.0 &&
@@ -949,51 +951,33 @@ py::tuple find_projection_tr(const Eigen::MatrixXd &CtrlPts,
     return py::make_tuple(res.t.x(), res.t.y(), res.m);
 }
 
-// Python-exposed wrapper for many patches / one point TR projection
-// CtrlPtsAll: stacked CtrlPts for all patches, shape (npatches*20, 3)
-// candidate_indices: 1D array of patch indices to consider
-// radii: 1D array of patch bounding-sphere radii, length npatches
-py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
-                                   const Eigen::Vector3d &xs,
-                                   py::array_t<int> candidate_indices,
-                                   py::array_t<double> radii,
-                                   double eps,
-                                   double TR_init,
-                                   double TR_min,
-                                   double TR_max)
+// Internal helper for many-patch / one-point TR projection that works on a
+// simple list of candidate indices and raw radii pointer. This version does
+// not depend on pybind11 types and is therefore safe to call from parallel
+// regions.
+TRProjResult find_projection_tr_multi_internal(const Eigen::MatrixXd &CtrlPtsAll,
+                                               const Eigen::Vector3d &xs,
+                                               const std::vector<int> &candidates,
+                                               const double *r_ptr,
+                                               double eps,
+                                               double TR_init,
+                                               double TR_min,
+                                               double TR_max)
 {
-    auto buf = candidate_indices.request();
-    if (buf.ndim != 1) {
-        throw std::runtime_error("candidate_indices must be a 1D array");
-    }
-    int nCand = static_cast<int>(buf.shape[0]);
-    int *idx_ptr = static_cast<int*>(buf.ptr);
-
-    // Each patch contributes 20 control points
     const int rows_per_patch = 20;
     if (CtrlPtsAll.rows() % rows_per_patch != 0) {
         throw std::runtime_error("CtrlPtsAll.rows() must be a multiple of 20");
     }
     int nPatches = CtrlPtsAll.rows() / rows_per_patch;
 
-    // Radii array
-    auto rbuf = radii.request();
-    if (rbuf.ndim != 1) {
-        throw std::runtime_error("radii must be a 1D array");
-    }
-    if (static_cast<int>(rbuf.shape[0]) != nPatches) {
-        throw std::runtime_error("radii length must match number of patches");
-    }
-    double *r_ptr = static_cast<double*>(rbuf.ptr);
-
     double best_m = std::numeric_limits<double>::infinity();
     Eigen::Vector2d best_t(-1.0, -1.0);
     int best_patch = -1;
 
-    for (int k = 0; k < nCand; ++k) {
-        int p_id = idx_ptr[k];
+    for (int k = 0; k < static_cast<int>(candidates.size()); ++k) {
+        int p_id = candidates[k];
         if (p_id < 0 || p_id >= nPatches) {
-            throw std::runtime_error("candidate index out of range");
+            continue;
         }
         double r = r_ptr[p_id];
 
@@ -1042,7 +1026,73 @@ py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
         }
     }
 
-    return py::make_tuple(best_patch, best_t.x(), best_t.y(), best_m);
+    TRProjResult result;
+    if (best_patch < 0) {
+        result.t = Eigen::Vector2d(-1.0, -1.0);
+        result.m = std::numeric_limits<double>::infinity();
+        result.patch_id = -1;
+    } else {
+        result.t = best_t;
+        result.m = best_m;
+        result.patch_id = best_patch;
+    }
+    return result;
+}
+
+// Python-exposed wrapper for many patches / one point TR projection
+// CtrlPtsAll: stacked CtrlPts for all patches, shape (npatches*20, 3)
+// candidate_indices: 1D array of patch indices to consider
+// radii: 1D array of patch bounding-sphere radii, length npatches
+py::tuple find_projection_tr_multi(const Eigen::MatrixXd &CtrlPtsAll,
+                                   const Eigen::Vector3d &xs,
+                                   py::array_t<int> candidate_indices,
+                                   py::array_t<double> radii,
+                                   double eps,
+                                   double TR_init,
+                                   double TR_min,
+                                   double TR_max)
+{
+    auto buf = candidate_indices.request();
+    if (buf.ndim != 1) {
+        throw std::runtime_error("candidate_indices must be a 1D array");
+    }
+    int nCand = static_cast<int>(buf.shape[0]);
+    int *idx_ptr = static_cast<int*>(buf.ptr);
+
+    // Each patch contributes 20 control points
+    const int rows_per_patch = 20;
+    if (CtrlPtsAll.rows() % rows_per_patch != 0) {
+        throw std::runtime_error("CtrlPtsAll.rows() must be a multiple of 20");
+    }
+    int nPatches = CtrlPtsAll.rows() / rows_per_patch;
+
+    // Radii array
+    auto rbuf = radii.request();
+    if (rbuf.ndim != 1) {
+        throw std::runtime_error("radii must be a 1D array");
+    }
+    if (static_cast<int>(rbuf.shape[0]) != nPatches) {
+        throw std::runtime_error("radii length must match number of patches");
+    }
+    double *r_ptr = static_cast<double*>(rbuf.ptr);
+
+    std::vector<int> candidates(nCand);
+    for (int k = 0; k < nCand; ++k) {
+        candidates[k] = idx_ptr[k];
+    }
+
+    TRProjResult res = find_projection_tr_multi_internal(
+        CtrlPtsAll,
+        xs,
+        candidates,
+        r_ptr,
+        eps,
+        TR_init,
+        TR_min,
+        TR_max
+    );
+
+    return py::make_tuple(res.patch_id, res.t.x(), res.t.y(), res.m);
 }
 
 // Function to find the signed distance and its gradient (normal)
@@ -1148,7 +1198,7 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
     if (static_cast<int>(rbuf.shape[0]) != nPatches) {
         throw std::runtime_error("radii length must match number of patches");
     }
-    // double *r_ptr = static_cast<double*>(rbuf.ptr);
+    double *r_ptr = static_cast<double*>(rbuf.ptr);
 
     // KD-based patch ids per point
     auto kdbuf = kd_patch_ids.request();
@@ -1183,16 +1233,18 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
     auto xs_surf_buf = xs_surf_arr.request();
     double *xs_surf_data = static_cast<double*>(xs_surf_buf.ptr);
 
-    // Temporary storage reused across points. We store squared BS-center
-    // distances to avoid repeated square-root evaluations; all radius
-    // comparisons are done in squared form, which is mathematically
-    // equivalent for ordering and thresholding.
-    std::vector<double> distances(nPatches);
-    std::vector<int> sorted_indices(nPatches);
-    std::vector<int> candidates_bs;
-    std::vector<int> merged;
-
+    // Parallel over points: each iteration only writes to the i-th slice of
+    // the output arrays and uses its own candidate buffers.
+    #pragma omp parallel for
     for (int i = 0; i < nPoints; ++i) {
+        // Per-point temporary storage. We store squared BS-center distances
+        // to avoid repeated square-root evaluations; all radius comparisons
+        // are done in squared form, which is mathematically equivalent for
+        // ordering and thresholding.
+        std::vector<double> distances(nPatches);
+        std::vector<int> sorted_indices(nPatches);
+        std::vector<int> candidates_bs;
+        std::vector<int> merged;
         Eigen::Vector3d xsi(xs_all(i, 0), xs_all(i, 1), xs_all(i, 2));
 
         // BS-center squared distances for this point
@@ -1268,35 +1320,23 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
                 continue;
             }
 
-            // Use the existing single-point TR projection and geometry helper
-            // for this point with the merged candidate set.
-            // We call find_projection_tr_multi to get best patch and (u,v),
-            // then compute signed distance and normal as in find_signed_distance.
-            py::array_t<int> cand_idx_py(nCand);
-            auto cand_buf = cand_idx_py.request();
-            int *cand_ptr = static_cast<int*>(cand_buf.ptr);
-            for (int c = 0; c < nCand; ++c) {
-                cand_ptr[c] = merged[c];
-            }
-
-            // Call the existing TR multi-patch projection
-            py::tuple proj = find_projection_tr_multi(
+            // Use the internal many-patch TR helper that operates purely on
+            // C++ types and is safe in parallel regions.
+            TRProjResult tr_res = find_projection_tr_multi_internal(
                 CtrlPtsAll,
                 xsi,
-                cand_idx_py,
-                radii,
+                merged,
+                r_ptr,
                 eps,
                 TR_init,
                 TR_min,
                 TR_max
             );
 
-            int p_id = proj[0].cast<int>();
-            double u = proj[1].cast<double>();
-            double v = proj[2].cast<double>();
-            double m_val = proj[3].cast<double>();
-
-            if (p_id < 0) {
+            // If no valid projection was found for this candidate set, try a
+            // larger radius in the next attempt.
+            if (tr_res.patch_id < 0 || !std::isfinite(tr_res.m) ||
+                tr_res.t.x() < 0.0 || tr_res.t.y() < 0.0) {
                 radius_factor *= 2.0;
                 continue;
             }
@@ -1304,15 +1344,17 @@ py::tuple find_signed_distance_multi_points(const Eigen::MatrixXd &CtrlPtsAll,
             // Geometric final check mirrored from find_projection_tr_multi's post-processing
             Eigen::Vector3d p;
             Eigen::Vector3d normal;
-            auto CtrlPts = CtrlPtsAll.block(p_id * rows_per_patch, 0, rows_per_patch, 3);
+            double u = tr_res.t.x();
+            double v = tr_res.t.y();
+            auto CtrlPts = CtrlPtsAll.block(tr_res.patch_id * rows_per_patch, 0, rows_per_patch, 3);
             point_and_normal_internal(CtrlPts, u, v, eps, p, normal);
             // double gn = (xsi - p).dot(normal);
 
             // Accept this point's result from the TR core
-            if (m_val < best_m) {
-                best_m = m_val;
+            if (tr_res.m < best_m) {
+                best_m = tr_res.m;
                 best_t = Eigen::Vector2d(u, v);
-                best_patch = p_id;
+                best_patch = tr_res.patch_id;
             }
         }
 
