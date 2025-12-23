@@ -23,3 +23,10 @@ PyClasses/__pycache__/
 2_Accelerated_Contact_Detection/sampled_data_50_percent.csv
 *.csv
 *.ft
+*.prof
+*/build
+oldScriptsVersions/
+for_HPC
+Legacy/
+ContactData*
+*.pstats

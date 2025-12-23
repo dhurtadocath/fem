@@ -5,6 +5,7 @@ from PyClasses.Utilities import Bernstein, dnBernstein, Unchain, printif, flatLi
 import numpy as np
 from numpy.linalg import norm
 import time,csv
+from . import gregory_patch_backend
 
 
 from pdb import set_trace
@@ -205,6 +206,10 @@ class GrgPatch:
             # set_trace()
             self.BS = BS(self, eps=0.15)
 
+        # Invalidate cached flattened control points for C++ backend
+        if hasattr(self, "_flatCtrlPts_np"):
+            self._flatCtrlPts_np = None
+
 
     def flatCtrlPts(self):
         cp = self.CtrlPts
@@ -215,6 +220,15 @@ class GrgPatch:
         ]
 
         return CtrlPts
+
+    def _flatCtrlPts_array(self):
+        """
+        Cached NumPy view of the 20x3 control points for C++ calls.
+        Recomputed only when CtrlPts changes (cache invalidated in getCtrlPts).
+        """
+        if not hasattr(self, "_flatCtrlPts_np") or self._flatCtrlPts_np is None:
+            self._flatCtrlPts_np = np.array(self.flatCtrlPts(), dtype=np.float64)
+        return self._flatCtrlPts_np
 
 
     def groupCtrlPts(self, cp = 0):
@@ -229,196 +243,37 @@ class GrgPatch:
         ctrls = [row0,row1,row2,row3]
         self.CtrlPts = ctrls
 
+    def Grg_vectorized(self, t, deriv=0):
+        if deriv == 0:
+            return gregory_patch_backend.Grg(self._flatCtrlPts_array(), t[0], t[1], self.eps)
+        else:
+            return self.Grg(t, deriv=deriv)
+
     def Grg(self, t, deriv = 0):                        # Normalized normal vector at (u,v) with treatment for undefinition at nodes
-        u,v = t
-        p       = np.array([0.0 , 0.0 , 0.0],dtype=np.float64)
-        if deriv > 0:
-            D1p     = np.array([0.0 , 0.0 , 0.0],dtype=np.float64)
-            D2p     = np.array([0.0 , 0.0 , 0.0],dtype=np.float64)
-        if deriv > 1:
-            D1D1p   = np.array([0.0 , 0.0 , 0.0],dtype=np.float64)
-            D1D2p   = np.array([0.0 , 0.0 , 0.0],dtype=np.float64)
-            D2D2p   = np.array([0.0 , 0.0 , 0.0],dtype=np.float64)
-        if deriv > 2:
-            D1D1D1p = np.array([0.0 , 0.0 , 0.0],dtype=(np.float64))
-            D1D1D2p = np.array([0.0 , 0.0 , 0.0],dtype=(np.float64))
-            D1D2D2p = np.array([0.0 , 0.0 , 0.0],dtype=(np.float64))
-            D2D2D2p = np.array([0.0 , 0.0 , 0.0],dtype=(np.float64))
-        n, m = len(self.CtrlPts)-1, len(self.CtrlPts[0])-1
-
-        for i  in range(n+1):
-            for j in range(m+1):
-                # Inner nodes: values, derivatives and treatments
-                if i in [1,2] and j in [1,2]:
-                    if i==1 and j ==1:
-                        x110, x111 = self.CtrlPts[1][1]
-                        den = max(self.eps,u+v)  
-                        xij = (u*x110+v*x111)/(den)
-                        if deriv > 0:
-                            D1xij = x110/(den) - (u*x110 + v*x111)/((den)**2)
-                            D2xij = x111/(den) - (u*x110 + v*x111)/((den)**2)
-                        if deriv > 1:
-                            D11xij =-2*v*(x110 - x111)/(den)**3
-                            D12xij = (u - v)*(x110 - x111)/(den)**3
-                            D22xij = 2*u*(x110 - x111)/(den)**3
-                        if deriv > 2:
-                            D111xij = 6*v*(x110-x111)/(den)**4
-                            D112xij = -(2*(u-2*v)*(x110-x111)/(den)**4)
-                            D122xij = -(2*(2*u-v)*(x110-x111)/(den)**4)
-                            D222xij = -(6*u*(x110-x111)/(den)**4)
-                            
-                    elif i==1 and j==2:
-                        x120, x121 = self.CtrlPts[1][2]
-                        den = max(self.eps,u+1-v)
-                        xij = (u*x120+(1-v)*x121)/(den)
-                        if deriv > 0:
-                            D1xij = x120/(den) - (u*x120 + (1-v)*x121)/((den)**2)
-                            D2xij = -x121/(den) + (u*x120 + (1-v)*x121)/((den)**2)
-                        if deriv > 1:
-                            D11xij = (2*(-1 + v)*(x120 - x121))/(den)**3
-                            D12xij = -(((-1 + u + v)*(x120 - x121))/(den)**3)
-                            D22xij = (2*u*(x120 - x121))/(den)**3
-                        if deriv > 2:
-                            D111xij = -(6*(-1+v)*(x120-x121)/(den)**4)
-                            D112xij = (2*(-2+u+2*v)*(x120-x121)/(den)**4)
-                            D122xij = -(2*(-1+2*u+v)*(x120-x121)/(den)**4)
-                            D222xij = (6*u*(x120-x121)/(den)**4)
-
-                    elif i==2 and j==1:
-                        x210, x211 = self.CtrlPts[2][1]
-                        den = max(self.eps, v+1-u)
-                        xij = ((1-u)*x210+v*x211)/(den)
-                        if deriv > 0:
-                            D1xij = -x210/(den) + ((1-u)*x210 + v*x211)/((den)**2)
-                            D2xij = x211/(den) - ((1-u)*x210 + v*x211)/((den)**2)
-                        if deriv > 1:
-                            D11xij = (2*v*(x210 - x211))/(-den)**3
-                            D12xij = ((-1 + u + v)*(x210 - x211))/(den)**3
-                            D22xij = (2*(-1 + u)*(x210 - x211))/(-den)**3
-                        if deriv > 2:
-                            D111xij = -(6*v*(x210-x211)/(den)**4)
-                            D112xij = (2*(-1+u+2*v)*(x210-x211)/(den)**4)
-                            D122xij = -(2*(-2+2*u+v)*(x210-x211)/(den)**4)
-                            D222xij = (6*(-1+u)*(x210-x211)/(den)**4)
-
-                    else:
-                        x220, x221 = self.CtrlPts[2][2]
-                        den = max(self.eps, 2-u-v)
-                        xij = ((1-u)*x220+(1-v)*x221)/(den)
-                        if deriv > 0:
-                            D1xij = -x220/(den) + ((1-u)*x220 + (1-v)*x221)/((den)**2)
-                            D2xij = -x221/(den) + ((1-u)*x220 + (1-v)*x221)/((den)**2)
-                        if deriv > 1:
-                            D11xij = -((2*(-1 + v)*(x220 - x221))/(-den)**3)
-                            D12xij = ((u - v)*(x220 - x221))/(-den)**3
-                            D22xij = (2*(-1 + u)*(x220 - x221))/(-den)**3
-                        if deriv > 2:
-                            D111xij = 6*(-1+v)*(x220-x221)/(-den)**4
-                            D112xij = -(2*(1+u-2*v)*(x220-x221)/(-den)**4)
-                            D122xij = -(2*(-1+2*u-v)*(x220-x221)/(-den)**4)
-                            D222xij = -(6*(-1+u)*(x220-x221)/(-den)**4)
-
-                else:
-                    xij = self.CtrlPts[i][j]
-                    D1xij, D2xij = 0.0 , 0.0
-                    D11xij, D12xij, D22xij = 0.0 , 0.0 , 0.0
-                    D111xij, D112xij, D122xij, D222xij = 0.0 , 0.0 , 0.0 , 0.0
-
-                # Bernstein polynomials
-                Bi     =   Bernstein(n, i, u)
-                Bj     =   Bernstein(m, j, v)
-
-                p += Bi*Bj*xij
-
-                # Tangent Derivatives w/r to LOCAL parameters
-                if deriv > 0:
-                    D1Bi     =  dnBernstein(n, i, u, 1)
-                    D2Bj     =  dnBernstein(m, j, v, 1)
-                    D1p += D1Bi*Bj*xij + Bi*Bj*D1xij
-                    D2p += Bi*D2Bj*xij + Bi*Bj*D2xij
-
-                if deriv > 1:
-                    DD1Bi = dnBernstein(n, i, u, 2)
-                    DD2Bj = dnBernstein(m, j, v, 2)
-                    D1D1p += (DD1Bi*xij + 2*D1Bi*D1xij + Bi*D11xij)*Bj
-                    D1D2p += D1Bi*D2Bj*xij + D1Bi*Bj*D2xij + Bi*D2Bj*D1xij + Bi*Bj*D12xij
-                    D2D2p += (DD2Bj*xij + 2*D2Bj*D2xij + Bj*D22xij)*Bi
-
-                if deriv > 2:
-                    DDD1Bi = dnBernstein(n, i, u, 3)
-                    DDD2Bj = dnBernstein(m, j, v, 3)
-                    D1D1D1p += (DDD1Bi*xij + 3*DD1Bi*D1xij + 3*D1Bi*D11xij + Bi*D111xij)*Bj
-                    D1D1D2p += (DD1Bi*D2xij + 2*D1Bi*D12xij + Bi*D112xij)*Bj + (DD1Bi*xij + 2*D1Bi*D1xij + Bi*D11xij)*D2Bj
-                    D1D2D2p += (DD2Bj*D1xij + 2*D2Bj*D12xij + Bj*D122xij)*Bi + (DD2Bj*xij + 2*D2Bj*D2xij + Bj*D22xij)*D1Bi
-                    D2D2D2p += (DDD2Bj*xij + 3*DD2Bj*D2xij + 3*D2Bj*D22xij + Bj*D222xij)*Bi
-
-        if deriv==0:
-            return p
-        if deriv==1:
+        # Use C++ backend for speed while maintaining exact original Python logic
+        if deriv == 0:
+            return gregory_patch_backend.Grg(self._flatCtrlPts_array(), t[0], t[1], self.eps)
+        elif deriv == 1:
+            p, D1p, D2p = gregory_patch_backend.Grg_derivs(self._flatCtrlPts_array(), t[0], t[1], self.eps)
             return p, np.array([D1p, D2p],dtype=np.float64).T
         elif deriv == 2:
+            p, D1p, D2p, D1D1p, D1D2p, D2D2p = gregory_patch_backend.Grg_derivs2(self._flatCtrlPts_array(), t[0], t[1], self.eps)
             return p, \
                     np.array([D1p, D2p],dtype=np.float64).T, \
                     np.array([[D1D1p, D1D2p], [D1D2p, D2D2p]],dtype=np.float64).T
-        elif deriv == 3:
-            return p, \
-                    np.array([D1p, D2p],dtype=np.float64).T, \
-                    np.array([[D1D1p, D1D2p], [D1D2p, D2D2p]],dtype=np.float64).T, \
-                    np.array([[[D1D1D1p,D1D1D2p],[D1D1D2p,D1D2D2p]], [[D1D1D2p,D1D2D2p],[D1D2D2p,D2D2D2p]]],dtype=np.float64).T
         else:
             print("Derivative order not (yet) implemented")
+            from pdb import set_trace
             set_trace()
 
 
     def Grg0(self, t):                        # Normalized normal vector at (u,v) with treatment for undefinition at nodes
-        u,v = t
-        p       = np.array([0.0 , 0.0 , 0.0])
-        n, m = len(self.CtrlPts)-1, len(self.CtrlPts[0])-1
-
-        for i  in range(n+1):
-            for j in range(m+1):
-                # Inner nodes: values, derivatives and treatments
-                if i in [1,2] and j in [1,2]:
-                    if i==1 and j ==1:
-                        x110, x111 = self.CtrlPts[1][1]
-                        den = max(self.eps,u+v)  
-                        xij = (u*x110+v*x111)/(den)
-                            
-                    elif i==1 and j==2:
-                        x120, x121 = self.CtrlPts[1][2]
-                        den = max(self.eps,u+1-v)
-                        xij = (u*x120+(1-v)*x121)/(den)
-
-                    elif i==2 and j==1:
-                        x210, x211 = self.CtrlPts[2][1]
-                        den = max(self.eps, v+1-u)
-                        xij = ((1-u)*x210+v*x211)/(den)
-
-                    else:
-                        x220, x221 = self.CtrlPts[2][2]
-                        den = max(self.eps, 2-u-v)
-                        xij = ((1-u)*x220+(1-v)*x221)/(den)
-
-                else:
-                    xij = self.CtrlPts[i][j]
-
-                # Bernstein polynomials
-                Bi     =   Bernstein(n, i, u)
-                Bj     =   Bernstein(m, j, v)
-
-                p += Bi*Bj*xij
-
-
-        return p
+        # Grg0 is identical to Grg(t, deriv=0) - use existing C++ optimization!
+        return self.Grg(t, deriv=0)
 
     def D3Grg(self,t, normalize = True):                        # Normalized normal vector at (u,v) with treatment for undefinition at nodes
-        D1p, D2p = self.Grg(t, deriv = 1)[1].T
-        D3p = np.cross(D1p,D2p)
-        if norm(D3p) ==0:
-            set_trace()
-        if normalize:
-            D3p = D3p/norm(D3p)       # The NORMALIZED vectors are continuous from patch to patch (doesnt make sense otherwise)
-        return D3p
+        # Use C++ backend for speed while maintaining exact original Python logic
+        return gregory_patch_backend.D3Grg(self._flatCtrlPts_array(), t[0], t[1], self.eps, normalize)
 
     def dndxi(self,t,degree=1):
         _, dxcdt= self.Grg(t, deriv = 1)
@@ -498,10 +353,6 @@ class GrgPatch:
 
     def MinDist(self, x, seeding = 10,x0x1y0y1 = [0.0,1.0,0.0,1.0],recursive = False,recursionLevel=0,prev_t=None):
         
-        umin = 0.0
-        vmin = 0.0
-        dmin = norm(x-self.CtrlPts[0][0])   # Starting point
-
         if recursive:
             x0,x1,y0,y1 = x0x1y0y1
             if recursive>1:
@@ -512,33 +363,14 @@ class GrgPatch:
         else:
             x0,x1,y0,y1 = x0x1y0y1
 
-        for u in np.linspace(x0,x1,seeding+1):
-            for v in np.linspace(y0,y1,seeding+1):
-                d = norm(x - self.Grg((u,v)))
-                if d < dmin:
-                    dmin, umin, vmin = d, u, v
+        # Call C++ with full parameters to match original Python logic exactly
+        prev_u = prev_t[0] if prev_t is not None else -1.0
+        prev_v = prev_t[1] if prev_t is not None else -1.0
         
-        # if recursive and recursionLevel<8:
-        if recursive and recursionLevel<8:
-            # if prev_t is None or (abs(prev_t[0]-umin)>5e-3 and abs(prev_t[1]-vmin)>5e-3):
-            if prev_t is None or (abs(prev_t[0]-umin)>5e-3 or abs(prev_t[1]-vmin)>5e-3):    # OR!
-                    # x0 = max(0.0,umin-dx*3/16)      # 3/16 is a bit less than 1/4
-                    # x1 = min(1.0,umin+dx*3/16)      # ... and this is useful 
-                    # y0 = max(0.0,vmin-dy*3/16)      # ... to increase variance 
-                    # y1 = min(1.0,vmin+dy*3/16)      # ... and reduce redundance.
-
-                    # x0 = max(0.0,umin-3*dx/(8*seeding))      # 3/4*(dx/(2*seeding))...
-                    # x1 = min(1.0,umin+3*dx/(8*seeding))      # ... and this is useful 
-                    # y0 = max(0.0,vmin-3*dy/(8*seeding))      # ... to increase variance 
-                    # y1 = min(1.0,vmin+3*dy/(8*seeding))      # ... and reduce redundance.
-
-                    x0 = max(0.0,umin-7*dx/(16*seeding))      # 7/8*(dx/(2*seeding))...
-                    x1 = min(1.0,umin+7*dx/(16*seeding))      # ... and this is useful 
-                    y0 = max(0.0,vmin-7*dy/(16*seeding))      # ... to increase variance 
-                    y1 = min(1.0,vmin+7*dy/(16*seeding))      # ... and reduce redundance.
-            
-                    return self.MinDist(x,seeding = seeding, x0x1y0y1=[x0,x1,y0,y1],recursive=recursive,recursionLevel=recursionLevel+1,prev_t=[umin,vmin])
-
+        umin, vmin = gregory_patch_backend.MinDist(
+            self._flatCtrlPts_array(), x, seeding, self.eps, 
+            x0, x1, y0, y1, recursive, recursionLevel, prev_u, prev_v
+        )
 
         return umin , vmin      # Temporarily returning UV from the rough approximation on the grid. TODO: implement exact calculus
 
@@ -546,9 +378,9 @@ class GrgPatch:
         return np.array(self.ANN_projection_model.predict(x,verbose=verbose),dtype=np.float64)
 
     def findProjection(self,xs, seeding=10, recursive=1, decimals = None,tracing =False, ANNapprox = False,t0 = None):
-
+        
         def proj_final_check(self,xs,t):
-            # final check (for points at/beyond edges)
+            # final check (for points at/beyond edges) - restored from original
             # if not (0<=t[0]<=1 and 0<=t[1]<=1):
             if not (0<t[0]<1 and 0<t[1]<1):         # Camilo
                 t1 = min(max(0.0,t[0]),1.0)     # trimming values
@@ -560,63 +392,61 @@ class GrgPatch:
                     return np.array([-1.0,-1.0])
             return t
 
-
-
         if not ANNapprox:
-            t = np.array(self.MinDist(xs, seeding=seeding,recursive=recursive))
+            t_initial = np.array(self.MinDist(xs, seeding=seeding,recursive=recursive))
         elif t0 is not None:
-            t = t0.copy()
+            t_initial = t0.copy()
         else:
-            t = self.MinDistANN( np.array([xs + np.array([-6.0, 0.0, 0.0],dtype=np.float64)]) , verbose=0 )[0]
+            t_initial = self.MinDistANN( np.array([xs + np.array([-6.0, 0.0, 0.0],dtype=np.float64)]) , verbose=0 )[0]
 
-        # tol = 1e-16
-        tol = 1e-15
-        res = 1+tol
-        niter = 0
-        tcandidate = t.copy()   # Is this a good candidate? It could happen that is it wrongly entering
-                                # with 0<t<1 in case of ANN and actually should be slightly out of bounds.
-                                # That would iterate 13 times and return the wrong value (this value).
-        dist = norm(xs - self.Grg0(tcandidate))  # Initial guess for distance in case there is no convergence
-
-
-        # import pdb; pdb.set_trace()
-
-        xc, dxcdt, d2xcd2t = self.Grg(t, deriv = 2)
-        f = -2*(xs-xc)@dxcdt
-        # opa = 5e-2  # this allows for a certain percentage of out-patch-allowance for NR to iterate in.
-        opa = 1e-2  # 5e-2 was giving problems for 3rd potato example with getCandidsANN
-        while res>tol and (0-opa<=t[0]<=1+opa and 0-opa<=t[1]<=1+opa):
-
-            
-
-            #f = -2*(xs-xc)@dxcdt
-            K =  2*(np.tensordot(-( xs-xc),d2xcd2t,axes=[[0],[0]]) + dxcdt.T @ dxcdt)
-
-            dt=np.linalg.solve(-K,f)
-            t+=dt
-            
-            xc, dxcdt, d2xcd2t = self.Grg(t, deriv = 2)
-            f = -2*(xs-xc)@dxcdt
-
-            res = np.linalg.norm(dt)
-
-            if res<np.sqrt(tol) and not (0<t[0]<1 and 0<t[1]<1):  # if it is converging outside the patch
-                return np.array([-1.0,-1.0])
-
-            # print("iter:",niter,"\tt:",t,"\tres:",res)
-
-            niter +=1
-            if niter > 10:
-                dist_new = norm(xs - xc )
-                if dist_new < dist:
-                    dist = dist_new
-                    tcandidate = t.copy()
-                if niter> 13:
-                    # return tcandidate
-                    return proj_final_check(self,xs,tcandidate)
-                
+        u, v = gregory_patch_backend.find_projection(self._flatCtrlPts_array(), xs, tuple(t_initial), self.BS.r, self.eps)
+        t = np.array([u, v])
+        
+        # Apply final boundary check like original Python version
         t = proj_final_check(self,xs,t)
-                
+
+        return t if decimals is None else t.round(decimals)
+
+    def findProjection_TR(self, xs, TR_init=1e-3, TR_min=1e-12, TR_max=1.0, decimals=None):
+        """Trust-region based projection using 9 fixed seeds in (t1, t2).
+
+        Parameters
+        ----------
+        xs : array_like
+            Point in R^3 to project.
+        TR_init : float, optional
+            Initial trust-region radius used in the C++ TR solver.
+        TR_min : float, optional
+            Minimum trust-region radius used in the C++ TR solver.
+        TR_max : float, optional
+            Maximum trust-region radius used in the C++ TR solver.
+        decimals : int or None, optional
+            If not None, round the returned parameters to this many decimals.
+        """
+
+        def proj_final_check(xs_local, t_local):
+            # final check (for points at/beyond edges) - same as in findProjection
+            if not (0 < t_local[0] < 1 and 0 < t_local[1] < 1):  # Camilo
+                t1 = min(max(0.0, t_local[0]), 1.0)
+                t2 = min(max(0.0, t_local[1]), 1.0)
+                xc0 = self.Grg0([t1, t2])
+                nor0 = self.D3Grg([t1, t2])
+                x_tang = (xs_local - xc0) - (xs_local - xc0) @ nor0
+                if norm(x_tang) > 2 * self.BS.r / 100:
+                    return np.array([-1.0, -1.0])
+            return t_local
+
+        u, v, _ = gregory_patch_backend.find_projection_tr(
+            self._flatCtrlPts_array(),
+            xs.astype(np.float64),
+            self.eps,
+            TR_init,
+            TR_min,
+            TR_max
+        )
+
+        t = np.array([u, v])
+        t = proj_final_check(xs, t)
         return t if decimals is None else t.round(decimals)
 
     # xc derivs
@@ -1305,10 +1135,8 @@ class GrgPatch:
         """Frictionless contact potential"""
         if t is None:
             t = self.findProjection(xs)
-        xc,dxcdt = self.Grg(t,deriv=1)
-        D1p, D2p = dxcdt.T
-        D3p = np.cross(D1p,D2p)
-        normal = D3p/norm(D3p)
+        xc = self.Grg(t,deriv=0)
+        normal = self.D3Grg(t, normalize=True)  # Use optimized D3Grg instead of duplicate cross product
         gn = (xs-xc)@normal
 
         if  cubicT is None:
@@ -1323,17 +1151,13 @@ class GrgPatch:
             set_trace()
 
 
-
-
     def mf_fless_rigidMaster(self, xs, kn, seeding=10, cubicT=None, OPA=1e-8, xs_check=None, ANNapprox = False,t0=None,recursive_seeding=1):       #Chain rule by hand
         """Frictionless contact force"""
         Ne = len(self.squad)
 
         t = self.findProjection(xs,ANNapprox=ANNapprox,t0=t0,recursive = recursive_seeding)
-        xc,dxcdt = self.Grg(t,deriv=1)
-        D1p, D2p = dxcdt.T
-        D3p = np.cross(D1p,D2p)
-        normal = D3p/norm(D3p)
+        xc = self.Grg(t,deriv=0)
+        normal = self.D3Grg(t, normalize=True)  # Use optimized D3Grg instead of duplicate cross product
         gn = (xs-xc)@normal
 
         # print("id_patch: ",self.iquad,"gn: ",gn)
@@ -1357,17 +1181,51 @@ class GrgPatch:
             return kn/2*(2*gn*dgndu - cubicT*dgndu), gn, t
         else:
             return kn/(2*cubicT)*gn**2*dgndu, gn, t
-        
+
+    def mf_fless_rigidMaster_TR(
+        self,
+        xs,
+        kn,
+        cubicT=None,
+        OPA=1e-8,
+        xs_check=None,
+        TR_init=0.1,
+        TR_min=1e-12,
+        TR_max=1.0,
+    ):
+        """Frictionless contact force using trust-region based projection."""
+        Ne = len(self.squad)
+
+        # Trust-region projection in parameter space
+        t = self.findProjection_TR(xs, TR_init=TR_init, TR_min=TR_min, TR_max=TR_max)
+        xc = self.Grg0(t)
+        normal = self.D3Grg(t, normalize=True)
+        gn = (xs - xc) @ normal
+
+        opa = 0
+        if not (0 - opa <= t[0] <= 1 + opa and 0 - opa <= t[1] <= 1 + opa):
+            return 0.0, np.zeros(3 * (Ne + 1)), gn, t
+
+        dgndu = np.zeros(3 * (Ne + 1))
+        # only the terms related to the slave node. Also dgndxc@dxcdxs = dgndn@dndxs = 0
+        dgndu[:3] = normal
+
+        if cubicT is None:
+            fintCN = kn * gn * dgndu
+            mC = 0.5 * kn * gn**2
+            return mC, fintCN, gn, t
+        elif gn < cubicT:
+            return kn / 2 * (2 * gn * dgndu - cubicT * dgndu), gn, t
+        else:
+            return kn / (2 * cubicT) * gn**2 * dgndu, gn, t
 
     def fintC_fless_rigidMaster(self, xs, kn, seeding=10, cubicT=None, OPA=1e-8, xs_check=None, ANNapprox = False,t0=None,recursive_seeding=1,test_gns=False):       #Chain rule by hand
         """Frictionless contact force"""
         Ne = len(self.squad)
 
         t = self.findProjection(xs,ANNapprox=ANNapprox,t0=t0,recursive = recursive_seeding)
-        xc,dxcdt = self.Grg(t,deriv=1)
-        D1p, D2p = dxcdt.T
-        D3p = np.cross(D1p,D2p)
-        normal = D3p/norm(D3p)
+        xc = self.Grg(t,deriv=0)
+        normal = self.D3Grg(t, normalize=True)  # Use optimized D3Grg instead of duplicate cross product
         gn = (xs-xc)@normal
 
         # print("id_patch: ",self.iquad,"gn: ",gn)
@@ -2164,9 +2022,7 @@ class GrgPatch:
 
         t = self.findProjection(xs) if t is None else t
         xc, dxcdt, d2xcd2t= self.Grg(t, deriv = 2)
-        D1p, D2p = dxcdt.T
-        D3p = np.cross(D1p,D2p)
-        normal = D3p/norm(D3p)
+        normal = self.D3Grg(t, normalize=True)  # Use optimized D3Grg instead of duplicate cross product
         gn = (xs-xc)@normal
 
         opa = 1e-3
@@ -3700,7 +3556,10 @@ class GrgPatch:
         ax.set_xlim3d((xyz_lims[0][0],xyz_lims[0][1] ))
         ax.set_ylim3d((xyz_lims[1][0],xyz_lims[1][1] ))
         ax.set_zlim3d((xyz_lims[2][0],xyz_lims[2][1] ))
-        ax.set_aspect('equal', 'box')
+        try:
+            ax.set_aspect('equal', 'box')
+        except NotImplementedError:
+            pass
 
 
         self.plot(ax, color =(0,0,1, 0.75),ref=ref)

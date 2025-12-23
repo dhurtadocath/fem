@@ -51,7 +51,10 @@ blk.Translate([6.0,0.0,4.5])
 
 
 # # POTATO
-[ptt] = pickle.load(open("PotatoAssembly.dat","rb"))
+[ptt] = pickle.load(open("Dat/PotatoAssembly.dat","rb"))
+# Fix compatibility issue from hexas->elements rename
+if hasattr(ptt, 'hexas') and not hasattr(ptt, 'elements'):
+    ptt.elements = ptt.hexas
 ## OR ##
 # mesh_ptt = meshio.read("../Meshes/QuadSpheres/QuadSphere4.msh")
 # # mesh_ptt = meshio.read("Meshes/Cubes/cube843.msh")
@@ -62,7 +65,7 @@ blk.Translate([6.0,0.0,4.5])
 # ptt.Resize(3.0,dir='y')
 # ptt.Resize(2.0,dir='z')
 # ptt.RandDistort(0.5)
-# # pickle.dump([ptt],open("PotatoAssembly.dat","wb"))
+# # pickle.dump([ptt],open("Dat/PotatoAssembly.dat","wb"))
 ptt.isRigid = True     # faster solving when True
 
 

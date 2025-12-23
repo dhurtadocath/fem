@@ -1,0 +1,122 @@
+Metadata-Version: 2.4
+Name: fem-contact-mechanics
+Version: 0.1.0
+Summary: Finite Element Method for Contact Mechanics with ML Acceleration
+Author: FEM Contact Mechanics Team
+License: MIT
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering :: Physics
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: C++
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: numpy<1.27.0,>=1.26.0
+Requires-Dist: scipy<1.15.0,>=1.14.0
+Requires-Dist: numba<0.61.0,>=0.60.0
+Requires-Dist: h5py<3.13.0,>=3.12.0
+Requires-Dist: meshio<5.4.0,>=5.3.0
+Requires-Dist: joblib<1.5.0,>=1.4.0
+Requires-Dist: rich<14.0.0,>=13.0.0
+Provides-Extra: ml
+Requires-Dist: tensorflow<2.18.0,>=2.17.0; extra == "ml"
+Requires-Dist: keras<3.7.0,>=3.6.0; extra == "ml"
+Requires-Dist: tensorboard<2.18.0,>=2.17.0; extra == "ml"
+Provides-Extra: viz
+Requires-Dist: matplotlib<3.10.0,>=3.9.0; extra == "viz"
+Requires-Dist: PyQt5<5.16.0,>=5.15.0; extra == "viz"
+Requires-Dist: Pillow<11.0.0,>=10.4.0; extra == "viz"
+Provides-Extra: dev
+Requires-Dist: pytest<8.0.0,>=7.4.0; extra == "dev"
+Requires-Dist: pytest-cov<5.0.0,>=4.1.0; extra == "dev"
+Requires-Dist: black<24.0.0,>=23.0.0; extra == "dev"
+Requires-Dist: flake8<7.0.0,>=6.1.0; extra == "dev"
+Requires-Dist: mypy<2.0.0,>=1.8.0; extra == "dev"
+Requires-Dist: isort<6.0.0,>=5.13.0; extra == "dev"
+Requires-Dist: ipython<9.0.0,>=8.18.0; extra == "dev"
+Requires-Dist: jupyter<2.0.0,>=1.0.0; extra == "dev"
+Requires-Dist: pre-commit<4.0.0,>=3.6.0; extra == "dev"
+Provides-Extra: all
+Requires-Dist: fem-contact-mechanics[dev,ml,viz]; extra == "all"
+
+# FEM - Computational Contact Mechanics and Machine Learning
+
+This repository contains the code used for my PhD thesis, which focuses on two main topics:
+
+1. **Minimization-Based Contact Mechanics**: Implementations of different minimization techniques (BFGS, L-BFGS, and Trust Region methods) to solve contact problems in quasi-static simulations.
+2. **Neural Network-Based Contact Detection**: Multi-task neural network models for accelerating contact detection in rigid-body simulations.
+
+## Repository Structure
+
+```
+FEM/
+│── 1_Minimization_solvers/         # Code for minimization-based contact solvers
+│── 2_Accelerated_Contact_Detection/ # Code for ANN-based contact detection
+│── PyClasses/                       # Python classes used in the main scripts
+│── Meshes/                           # Mesh data used for simulations
+│── Other_work/                       # Additional or exploratory work
+│── Paper1: Remedy_to_Newton_v0/      # Material related to a paper submission
+│── .gitignore                        # Files to be ignored by git
+│── environment.yml                    # Conda environment setup
+│── fem-env.yml                        # Additional environment configuration
+│── requirements.txt                    # Python dependencies
+```
+
+## Getting Started
+
+### 1. Clone the Repository
+```bash
+git clone https://github.com/dhurtadocath/fem.git
+cd fem
+```
+
+### 2. Set Up the Environment
+#### Using Conda:
+```bash
+conda env create -f environment.yml
+conda activate fem-env
+```
+#### Using pip:
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Running the Code
+Each of the main sections (`1_Minimization_solvers/` and `2_Accelerated_Contact_Detection/`) contains 2D and 3D examples that require specific input parameters.
+
+#### **Minimization-Based Contact Mechanics**
+- **2D Case:**
+```bash
+python pseudo2d.py --min_method BFGS --mesh 5 --plastic 0
+```
+  - Available meshes: `5` (5x5x5), `10`, `15`
+  - Minimization methods: `BFGS`, `LBFGSnn` (nn is the number of iteration differences stored), `TR`, `TR-icho` (Trust regions with incomplete Cholesky decomposition as a preconditioner)
+
+- **3D Case:**
+```bash
+python ContactPotato_Ex1.py --min_method BFGS --mesh 10 --plastic 0
+```
+
+#### **Neural Network-Based Contact Detection**
+The scripts in `2_Accelerated_Contact_Detection/` follow the same execution principle but include an additional flag to determine if the Multi-Task ANN is used.
+
+- **Example (3D with ANN disabled):**
+```bash
+python ContactPotato_Ex2.py --min_method BFGS --mesh 15 --plastic 0 --ann 0
+```
+
+## Compilation Notice
+The material solver in `PyClasses/FEAssembly.py` uses compiled functions to compute the material contributions to the system. **Only the first time you run a script, the code will need to compile this, which may take several minutes.** After that, the compiled files remain in `PyClasses/` and will be reused in subsequent runs, significantly reducing execution time.
+
+## Future Improvements
+- Adding **unit tests** for core functionalities.
+- Implementing **GitHub Actions** for automated testing.
+- Improving documentation with detailed explanations of models and methods.
+
+## License
+TBD
+

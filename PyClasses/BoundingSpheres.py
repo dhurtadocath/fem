@@ -9,6 +9,9 @@ import numpy as np
 from numpy.linalg import norm
 from math import sqrt
 
+# Import C++ backend at module level to reduce per-call overhead
+from . import gregory_patch_backend
+
 
 
 class BS:
@@ -131,7 +134,9 @@ class BS:
         # return sphereCenter, Rad
 
     def ContainsNode(self,xp):
-        return norm(xp-self.x) <= self.r
+        # Use C++ backend for speed while maintaining exact logic: norm(xp-self.x) <= self.r
+        # Import moved to module level to reduce per-call overhead
+        return gregory_patch_backend.ContainsNode(self.x, self.r, xp)
 
     def CollidesWithBS(self,BS2, res = "bool"):
         if res == "bool":

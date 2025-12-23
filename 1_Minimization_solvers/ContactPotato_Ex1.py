@@ -51,7 +51,10 @@ blk.Translate([0.0,0.0,3.5])
 
 
 # # POTATO
-[ptt] = pickle.load(open("PotatoAssembly.dat","rb"))
+[ptt] = pickle.load(open("Dat/PotatoAssembly.dat","rb"))
+# Fix compatibility issue from hexas->elements rename
+if hasattr(ptt, 'hexas') and not hasattr(ptt, 'elements'):
+    ptt.elements = ptt.hexas
 ## OR ##
 # mesh_ptt = meshio.read("../Meshes/QuadSpheres/QuadSphere4.msh")
 # # mesh_ptt = meshio.read("Meshes/Cubes/cube843.msh")
@@ -62,7 +65,7 @@ blk.Translate([0.0,0.0,3.5])
 # ptt.Resize(3.0,dir='y')
 # ptt.Resize(2.0,dir='z')
 # ptt.RandDistort(0.5)
-# pickle.dump([ptt],open("PotatoAssembly.dat","wb"))
+# pickle.dump([ptt],open("Dat/PotatoAssembly.dat","wb"))
 ptt.isRigid = True     # faster solving when True
 
 ######################
@@ -86,7 +89,36 @@ BCs = [cond_bd1, cond_bd2]
 slave   = [blk , blk_bottom]
 master = [ptt,ptt_highernodes]
 
-contact1 = Contact(slave, master, kn=1e2, C1Edges = False, maxGN = 0.001,f0=0.1)       # (slave, master) inputs can be surfaces as well
+# CONVERGENCE FIX: Mesh-adaptive contact parameters to prevent oscillations
+element_size = 4.0 / mesh  # Approximate element characteristic length
+
+# Conservative contact stiffness scaling - maintain reasonable ratio to material stiffness
+E = blk.Youngsmodulus  # Material Young's modulus
+base_kn = 100.0 * E  # Conservative base stiffness (20x material stiffness)
+
+# Scale contact stiffness y with mesh characteristic parameter L/h 
+# mesh_adapted_kn = 0.1*base_kn*mesh
+mesh_adapted_kn = base_kn
+
+# penetration tolerance 
+maxGN = 0.0001
+
+
+print(f"Mesh-adaptive contact parameters for mesh={mesh}:")
+print(f"  Element size: {element_size:.3f}")
+print(f"  Material E: {E:.3f}")
+print(f"  Contact stiffness kn: {mesh_adapted_kn:.2f} (was 1e2={1e2:.0f})")
+print(f"  Max penetration maxGN: {maxGN:.4f} (was 0.001)")
+
+# contact1 = Contact(slave, master, kn=mesh_adapted_kn, C1Edges = False,
+#                     maxGN = maxGN, f0=0.1)
+
+contact1 = Contact(slave, master, kn=mesh_adapted_kn, C1Edges = False,
+                    maxGN = maxGN, f0=0.1, use_TR_projection=True,
+                    TR_init=0.1, TR_min=1e-15, TR_max=1.0,
+                    tr_base_ncand=24, tr_min_ncand=10, tr_max_ncand=96,
+                    tr_radius_factor_initial=1.5, tr_k_surf=15)
+
 
 ### MODEL ###
 subname = "_"+("plastic" if plastic else "elastic")+"_"+minimization_method+"_"+str(mesh)
@@ -108,8 +140,8 @@ model.plotNow()       # Uncomment to see and verify geometry
 t0 = time()
 
 
-recov = "OUTPUT_202410290908ContactPotato_slideX_elastic_BFGS_10/"+"RecoveryData.dat"
-model.Solve(TimeSteps=100,max_iter=20, recover=False ,minimethod=minimization_method,plot=1)
+# recov = "OUTPUT_202410290908ContactPotato_slideX_elastic_BFGS_10/"+"RecoveryData.dat"
+model.Solve(TimeSteps=100,max_iter=20, recover=False ,minimethod=minimization_method,plot=0)
 
 
 

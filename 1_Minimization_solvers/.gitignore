@@ -8,3 +8,4 @@ fem-env/
 cache_directory/
 *.so
 *.pyc
+*.prof

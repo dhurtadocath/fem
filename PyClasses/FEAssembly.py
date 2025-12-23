@@ -444,55 +444,12 @@ class FEAssembly:
         # return K
 
     def m_el_extra(self, hexa, u):
-        X = self.X[hexa]
-        u = u[self.DoFs[hexa]]
-
-        SED = np.zeros((8,))
-        NN = np.zeros((8,8))
-
-
-        d1 = self.Youngsmodulus * self.Poissonsratio / (2 * (1 + self.Poissonsratio) * (1 - 2 * self.Poissonsratio))
-        c10 = self.Youngsmodulus / (4 * (1 + self.Poissonsratio))
-
-        gauss_points = 1 / np.sqrt(3) * np.array([[-1, -1, -1],
-                                                [1, -1, -1],
-                                                [1, 1, -1],
-                                                [-1, 1, -1],
-                                                [-1, -1, 1],
-                                                [1, -1, 1],
-                                                [1, 1, 1],
-                                                [-1, 1, 1]])
-
-        for g_i,(g1, g2, g3) in enumerate(gauss_points):
-            dNd_xi = 1 / 8 * np.array([[-(1 - g2) * (1 - g3), -(1 - g1) * (1 - g3), -(1 - g1) * (1 - g2)],
-                                    [(1 - g2) * (1 - g3), -(1 + g1) * (1 - g3), -(1 + g1) * (1 - g2)],
-                                    [(1 + g2) * (1 - g3), (1 + g1) * (1 - g3), -(1 + g1) * (1 + g2)],
-                                    [-(1 + g2) * (1 - g3), (1 - g1) * (1 - g3), -(1 - g1) * (1 + g2)],
-                                    [-(1 - g2) * (1 + g3), -(1 - g1) * (1 + g3), (1 - g1) * (1 - g2)],
-                                    [(1 - g2) * (1 + g3), -(1 + g1) * (1 + g3), (1 + g1) * (1 - g2)],
-                                    [(1 + g2) * (1 + g3), (1 + g1) * (1 + g3), (1 + g1) * (1 + g2)],
-                                    [-(1 + g2) * (1 + g3), (1 - g1) * (1 + g3), (1 - g1) * (1 + g2)]])
-
-            J = np.dot(dNd_xi.T, X)
-            invJ = np.linalg.inv(J)
-
-            dNdx = np.dot(dNd_xi, invJ.T)
-            F = np.eye(len(dNdx.T)) + np.dot(dNdx.T, u).T
-            detF = np.linalg.det(F)
-
-            SED[g_i] = c10 * (np.trace(F.T @ F) - 3 - 2 * np.log(detF)) + d1 * (np.log(detF))**2
-
-            # Extrapolate the SED values to the nodes
-            NN[g_i] = 1 / 8 * np.array([(1 - g1) * (1 - g2) * (1 - g3),
-                                (1 + g1) * (1 - g2) * (1 - g3),
-                                (1 + g1) * (1 + g2) * (1 - g3),
-                                (1 - g1) * (1 + g2) * (1 - g3),
-                                (1 - g1) * (1 - g2) * (1 + g3),
-                                (1 + g1) * (1 - g2) * (1 + g3),
-                                (1 + g1) * (1 + g2) * (1 + g3),
-                                (1 - g1) * (1 + g2) * (1 + g3)])
-
-        return SED@np.linalg.inv(NN)
+        # Use C++ backend for speed while maintaining exact original Python logic
+        from . import gregory_patch_backend
+        X_hexa = self.X[hexa]
+        u_hexa = u[self.DoFs[hexa]]
+        
+        return gregory_patch_backend.m_el_extra(X_hexa, u_hexa, self.Youngsmodulus, self.Poissonsratio)
 
     def get_nodal_SED(self,u):
 

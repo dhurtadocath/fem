@@ -1,0 +1,39 @@
+# Include all other requirements
+-r ml.txt
+-r viz.txt
+
+# Development tools
+pytest>=7.4.0,<8.0.0
+pytest-cov>=4.1.0,<5.0.0
+black>=23.0.0,<24.0.0
+flake8>=6.1.0,<7.0.0
+mypy>=1.8.0,<2.0.0
+isort>=5.13.0,<6.0.0
+psutil
+
+# Interactive development
+ipython>=8.18.0,<9.0.0
+jupyter>=1.0.0,<2.0.0
+notebook>=7.0.0,<8.0.0
+
+# Documentation
+sphinx>=7.2.0,<8.0.0
+sphinx-rtd-theme>=2.0.0,<3.0.0
+
+# C++ integration for development
+pybind11>=2.13.0,<2.14.0
+
+# Code formatting and linting
+autopep8>=2.0.0,<3.0.0
+pylint>=3.0.0,<4.0.0
+
+# Debugging
+ipdb>=0.13.0,<0.14.0
+
+# Performance profiling
+memory-profiler>=0.61.0,<0.62.0
+line-profiler>=4.1.0,<4.2.0
+
+# Additional utilities
+pre-commit>=3.6.0,<4.0.0
+tqdm>=4.66.0,<5.0.0
