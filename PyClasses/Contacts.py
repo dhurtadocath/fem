@@ -367,7 +367,9 @@ class Contact:
         for every slave node, with BS + surface-KD candidate selection and the
         C++ TR+Newton core (objective SDF).
         """
-        from ._contact_tr_multi_helpers import project_point_tr_multi
+        from ._contact_tr_multi_helpers import (
+            project_points_tr_multi_batch,
+        )
         from PyClasses import gregory_patch_backend  # ensure module is loaded
 
         # Ensure TR geometry structures are built (only for rigid masters)
@@ -387,42 +389,50 @@ class Contact:
         sDoFs  = self.slaveBody.DoFs[self.slaveNodes]
         xs_all = np.array(self.slaveBody.X )[self.slaveNodes ] + np.array(u[sDoFs ])
         self.xs = xs_all
-
         eventList_iter = []
+        n_points = self.nsn
 
-        for idx in range(self.nsn):
-            xsi = xs_all[idx]
-            kn  = self.alpha_p[idx] * self.kn
-            # Multi-patch TR projection with BS + surface-KD candidates.
-            # project_point_tr_multi now returns the patch id, parameters,
-            # signed distance, and normal directly from the C++ TR core.
-            p_id, t1, t2, gn, normal = project_point_tr_multi(
-                xsi,
-                xm_matrix,
-                ctrlpts_all,
-                radii,
-                eps,
-                self.TR_init,
-                self.TR_min,
-                self.TR_max,
-                surf_kdtree,
-                surf_patch_ids,
-                self.tr_base_ncand,
-                self.tr_min_ncand,
-                self.tr_max_ncand,
-                self.tr_radius_factor_initial,
-                self.tr_k_surf,
-            )
+        # Batch TR projection for all slave nodes using the C++ OpenMP helper
+        (
+            patch_ids,
+            t1_arr,
+            t2_arr,
+            gn_arr,
+            normals,
+            xs_surf,
+        ) = project_points_tr_multi_batch(
+            xs_all,
+            xm_matrix,
+            ctrlpts_all,
+            radii,
+            eps,
+            self.TR_init,
+            self.TR_min,
+            self.TR_max,
+            surf_kdtree,
+            surf_patch_ids,
+            self.tr_base_ncand,
+            self.tr_min_ncand,
+            self.tr_max_ncand,
+            self.tr_radius_factor_initial,
+            self.tr_k_surf,
+        )
 
-            if p_id < 0:
-                # No valid projection / contact
+        for idx in range(n_points):
+            p_id = int(patch_ids[idx])
+            gn = float(gn_arr[idx])
+            normal = normals[idx]
+            kn = self.alpha_p[idx] * self.kn
+
+            # Invalid projection or NaN distance: no contact
+            if p_id < 0 or not np.isfinite(gn):
                 if self.actives[idx] is not None:
                     eventList_iter.append(f"{idx}: {self.actives[idx]}-->None")
                 self.actives[idx] = None
                 continue
 
+            # No compression -> no contact
             if gn >= 0.0:
-                # No compression -> no contact
                 if self.actives[idx] is not None:
                     eventList_iter.append(f"{idx}: {self.actives[idx]}-->None")
                 self.actives[idx] = None
@@ -435,7 +445,7 @@ class Contact:
                 self.actives[idx] = p_id
 
             # Store patch id, parametric coordinates (t1,t2) and gn for this node
-            self.proj[idx] = np.array([p_id, t1, t2, gn])
+            self.proj[idx] = np.array([p_id, t1_arr[idx], t2_arr[idx], gn])
 
             # Contact potential and force (only slave node DOFs for rigid master)
             m += 0.5 * kn * gn**2
