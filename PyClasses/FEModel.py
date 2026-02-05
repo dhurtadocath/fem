@@ -383,14 +383,15 @@ class FEModel:
             if temp: ctct.patch_changes = []                 # to keep track of the changes during iterations
             sDoFs  = ctct.slaveBody.DoFs[ctct.slaveNodes]
             ctct.xs = np.array(ctct.slaveBody.X )[ctct.slaveNodes ] + np.array(u[sDoFs ])      # u_temp
-            
-            # if ctct.ANNmodel is not None:
-            #     ctct.get_fintCamilo(self,DispTime = False, tracing = False)
-            # else:
+
+            # Legacy behaviour: use the projection-based contact force paths.
+            # TR-based contact is still available through Energy_and_Force /
+            # compute_mf_unilateral but NR continues to use the original,
+            # well-tested routines here.
             if self.IterUpdate:
                 ctct.getfintC_unilateral(self, DispTime=DispTime)      # uses xs
             else:
-                ctct.getfintC(self, DispTime=DispTime)      # uses xs
+                ctct.getfintC(self, DispTime=DispTime)                 # uses xs
         self.TIMERS[4] += time.time()-fcon_t0
 
     def get_K(self, DispTime = False):
@@ -405,10 +406,10 @@ class FEModel:
 
 
         for contact in self.contacts:
-            # if contact.ANNmodel is not None:
-            #     contact.get_KCamilo(self,DispTime = False, tracing = False)
-            # else:
-
+            # Legacy stiffness assembly: continue using the original KC
+            # routines for NR. TR-based stiffness is available via the
+            # dedicated contact.compute_k, but not wired into NR here to
+            # preserve robustness.
             if self.IterUpdate:
                 contact.getKC_unilateral(self, DispTime=DispTime)     #uses model.u_temp
             else:

@@ -30,3 +30,6 @@ for_HPC
 Legacy/
 ContactData*
 *.pstats
+*.vol
+*.ini
+*.tex

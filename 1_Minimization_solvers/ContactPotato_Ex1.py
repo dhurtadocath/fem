@@ -94,7 +94,7 @@ element_size = 4.0 / mesh  # Approximate element characteristic length
 
 # Conservative contact stiffness scaling - maintain reasonable ratio to material stiffness
 E = blk.Youngsmodulus  # Material Young's modulus
-base_kn = 100.0 * E  # Conservative base stiffness (20x material stiffness)
+base_kn = 20.0 * E  # Conservative base stiffness (20x material stiffness)
 
 # Scale contact stiffness y with mesh characteristic parameter L/h 
 # mesh_adapted_kn = 0.1*base_kn*mesh
@@ -141,7 +141,7 @@ t0 = time()
 
 
 # recov = "OUTPUT_202410290908ContactPotato_slideX_elastic_BFGS_10/"+"RecoveryData.dat"
-model.Solve(TimeSteps=100,max_iter=20, recover=False ,minimethod=minimization_method,plot=0)
+model.Solve(TimeSteps=100,max_iter=20, recover=False ,minimethod=minimization_method,plot=1)
 
 
 

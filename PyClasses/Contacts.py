@@ -619,8 +619,10 @@ class Contact:
 
         # Always refresh candidates and TR caches for the current configuration.
         # In TR+rigid mode this will also populate self.tr_xs_surf and
-        # self.tr_normals via the C++ multi-patch TR core.
-        self.getCandidates(u)   # this updates self.xs and candidates. We don't use 'actives' here in the old path.
+        # self.tr_normals via the C++ multi-patch TR core. We must pass
+        # CheckActive=True so that the TR batch path in getCandidates()
+        # is executed and actives/proj/tr_normals are refreshed.
+        self.getCandidates(u, CheckActive=True)
 
         # Optimized TR unilateral path: when TR projection is enabled, the
         # master is rigid, and no cubic regularization is requested, reuse
@@ -638,7 +640,8 @@ class Contact:
                     continue
 
                 # Projection data and geometry from the TR batch call:
-                t1, t2, gn = self.proj[idx]
+                # self.proj[idx] stores [p_id, t1, t2, gn]
+                _, t1, t2, gn = self.proj[idx]
                 normal = self.tr_normals[idx]
 
                 # Sanity check on parametric location as in the original code.
