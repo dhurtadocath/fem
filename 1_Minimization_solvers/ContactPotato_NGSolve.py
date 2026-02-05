@@ -38,7 +38,8 @@ parser.add_argument("--E",          type=float, default=0.05,    help="Young's m
 parser.add_argument("--nu",         type=float, default=0.3,     help="Poisson ratio")
 parser.add_argument("--kn_factor",  type=float, default=20.0,    help="kn = kn_factor * E")
 parser.add_argument("--nsteps",     type=int,   default=100,     help="number of load steps")
-parser.add_argument("--max_iter",   type=int,   default=20,      help="max minimiser iterations per step")
+parser.add_argument("--max_iter",   type=int,   default=500,     help="max minimiser iterations per step")
+parser.add_argument("--gtol",       type=float, default=1e-6,    help="gradient tolerance for convergence")
 parser.add_argument("--compare",    action="store_true",         help="write comparison outputs")
 parser.add_argument("--plot",       type=int,   default=1,       help="VTK export every N steps (0=off)")
 args = parser.parse_args()
@@ -349,11 +350,13 @@ def objective(x_free):
     E_con = 0.5 * kn * np.sum(gn[active]**2)
 
     f_con = np.zeros(ndof)
-    for idx in np.where(active)[0]:
-        v = slave_verts[idx]
-        f_con[v]          += kn * gn[idx] * normals[idx, 0]
-        f_con[v + nv]     += kn * gn[idx] * normals[idx, 1]
-        f_con[v + 2*nv]   += kn * gn[idx] * normals[idx, 2]
+    if np.any(active):
+        act = np.where(active)[0]
+        verts_act = slave_verts[act]
+        kgn = kn * gn[act]                              # (n_active,)
+        f_con[verts_act]          = kgn * normals[act, 0]
+        f_con[verts_act + nv]     = kgn * normals[act, 1]
+        f_con[verts_act + 2*nv]   = kgn * normals[act, 2]
 
     f_total = f_mat + f_con
     return E_mat + E_con, f_total[free_dofs].copy()
@@ -376,10 +379,10 @@ def update_contact_fields(gn, normals, active, f_con):
     act_np = gf_contact_active.vec.FV().NumPy()
     act_np[:] = 0.0
 
-    for idx in np.where(active)[0]:
-        v = slave_verts[idx]
-        pen_np[v] = gn[idx]       # negative = penetration
-        act_np[v] = 1.0
+    if np.any(active):
+        act = np.where(active)[0]
+        pen_np[slave_verts[act]] = gn[act]
+        act_np[slave_verts[act]] = 1.0
 
     gf_contact_rx.vec.FV().NumPy()[:] = f_con
 
@@ -404,7 +407,7 @@ disp_increment = np.array([12.0, 0.0, 0.0]) * dt   # prescribed sliding
 print(f"\n{'='*60}")
 print(f"  ContactPotato NGSolve — mesh {n}x{n}x{n}")
 print(f"  E={E_val}, nu={nu_val}, kn={kn:.4f}")
-print(f"  {nsteps} steps, max_iter={max_iter}, method={args.min_method}")
+print(f"  {nsteps} steps, max_iter={max_iter}, gtol={args.gtol:.0e}, method={args.min_method}")
 print(f"{'='*60}\n")
 
 t_wall_start = perf_counter()
@@ -425,7 +428,8 @@ for step in range(1, nsteps + 1):
     x0 = vec[free_dofs].copy()
     result = minimize(
         objective, x0, method='L-BFGS-B', jac=True,
-        options={'maxiter': max_iter, 'gtol': 1e-10},
+        options={'maxiter': max_iter, 'gtol': args.gtol,
+                 'maxls': 40, 'ftol': 0},
     )
     vec[free_dofs] = result.x
 
@@ -437,20 +441,25 @@ for step in range(1, nsteps + 1):
     ])
     gn, normals, active = contact_cache.evaluate(slave_pos)
     f_con = np.zeros(ndof)
-    for idx in np.where(active)[0]:
-        v = slave_verts[idx]
-        f_con[v]          += kn * gn[idx] * normals[idx, 0]
-        f_con[v + nv]     += kn * gn[idx] * normals[idx, 1]
-        f_con[v + 2*nv]   += kn * gn[idx] * normals[idx, 2]
+    if np.any(active):
+        act = np.where(active)[0]
+        verts_act = slave_verts[act]
+        kgn = kn * gn[act]
+        f_con[verts_act]          = kgn * normals[act, 0]
+        f_con[verts_act + nv]     = kgn * normals[act, 1]
+        f_con[verts_act + 2*nv]   = kgn * normals[act, 2]
     update_contact_fields(gn, normals, active, f_con)
 
     n_active = int(np.sum(active))
     max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
     dt_step  = perf_counter() - t_step
     print(f"Step {step:3d}/{nsteps}  success={result.success}  "
-          f"nit={result.nit:2d}  |grad|={np.linalg.norm(result.jac):.2e}  "
+          f"nit={result.nit:2d}  nfev={result.nfev:3d}  "
+          f"|grad|={np.linalg.norm(result.jac):.2e}  "
           f"active={n_active:3d}  maxpen={max_pen:.2e}  "
           f"t={dt_step:.1f}s")
+    if not result.success and result.nit == 0:
+        print(f"  >> WARNING: {result.message}")
 
     # --- VTK snapshot ------------------------------------------------------
     if args.plot > 0 and step % args.plot == 0:
