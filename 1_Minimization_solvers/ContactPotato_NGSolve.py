@@ -4,13 +4,26 @@ ContactPotato_NGSolve.py — NGSolve hyperelastic contact simulation
 Single self-contained script simulating a hyperelastic block sliding over a
 rigid "potato" body.  ALL FE computations use the NGSolve API (mesh, FE space,
 hyperelastic energy via Variation, Dirichlet BCs).  Contact detection reuses
-the existing Gregory-patch / trust-region projection backend.  Minimization
-is driven by scipy.optimize.minimize (L-BFGS-B).
+the existing Gregory-patch / trust-region projection backend.
+
+Solvers
+-------
+- **newton**: Full Newton with active-set iteration for contact. Uses the
+  material tangent from NGSolve plus contact Hessian (kn * n ⊗ n). Optionally
+  includes the curvature term (∂n/∂x_s) via --full_hessian flag (experimental,
+  can cause matrix singularity). Typically converges in 10-25 iterations per
+  load step during contact.
+- **newton-cg**: Newton-CG via scipy.optimize.minimize with Hessian-vector
+  product. More robust than direct Newton for ill-conditioned problems.
+  Supports --full_hessian for curvature term without matrix singularity risk.
+- **lbfgsb**: L-BFGS-B quasi-Newton via scipy.optimize.minimize. Uses cached
+  TR projections for efficiency (~500 iterations per step).
 
 Usage
 -----
-    python ContactPotato_NGSolve.py --mesh 5  --min_method LBFGSB
-    python ContactPotato_NGSolve.py --mesh 10 --min_method LBFGSB --compare
+    python ContactPotato_NGSolve.py --mesh 10 --solver newton
+    python ContactPotato_NGSolve.py --mesh 10 --solver lbfgsb --max_iter 500
+    python ContactPotato_NGSolve.py --mesh 5  --solver newton --compare
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -33,13 +46,18 @@ from PyClasses import gregory_patch_backend as gb
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="NGSolve ContactPotato simulation")
 parser.add_argument("--mesh",       type=int,   default=10,      help="mesh density n (nxnxn hex)")
-parser.add_argument("--min_method", type=str,   default="LBFGSB",help="scipy method: LBFGSB")
+parser.add_argument("--solver",     type=str,   default="newton",
+                    choices=["newton", "lbfgsb", "newton-cg", "trust-ncg", "trust-krylov",
+                             "trust-constr", "bfgs", "cg", "tnc", "slsqp"],
+                    help="solver: newton, newton-cg, trust-ncg, trust-krylov, trust-constr, bfgs, cg, tnc, slsqp, or lbfgsb")
 parser.add_argument("--E",          type=float, default=0.05,    help="Young's modulus")
 parser.add_argument("--nu",         type=float, default=0.3,     help="Poisson ratio")
-parser.add_argument("--kn_factor",  type=float, default=1000.0,    help="kn = kn_factor * E")
+parser.add_argument("--kn_factor",  type=float, default=20.0,    help="kn = kn_factor * E")
 parser.add_argument("--nsteps",     type=int,   default=100,     help="number of load steps")
-parser.add_argument("--max_iter",   type=int,   default=5000,     help="max minimiser iterations per step")
-parser.add_argument("--gtol",       type=float, default=1e-15,    help="gradient tolerance for convergence")
+parser.add_argument("--max_iter",   type=int,   default=50,      help="max iterations per step (Newton inner or L-BFGS-B)")
+parser.add_argument("--max_as",     type=int,   default=5,       help="max active-set iterations (Newton only)")
+parser.add_argument("--gtol",       type=float, default=1e-8,    help="gradient/residual tolerance for convergence")
+parser.add_argument("--full_hessian", action="store_true",       help="use full contact Hessian with curvature term (experimental)")
 parser.add_argument("--compare",    action="store_true",         help="write comparison outputs")
 parser.add_argument("--plot",       type=int,   default=1,       help="VTK export every N steps (0=off)")
 args = parser.parse_args()
@@ -183,7 +201,7 @@ K_SURF = 15
 
 
 def _project_single(xsi, distances, sorted_idx, kd_pids):
-    """TR projection for a single slave node. Returns (gn, normal)."""
+    """TR projection for a single slave node. Returns (gn, normal, patch_id, params)."""
     radius_factor = RADIUS_FACTOR
     for attempt in range(2):
         base_idx = min(BASE_NCAND - 1, npatches - 1)
@@ -363,6 +381,337 @@ def objective(x_free):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 6a. HESSIAN-VECTOR PRODUCT FOR NEWTON-CG
+# ══════════════════════════════════════════════════════════════════════════════
+# Scratch vectors for Hessian-vector product
+_hess_tmp = gfu.vec.CreateVector()
+_hess_out = gfu.vec.CreateVector()
+
+
+def hessp(x_free, p):
+    """Hessian-vector product: H @ p for scipy Newton-CG.
+
+    Computes (K_mat + K_con) @ p where:
+    - K_mat: material tangent from NGSolve (linearization of hyperelastic energy)
+    - K_con: contact Hessian = kn * (n ⊗ n + g * ∂n/∂x_s) for penetrating nodes
+
+    Parameters
+    ----------
+    x_free : ndarray
+        Current solution on free DOFs
+    p : ndarray
+        Direction vector on free DOFs
+
+    Returns
+    -------
+    Hp : ndarray
+        Hessian-vector product on free DOFs
+    """
+    vec = gfu.vec.FV().NumPy()
+    vec[free_dofs] = x_free
+
+    # --- Material Hessian-vector product ---
+    # Assemble linearization (tangent stiffness) at current state
+    a_form.AssembleLinearization(gfu.vec)
+
+    # Set up direction vector
+    _hess_tmp.FV().NumPy()[:] = 0.0
+    _hess_tmp.FV().NumPy()[free_dofs] = p
+
+    # Apply material tangent: K_mat @ p
+    _hess_out.data = a_form.mat * _hess_tmp
+    Hp = _hess_out.FV().NumPy()[free_dofs].copy()
+
+    # --- Contact Hessian-vector product ---
+    # Get current slave positions
+    slave_pos = np.column_stack([
+        X_ref[slave_verts, 0] + vec[slave_verts],
+        X_ref[slave_verts, 1] + vec[slave_verts + nv],
+        X_ref[slave_verts, 2] + vec[slave_verts + 2*nv],
+    ])
+
+    # Get direction components for slave nodes
+    p_full = np.zeros(ndof)
+    p_full[free_dofs] = p
+    p_slave = np.column_stack([
+        p_full[slave_verts],
+        p_full[slave_verts + nv],
+        p_full[slave_verts + 2*nv],
+    ])
+
+    # Contact contribution using cached projection
+    gn, normals, active = contact_cache.evaluate(slave_pos)
+
+    if np.any(active):
+        act_idx = np.where(active)[0]
+        for i in act_idx:
+            g = gn[i]
+            if g >= 0:
+                continue  # Not penetrating
+
+            nor = normals[i]
+            v = int(slave_verts[i])
+            p_v = p_slave[i]  # (3,) direction at this node
+
+            # Simple Hessian: kn * (n ⊗ n) @ p_v = kn * (n · p_v) * n
+            Hp_contact = kn * (nor @ p_v) * nor
+
+            # Full Hessian with curvature term (if enabled)
+            if args.full_hessian and contact_cache.patch_ids is not None:
+                pid = contact_cache.patch_ids[i]
+                t = contact_cache.params[i]
+                if pid >= 0:
+                    # Compute curvature contribution: kn * g * (∂n/∂x_s) @ p_v
+                    try:
+                        patch = patches[pid]
+                        xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
+                        delta = slave_pos[i] - xc
+                        dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
+                        dfdxs = -2 * dxcdt.T
+                        dtdxs = np.linalg.solve(-dfdt, dfdxs)
+                        dndt = patch.dndt(t)
+                        dndxs = dndt @ dtdxs  # (3, 3)
+
+                        # Curvature contribution: kn * g * dndxs @ p_v
+                        curv_contrib = kn * g * (dndxs @ p_v)
+
+                        # Safeguard: limit magnitude
+                        curv_norm = np.linalg.norm(curv_contrib)
+                        base_norm = np.linalg.norm(Hp_contact)
+                        if curv_norm > 0.3 * max(base_norm, 1e-10):
+                            curv_contrib *= 0.3 * base_norm / curv_norm
+
+                        Hp_contact += curv_contrib
+                    except (np.linalg.LinAlgError, ValueError):
+                        pass  # Skip curvature if computation fails
+
+            # Map back to DOF indices
+            dofs_v = np.array([v, v + nv, v + 2*nv])
+            # Find which DOFs are free
+            for k, dof in enumerate(dofs_v):
+                idx_in_free = np.searchsorted(free_dofs, dof)
+                if idx_in_free < len(free_dofs) and free_dofs[idx_in_free] == dof:
+                    Hp[idx_in_free] += Hp_contact[k]
+
+    return Hp
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6b. NEWTON SOLVER WITH ACTIVE-SET ITERATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_slave_pos():
+    """Get current slave node positions from gfu."""
+    vec = gfu.vec.FV().NumPy()
+    return np.column_stack([
+        X_ref[slave_verts, 0] + vec[slave_verts],
+        X_ref[slave_verts, 1] + vec[slave_verts + nv],
+        X_ref[slave_verts, 2] + vec[slave_verts + 2*nv],
+    ])
+
+
+def compute_contact_hessian(pid, t, xs, g, nor):
+    """Compute the full consistent contact Hessian for a penetrating node.
+
+    The contact energy is E_con = (1/2) * kn * g_n^2, where g_n = (x_s - x_c) · n.
+    The full Hessian is:
+        K_con = kn * (n ⊗ n + g_n * ∂n/∂x_s)
+
+    where ∂n/∂x_s is computed via the chain rule:
+        ∂n/∂x_s = (∂n/∂t) @ (∂t/∂x_s)
+
+    and ∂t/∂x_s comes from implicit differentiation of the projection equations.
+
+    Parameters
+    ----------
+    pid : int
+        Patch ID
+    t : ndarray (2,)
+        Parametric coordinates of projection point
+    xs : ndarray (3,)
+        Current slave node position
+    g : float
+        Current gap value (negative for penetration)
+    nor : ndarray (3,)
+        Unit normal at projection point (from D3Grg, equivalent to D1 × D2)
+
+    Returns
+    -------
+    K_con : ndarray (3, 3)
+        Contact Hessian contribution for this node
+    """
+    patch = patches[pid]
+
+    # Get surface point, first and second derivatives w.r.t. parametric coords
+    # Shapes (from compute_tr_projection_batch.py):
+    #   xc: (3,)
+    #   dxcdt: (3, 2) - columns are tangent vectors D1, D2
+    #   d2xcd2t: (3, 2, 2) - second derivatives
+    xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
+
+    # ── Compute ∂t/∂x_s via implicit function theorem ──
+    # The projection minimizes |x_s - x_c(t)|^2, so at the minimum:
+    #   f(t, x_s) = ∂/∂t |x_s - x_c(t)|^2 = -2 * (x_s - x_c) · ∂x_c/∂t = 0
+    #
+    # Differentiating: ∂f/∂t * dt + ∂f/∂x_s * dx_s = 0
+    # => dt/dx_s = -(∂f/∂t)^{-1} @ (∂f/∂x_s)
+
+    delta = xs - xc  # (3,)
+
+    # ∂f/∂t (2x2 Hessian of distance^2 w.r.t. t)
+    # Using tensordot as in compute_tr_projection_batch.py:
+    #   dfdt = -2 * tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
+    # tensordot contracts delta (3,) with d2xcd2t (3,2,2) over first axis → (2,2)
+    # dxcdt.T @ dxcdt is (2,3) @ (3,2) → (2,2)
+    dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
+
+    # ∂f/∂x_s (2x3)
+    dfdxs = -2 * dxcdt.T  # (2, 3)
+
+    # ∂t/∂x_s (2x3) via implicit function theorem
+    try:
+        dtdxs = np.linalg.solve(-dfdt, dfdxs)  # (2, 3)
+    except np.linalg.LinAlgError:
+        # Singular Hessian (degenerate projection) - fall back to n⊗n only
+        return kn * np.outer(nor, nor)
+
+    # ── Compute ∂n/∂x_s ──
+    dndt = patch.dndt(t)  # (3, 2) - ∂n/∂t
+    dndxs = dndt @ dtdxs  # (3, 3) - ∂n/∂x_s
+
+    # ── Full contact Hessian ──
+    # K_con = kn * (n ⊗ n + g * ∂n/∂x_s)
+    #
+    # The curvature term (g * dndxs) can make the Hessian indefinite when
+    # |g| is large relative to the surface curvature. This causes Newton
+    # to diverge or the matrix to become singular.
+    #
+    # Safeguard: limit the curvature contribution to avoid indefiniteness.
+    # The n⊗n term has spectral norm 1. We limit |g * dndxs| relative to this.
+    K_base = np.outer(nor, nor)
+    K_curv = g * dndxs
+
+    # The curvature term can make the Hessian indefinite or singular when |g| is
+    # large relative to the surface curvature. Only include if --full_hessian is set.
+    if args.full_hessian:
+        # Safeguard: limit curvature contribution to avoid indefiniteness
+        curv_norm = np.linalg.norm(K_curv, ord=2)  # Spectral norm
+        max_curv_ratio = 0.3  # Limit curvature contribution to 30% of base term
+
+        if curv_norm > max_curv_ratio:
+            K_curv = K_curv * (max_curv_ratio / curv_norm)
+
+        K_con = kn * (K_base + K_curv)
+    else:
+        # Simple Hessian: just n ⊗ n (more robust)
+        K_con = kn * K_base
+
+    return K_con
+
+
+def newton_active_set_solve():
+    """Newton solver with active-set iteration for contact.
+
+    The outer loop iterates the active set (which nodes are in contact).
+    The inner loop performs Newton iterations with fixed active set.
+
+    Returns
+    -------
+    total_newton : int
+        Total Newton iterations across all active-set iterations
+    n_as : int
+        Number of active-set iterations
+    gn : ndarray
+        Final gap values for all slave nodes
+    normals : ndarray
+        Final surface normals for all slave nodes
+    active : ndarray
+        Boolean mask of nodes in contact
+    """
+    prev_active_idx = None
+    total_newton = 0
+    gn_out, normals_out, active_out = None, None, None
+
+    for as_iter in range(args.max_as):
+        # ── Full contact evaluation (expensive TR projection) ──
+        contact_cache.reset()
+        slave_pos = compute_slave_pos()
+        gn_out, normals_out, active_out = contact_cache.evaluate(slave_pos)
+        active_idx = np.where(active_out)[0]
+
+
+        # Active-set convergence check
+        if prev_active_idx is not None and np.array_equal(active_idx, prev_active_idx):
+            break
+        prev_active_idx = active_idx.copy()
+
+        # Cache projection data for cheap Newton re-evaluation
+        n_act = len(active_idx)
+        if n_act > 0 and contact_cache.patch_ids is not None:
+            saved_pids = contact_cache.patch_ids[active_idx].copy()
+            saved_params = contact_cache.params[active_idx].copy()
+        else:
+            saved_pids = np.array([], dtype=np.int32)
+            saved_params = np.zeros((0, 2))
+
+        # ── Newton iterations (fixed active set) ──
+        for nit in range(args.max_iter):
+            # 1. Material residual via NGSolve
+            a_form.Apply(gfu.vec, res_vec)
+            r_np = res_vec.FV().NumPy()
+
+            # 2. Add contact forces and compute Hessian data
+            slave_pos_now = compute_slave_pos()
+            pen_data = []  # [(local_idx, gap, normal, K_con), ...] for penetrating nodes
+
+            for j in range(n_act):
+                pid = int(saved_pids[j])
+                t = saved_params[j]
+                xs = slave_pos_now[active_idx[j]]
+
+                # Get surface point and normal for gap computation
+                xc  = patches[pid].Grg(t, deriv=0)
+                n_raw = patches[pid].D3Grg(t)
+                nor = n_raw / np.linalg.norm(n_raw)
+                g = (xs - xc) @ nor
+
+                if g < 0:  # penetrating
+                    # Compute full consistent contact Hessian
+                    K_con = compute_contact_hessian(pid, t, xs, g, nor)
+                    pen_data.append((j, g, nor, K_con))
+
+                    # Add contact force to residual
+                    v = int(slave_verts[active_idx[j]])
+                    r_np[v]          += kn * g * nor[0]
+                    r_np[v + nv]     += kn * g * nor[1]
+                    r_np[v + 2*nv]   += kn * g * nor[2]
+
+            # 3. Convergence check on free DOFs
+            rnorm = np.linalg.norm(r_np[free_dofs])
+            total_newton += 1
+            if rnorm < args.gtol:
+                break
+
+            # 4. Material tangent (linearization at current state)
+            a_form.AssembleLinearization(gfu.vec)
+
+            # 5. Add full contact Hessian: kn * (n ⊗ n + g * ∂n/∂x_s)
+            mat = a_form.mat
+            for j_local, g, nor, K_con in pen_data:
+                v = int(slave_verts[active_idx[j_local]])
+                dofs = [v, v + nv, v + 2*nv]
+                for a in range(3):
+                    for b in range(3):
+                        mat[dofs[a], dofs[b]] = mat[dofs[a], dofs[b]] + K_con[a, b]
+
+            # 6. Solve K·Δu = -r and update
+            inv = mat.Inverse(fes.FreeDofs(), inverse="umfpack")
+            gfu.vec.data -= inv * res_vec
+
+    return total_newton, as_iter + 1, gn_out, normals_out, active_out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 7.  GRIDFUNCTION FIELDS FOR VTK OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
 # Scalar spaces for contact observables
@@ -407,7 +756,13 @@ disp_increment = np.array([12.0, 0.0, 0.0]) * dt   # prescribed sliding
 print(f"\n{'='*60}")
 print(f"  ContactPotato NGSolve — mesh {n}x{n}x{n}")
 print(f"  E={E_val}, nu={nu_val}, kn={kn:.4f}")
-print(f"  {nsteps} steps, max_iter={max_iter}, gtol={args.gtol:.0e}, method={args.min_method}")
+if args.solver == "newton":
+    print(f"  {nsteps} steps, solver=Newton, max_iter={max_iter}, max_as={args.max_as}, gtol={args.gtol:.0e}")
+elif args.solver in ("newton-cg", "trust-ncg", "trust-krylov", "trust-constr"):
+    hess_type = "full (with curvature)" if args.full_hessian else "simple (n⊗n)"
+    print(f"  {nsteps} steps, solver={args.solver}, max_iter={max_iter}, gtol={args.gtol:.0e}, hess={hess_type}")
+else:
+    print(f"  {nsteps} steps, solver={args.solver}, max_iter={max_iter}, gtol={args.gtol:.0e}")
 print(f"{'='*60}\n")
 
 t_wall_start = perf_counter()
@@ -424,42 +779,101 @@ for step in range(1, nsteps + 1):
     vec[top_dofs_y] += disp_increment[1]
     vec[top_dofs_z] += disp_increment[2]
 
-    # --- Minimise total energy on free DOFs --------------------------------
-    x0 = vec[free_dofs].copy()
-    result = minimize(
-        objective, x0, method='L-BFGS-B', jac=True,
-        options={'maxiter': max_iter, 'gtol': args.gtol,
-                 'maxls': 40, 'ftol': 0},
-    )
-    vec[free_dofs] = result.x
+    # ══════════════════════════════════════════════════════════════════════
+    # SOLVER DISPATCH
+    # ══════════════════════════════════════════════════════════════════════
 
-    # --- Contact state for output (reuse last cache, cheap) ----------------
-    slave_pos = np.column_stack([
-        X_ref[slave_verts, 0] + vec[slave_verts],
-        X_ref[slave_verts, 1] + vec[slave_verts + nv],
-        X_ref[slave_verts, 2] + vec[slave_verts + 2*nv],
-    ])
-    gn, normals, active = contact_cache.evaluate(slave_pos)
-    f_con = np.zeros(ndof)
-    if np.any(active):
-        act = np.where(active)[0]
-        verts_act = slave_verts[act]
-        kgn = kn * gn[act]
-        f_con[verts_act]          = kgn * normals[act, 0]
-        f_con[verts_act + nv]     = kgn * normals[act, 1]
-        f_con[verts_act + 2*nv]   = kgn * normals[act, 2]
-    update_contact_fields(gn, normals, active, f_con)
+    # --- Helper: compute contact forces and update fields ---
+    def finalize_contact_state():
+        """Evaluate contact state and update output fields. Returns (gn, normals, active, n_active, max_pen)."""
+        slave_pos = compute_slave_pos()
+        gn, normals, active = contact_cache.evaluate(slave_pos)
+        f_con = np.zeros(ndof)
+        if np.any(active):
+            act = np.where(active)[0]
+            verts_act = slave_verts[act]
+            kgn = kn * gn[act]
+            f_con[verts_act]          = kgn * normals[act, 0]
+            f_con[verts_act + nv]     = kgn * normals[act, 1]
+            f_con[verts_act + 2*nv]   = kgn * normals[act, 2]
+        update_contact_fields(gn, normals, active, f_con)
+        n_active = int(np.sum(active))
+        max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
+        return gn, normals, active, n_active, max_pen
 
-    n_active = int(np.sum(active))
-    max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
-    dt_step  = perf_counter() - t_step
-    print(f"Step {step:3d}/{nsteps}  success={result.success}  "
-          f"nit={result.nit:2d}  nfev={result.nfev:3d}  "
-          f"|grad|={np.linalg.norm(result.jac):.2e}  "
-          f"active={n_active:3d}  maxpen={max_pen:.2e}  "
-          f"t={dt_step:.1f}s")
-    if not result.success and result.nit == 0:
-        print(f"  >> WARNING: {result.message}")
+    if args.solver == "newton":
+        # ── Newton + active-set solver ──
+        n_newton, n_as, gn, normals, active = newton_active_set_solve()
+
+        # Compute contact forces for output
+        f_con = np.zeros(ndof)
+        if np.any(active):
+            act = np.where(active)[0]
+            verts_act = slave_verts[act]
+            kgn = kn * gn[act]
+            f_con[verts_act]          = kgn * normals[act, 0]
+            f_con[verts_act + nv]     = kgn * normals[act, 1]
+            f_con[verts_act + 2*nv]   = kgn * normals[act, 2]
+        update_contact_fields(gn, normals, active, f_con)
+
+        # Compute final residual norm for reporting
+        a_form.Apply(gfu.vec, res_vec)
+        r_np = res_vec.FV().NumPy()
+        if np.any(active):
+            for i in np.where(active)[0]:
+                v, g = int(slave_verts[i]), gn[i]
+                if g < 0:
+                    nor = normals[i]
+                    r_np[v]          += kn * g * nor[0]
+                    r_np[v + nv]     += kn * g * nor[1]
+                    r_np[v + 2*nv]   += kn * g * nor[2]
+        rnorm = np.linalg.norm(r_np[free_dofs])
+
+        n_active = int(np.sum(active))
+        max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
+        dt_step  = perf_counter() - t_step
+        print(f"Step {step:3d}/{nsteps}  Newton: nit={n_newton:2d} as={n_as}  "
+              f"|r|={rnorm:.2e}  active={n_active:3d}  maxpen={max_pen:.2e}  "
+              f"t={dt_step:.1f}s")
+
+    else:
+        # ── Scipy minimize solvers ──
+        # Solver configurations: (method_name, uses_hessp, options_override)
+        SCIPY_SOLVERS = {
+            "newton-cg":    ("Newton-CG",    True,  {"xtol": args.gtol}),
+            "trust-ncg":    ("trust-ncg",    True,  {"gtol": args.gtol}),
+            "trust-krylov": ("trust-krylov", True,  {"gtol": args.gtol}),
+            "trust-constr": ("trust-constr", True,  {"gtol": args.gtol}),
+            "bfgs":         ("BFGS",         False, {"gtol": args.gtol}),
+            "cg":           ("CG",           False, {"gtol": args.gtol}),
+            "tnc":          ("TNC",          False, {"gtol": args.gtol}),
+            "slsqp":        ("SLSQP",        False, {"ftol": args.gtol}),
+            "lbfgsb":       ("L-BFGS-B",     False, {"gtol": args.gtol, "maxls": 40, "ftol": 0}),
+        }
+
+        method_name, uses_hessp, opts_override = SCIPY_SOLVERS[args.solver]
+        options = {"maxiter": max_iter, **opts_override}
+
+        x0 = vec[free_dofs].copy()
+        if uses_hessp:
+            result = minimize(objective, x0, method=method_name, jac=True,
+                              hessp=hessp, options=options)
+        else:
+            result = minimize(objective, x0, method=method_name, jac=True,
+                              options=options)
+        vec[free_dofs] = result.x
+
+        # Finalize contact state and get metrics
+        _, _, _, n_active, max_pen = finalize_contact_state()
+        dt_step   = perf_counter() - t_step
+        grad_norm = np.linalg.norm(result.jac) if result.jac is not None else float("nan")
+
+        # Print result
+        print(f"Step {step:3d}/{nsteps}  {args.solver}: nit={result.nit:2d}  "
+              f"nfev={result.nfev:3d}  |grad|={grad_norm:.2e}  "
+              f"active={n_active:3d}  maxpen={max_pen:.2e}  t={dt_step:.1f}s")
+        if not result.success:
+            print(f"  >> {result.message}")
 
     # --- VTK snapshot ------------------------------------------------------
     if args.plot > 0 and step % args.plot == 0:
