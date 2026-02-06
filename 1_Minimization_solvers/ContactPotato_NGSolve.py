@@ -10,7 +10,7 @@ Solvers
 -------
 - **newton**: Full Newton with active-set iteration for contact. Uses the
   material tangent from NGSolve plus contact Hessian (kn * n ⊗ n). Optionally
-  includes the curvature term (∂n/∂x_s) via --full_hessian flag (experimental,
+  includes the curvature term (dn/dx_s) via --full_hessian flag (experimental,
   can cause matrix singularity). Typically converges in 10-25 iterations per
   load step during contact.
 - **newton-cg**: Newton-CG via scipy.optimize.minimize with Hessian-vector
@@ -393,7 +393,7 @@ def hessp(x_free, p):
 
     Computes (K_mat + K_con) @ p where:
     - K_mat: material tangent from NGSolve (linearization of hyperelastic energy)
-    - K_con: contact Hessian = kn * (n ⊗ n + g * ∂n/∂x_s) for penetrating nodes
+    - K_con: contact Hessian = kn * (n ⊗ n + g * dn/dx_s) for penetrating nodes
 
     Parameters
     ----------
@@ -461,7 +461,7 @@ def hessp(x_free, p):
                 pid = contact_cache.patch_ids[i]
                 t = contact_cache.params[i]
                 if pid >= 0:
-                    # Compute curvature contribution: kn * g * (∂n/∂x_s) @ p_v
+                    # Compute curvature contribution: kn * g * (dn/dx_s) @ p_v
                     try:
                         patch = patches[pid]
                         xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
@@ -515,12 +515,12 @@ def compute_contact_hessian(pid, t, xs, g, nor):
 
     The contact energy is E_con = (1/2) * kn * g_n^2, where g_n = (x_s - x_c) · n.
     The full Hessian is:
-        K_con = kn * (n ⊗ n + g_n * ∂n/∂x_s)
+        K_con = kn * (n ⊗ n + g_n * dn/dx_s)
 
-    where ∂n/∂x_s is computed via the chain rule:
-        ∂n/∂x_s = (∂n/∂t) @ (∂t/∂x_s)
+    where dn/dx_s is computed via the chain rule:
+        dn/dx_s = (dn/dt) @ (dt/dx_s)
 
-    and ∂t/∂x_s comes from implicit differentiation of the projection equations.
+    and dt/dx_s comes from implicit differentiation of the projection equations.
 
     Parameters
     ----------
@@ -549,38 +549,38 @@ def compute_contact_hessian(pid, t, xs, g, nor):
     #   d2xcd2t: (3, 2, 2) - second derivatives
     xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
 
-    # ── Compute ∂t/∂x_s via implicit function theorem ──
+    # ── Compute dt/dx_s via implicit function theorem ──
     # The projection minimizes |x_s - x_c(t)|^2, so at the minimum:
-    #   f(t, x_s) = ∂/∂t |x_s - x_c(t)|^2 = -2 * (x_s - x_c) · ∂x_c/∂t = 0
+    #   f(t, x_s) = d/dt |x_s - x_c(t)|^2 = -2 * (x_s - x_c) · dx_c/dt = 0
     #
-    # Differentiating: ∂f/∂t * dt + ∂f/∂x_s * dx_s = 0
-    # => dt/dx_s = -(∂f/∂t)^{-1} @ (∂f/∂x_s)
+    # Differentiating: df/dt * dt + df/dx_s * dx_s = 0
+    # => dt/dx_s = -(df/dt)^{-1} @ (df/dx_s)
 
     delta = xs - xc  # (3,)
 
-    # ∂f/∂t (2x2 Hessian of distance^2 w.r.t. t)
+    # df/dt (2x2 Hessian of distance^2 w.r.t. t)
     # Using tensordot as in compute_tr_projection_batch.py:
     #   dfdt = -2 * tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
     # tensordot contracts delta (3,) with d2xcd2t (3,2,2) over first axis → (2,2)
     # dxcdt.T @ dxcdt is (2,3) @ (3,2) → (2,2)
     dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
 
-    # ∂f/∂x_s (2x3)
+    # df/dx_s (2x3)
     dfdxs = -2 * dxcdt.T  # (2, 3)
 
-    # ∂t/∂x_s (2x3) via implicit function theorem
+    # dt/dx_s (2x3) via implicit function theorem
     try:
         dtdxs = np.linalg.solve(-dfdt, dfdxs)  # (2, 3)
     except np.linalg.LinAlgError:
         # Singular Hessian (degenerate projection) - fall back to n⊗n only
         return kn * np.outer(nor, nor)
 
-    # ── Compute ∂n/∂x_s ──
-    dndt = patch.dndt(t)  # (3, 2) - ∂n/∂t
-    dndxs = dndt @ dtdxs  # (3, 3) - ∂n/∂x_s
+    # ── Compute dn/dx_s ──
+    dndt = patch.dndt(t)  # (3, 2) - dn/dt
+    dndxs = dndt @ dtdxs  # (3, 3) - dn/dx_s
 
     # ── Full contact Hessian ──
-    # K_con = kn * (n ⊗ n + g * ∂n/∂x_s)
+    # K_con = kn * (n ⊗ n + g * dn/dx_s)
     #
     # The curvature term (g * dndxs) can make the Hessian indefinite when
     # |g| is large relative to the surface curvature. This causes Newton
@@ -695,7 +695,7 @@ def newton_active_set_solve():
             # 4. Material tangent (linearization at current state)
             a_form.AssembleLinearization(gfu.vec)
 
-            # 5. Add full contact Hessian: kn * (n ⊗ n + g * ∂n/∂x_s)
+            # 5. Add full contact Hessian: kn * (n ⊗ n + g * dn/dx_s)
             mat = a_form.mat
             for j_local, g, nor, K_con in pen_data:
                 v = int(slave_verts[active_idx[j_local]])
