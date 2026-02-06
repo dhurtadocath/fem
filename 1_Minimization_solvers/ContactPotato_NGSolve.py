@@ -210,8 +210,35 @@ RADIUS_FACTOR = 1.5
 K_SURF = 15
 
 
-def _project_single(xsi, distances, sorted_idx, kd_pids):
-    """TR projection for a single slave node. Returns (gn, normal, patch_id, params)."""
+def _project_single(xsi, distances, sorted_idx, kd_pids, compute_hessian=False):
+    """TR projection for a single slave node.
+
+    Parameters
+    ----------
+    xsi : ndarray (3,)
+        Slave node position
+    distances : ndarray (npatches,)
+        Distance from slave to each patch bounding sphere center
+    sorted_idx : ndarray
+        Indices that sort patches by distance
+    kd_pids : ndarray
+        Candidate patch IDs from KD-tree
+    compute_hessian : bool
+        If True, compute dn/dx_s for contact Hessian
+
+    Returns
+    -------
+    gn : float
+        Gap value (negative = penetration)
+    nor : ndarray (3,)
+        Unit normal at projection point
+    patch_id : int
+        Patch ID (-1 if projection failed)
+    t : ndarray (2,) or None
+        Parametric coordinates
+    dndxs : ndarray (3,3) or None
+        dn/dx_s matrix (only if compute_hessian=True and projection succeeded)
+    """
     radius_factor = RADIUS_FACTOR
     for attempt in range(2):
         base_idx = min(BASE_NCAND - 1, npatches - 1)
@@ -231,31 +258,61 @@ def _project_single(xsi, distances, sorted_idx, kd_pids):
             TR_INIT, TR_MIN, TR_MAX
         )
         if int(best_patch) >= 0:
+            pid = int(best_patch)
             t   = np.array([t1, t2], dtype=np.float64)
-            xc  = patches[int(best_patch)].Grg(t, deriv=0)
-            n_raw = patches[int(best_patch)].D3Grg(t)
-            nor = n_raw / np.linalg.norm(n_raw)
-            return (xsi - xc) @ nor, nor, int(best_patch), t
+            patch = patches[pid]
+
+            # Get surface point and normal
+            if compute_hessian:
+                # Get derivatives for Hessian computation
+                xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
+                n_raw = patch.D3Grg(t)
+                nor = n_raw / np.linalg.norm(n_raw)
+
+                # Compute dn/dx_s via implicit function theorem
+                delta = xsi - xc
+                dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
+                dfdxs = -2 * dxcdt.T
+                try:
+                    dtdxs = np.linalg.solve(-dfdt, dfdxs)  # (2, 3)
+                    dndt = patch.dndt(t)  # (3, 2)
+                    dndxs = dndt @ dtdxs  # (3, 3)
+                except np.linalg.LinAlgError:
+                    dndxs = None  # Singular, skip curvature term
+            else:
+                xc = patch.Grg(t, deriv=0)
+                n_raw = patch.D3Grg(t)
+                nor = n_raw / np.linalg.norm(n_raw)
+                dndxs = None
+
+            gn = (xsi - xc) @ nor
+            return gn, nor, pid, t, dndxs
+
         radius_factor *= 2.0
-    return np.inf, np.zeros(3), -1, None
+    return np.inf, np.zeros(3), -1, None, None
 
 
-def compute_contact(slave_pos):
+def compute_contact(slave_pos, compute_hessian=False):
     """Compute gap and normal for each slave node via TR projection.
 
     Parameters
     ----------
     slave_pos : (n_slave, 3) array of current slave-node positions
+    compute_hessian : bool
+        If True, also compute dn/dx_s for contact Hessian
 
     Returns
     -------
     gn      : (n_slave,) gap values (negative = penetration)
     normals : (n_slave, 3) outward unit normals on master surface
     active  : boolean mask of penetrating nodes
+    dndxs_all : (n_slave, 3, 3) or None
+        dn/dx_s matrices (only if compute_hessian=True)
     """
     n_slave = slave_pos.shape[0]
     gn      = np.full(n_slave, np.inf)
     normals = np.zeros((n_slave, 3))
+    dndxs_all = np.zeros((n_slave, 3, 3)) if compute_hessian else None
 
     # Distance to each BS centre
     dist_mat = np.linalg.norm(
@@ -271,10 +328,14 @@ def compute_contact(slave_pos):
         _, idx_kd  = surf_kdtree.query(xsi, k=min(K_SURF, len(surf_pts)))
         kd_pids    = np.unique(surf_pids[np.atleast_1d(idx_kd)])
 
-        gn[i], normals[i], _, _ = _project_single(xsi, distances, sorted_idx, kd_pids)
+        gn[i], normals[i], _, _, dndxs = _project_single(
+            xsi, distances, sorted_idx, kd_pids, compute_hessian=compute_hessian
+        )
+        if compute_hessian and dndxs is not None:
+            dndxs_all[i] = dndxs
 
     active = gn < 0
-    return gn, normals, active
+    return gn, normals, active, dndxs_all
 
 
 # --- Contact cache for warm-starting within a load step -------------------
@@ -290,17 +351,38 @@ class ContactCache:
         self.prev_pos    = None      # (n_slave, 3)
         self.patch_ids   = None      # (n_slave,) int
         self.params      = None      # (n_slave, 2) parametric coords
+        self.dndxs       = None      # (n_slave, 3, 3) dn/dx_s matrices
         self.tol_reuse   = 0.05      # reuse if ||Δx|| < tol per node
 
     def reset(self):
         """Call at the start of each load step."""
         self.prev_pos = None
 
-    def evaluate(self, slave_pos):
-        """Return (gn, normals, active) using cache when possible."""
+    def evaluate(self, slave_pos, compute_hessian=False):
+        """Return (gn, normals, active, dndxs_all) using cache when possible.
+
+        Parameters
+        ----------
+        slave_pos : (n_slave, 3) array
+            Current slave node positions
+        compute_hessian : bool
+            If True, compute dn/dx_s for contact Hessian
+
+        Returns
+        -------
+        gn : (n_slave,) array
+            Gap values (negative = penetration)
+        normals : (n_slave, 3) array
+            Unit normals at projection points
+        active : (n_slave,) bool array
+            Mask of penetrating nodes
+        dndxs_all : (n_slave, 3, 3) array or None
+            dn/dx_s matrices (only if compute_hessian=True)
+        """
         n_slave = slave_pos.shape[0]
         gn      = np.full(n_slave, np.inf)
         normals = np.zeros((n_slave, 3))
+        dndxs_all = np.zeros((n_slave, 3, 3)) if compute_hessian else None
 
         # Decide per-node: reuse cache or full re-project
         need_full = np.ones(n_slave, dtype=bool)
@@ -313,9 +395,28 @@ class ContactCache:
                 if pid < 0:
                     continue
                 t   = self.params[i]
-                xc  = patches[pid].Grg(t, deriv=0)
-                n_raw = patches[pid].D3Grg(t)
-                nor = n_raw / np.linalg.norm(n_raw)
+                patch = patches[pid]
+
+                if compute_hessian:
+                    # Recompute with Hessian data
+                    xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
+                    n_raw = patch.D3Grg(t)
+                    nor = n_raw / np.linalg.norm(n_raw)
+
+                    delta = slave_pos[i] - xc
+                    dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
+                    dfdxs = -2 * dxcdt.T
+                    try:
+                        dtdxs = np.linalg.solve(-dfdt, dfdxs)
+                        dndt = patch.dndt(t)
+                        dndxs_all[i] = dndt @ dtdxs
+                    except np.linalg.LinAlgError:
+                        pass  # Keep zeros (will use n⊗n only)
+                else:
+                    xc = patch.Grg(t, deriv=0)
+                    n_raw = patch.D3Grg(t)
+                    nor = n_raw / np.linalg.norm(n_raw)
+
                 gn[i]      = (slave_pos[i] - xc) @ nor
                 normals[i] = nor
                 need_full[i] = False
@@ -333,19 +434,23 @@ class ContactCache:
                 sorted_idx = np.argsort(distances)
                 _, idx_kd  = surf_kdtree.query(xsi, k=min(K_SURF, len(surf_pts)))
                 kd_pids    = np.unique(surf_pids[np.atleast_1d(idx_kd)])
-                gn[i], normals[i], pid, t = _project_single(
-                    xsi, distances, sorted_idx, kd_pids
+                gn[i], normals[i], pid, t, dndxs = _project_single(
+                    xsi, distances, sorted_idx, kd_pids, compute_hessian=compute_hessian
                 )
                 if self.patch_ids is None:
                     self.patch_ids = np.full(n_slave, -1, dtype=np.int32)
                     self.params    = np.zeros((n_slave, 2), dtype=np.float64)
+                    self.dndxs     = np.zeros((n_slave, 3, 3), dtype=np.float64)
                 self.patch_ids[i] = pid
                 if t is not None:
                     self.params[i] = t
+                if compute_hessian and dndxs is not None:
+                    dndxs_all[i] = dndxs
+                    self.dndxs[i] = dndxs
 
         self.prev_pos = slave_pos.copy()
         active = gn < 0
-        return gn, normals, active
+        return gn, normals, active, dndxs_all
 
 contact_cache = ContactCache()
 
@@ -374,7 +479,7 @@ def objective(x_free):
     ])
 
     # --- Contact penalty (cached TR projection) ----------------------------
-    gn, normals, active = contact_cache.evaluate(slave_pos)
+    gn, normals, active, _ = contact_cache.evaluate(slave_pos)
     E_con = 0.5 * kn * np.sum(gn[active]**2)
 
     f_con = np.zeros(ndof)
@@ -449,8 +554,10 @@ def hessp(x_free, p):
         p_full[slave_verts + 2*nv],
     ])
 
-    # Contact contribution using cached projection
-    gn, normals, active = contact_cache.evaluate(slave_pos)
+    # Contact contribution using cached projection (with Hessian data if requested)
+    gn, normals, active, dndxs_all = contact_cache.evaluate(
+        slave_pos, compute_hessian=args.full_hessian
+    )
 
     if np.any(active):
         act_idx = np.where(active)[0]
@@ -466,34 +573,20 @@ def hessp(x_free, p):
             # Simple Hessian: kn * (n ⊗ n) @ p_v = kn * (n · p_v) * n
             Hp_contact = kn * (nor @ p_v) * nor
 
-            # Full Hessian with curvature term (if enabled)
-            if args.full_hessian and contact_cache.patch_ids is not None:
-                pid = contact_cache.patch_ids[i]
-                t = contact_cache.params[i]
-                if pid >= 0:
-                    # Compute curvature contribution: kn * g * (dn/dx_s) @ p_v
-                    try:
-                        patch = patches[pid]
-                        xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
-                        delta = slave_pos[i] - xc
-                        dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
-                        dfdxs = -2 * dxcdt.T
-                        dtdxs = np.linalg.solve(-dfdt, dfdxs)
-                        dndt = patch.dndt(t)
-                        dndxs = dndt @ dtdxs  # (3, 3)
+            # Full Hessian with curvature term (if enabled and available)
+            if args.full_hessian and dndxs_all is not None:
+                dndxs = dndxs_all[i]
+                if np.any(dndxs):  # Non-zero (successfully computed)
+                    # Curvature contribution: kn * g * dndxs @ p_v
+                    curv_contrib = kn * g * (dndxs @ p_v)
 
-                        # Curvature contribution: kn * g * dndxs @ p_v
-                        curv_contrib = kn * g * (dndxs @ p_v)
+                    # Safeguard: limit magnitude
+                    curv_norm = np.linalg.norm(curv_contrib)
+                    base_norm = np.linalg.norm(Hp_contact)
+                    if curv_norm > 0.3 * max(base_norm, 1e-10):
+                        curv_contrib *= 0.3 * base_norm / curv_norm
 
-                        # Safeguard: limit magnitude
-                        curv_norm = np.linalg.norm(curv_contrib)
-                        base_norm = np.linalg.norm(Hp_contact)
-                        if curv_norm > 0.3 * max(base_norm, 1e-10):
-                            curv_contrib *= 0.3 * base_norm / curv_norm
-
-                        Hp_contact += curv_contrib
-                    except (np.linalg.LinAlgError, ValueError):
-                        pass  # Skip curvature if computation fails
+                    Hp_contact += curv_contrib
 
             # Map back to DOF indices
             dofs_v = np.array([v, v + nv, v + 2*nv])
@@ -520,91 +613,35 @@ def compute_slave_pos():
     ])
 
 
-def compute_contact_hessian(pid, t, xs, g, nor):
-    """Compute the full consistent contact Hessian for a penetrating node.
+def compute_contact_hessian(g, nor, dndxs=None):
+    """Compute the contact Hessian for a penetrating node.
 
     The contact energy is E_con = (1/2) * kn * g_n^2, where g_n = (x_s - x_c) · n.
     The full Hessian is:
         K_con = kn * (n ⊗ n + g_n * dn/dx_s)
 
-    where dn/dx_s is computed via the chain rule:
-        dn/dx_s = (dn/dt) @ (dt/dx_s)
-
-    and dt/dx_s comes from implicit differentiation of the projection equations.
-
     Parameters
     ----------
-    pid : int
-        Patch ID
-    t : ndarray (2,)
-        Parametric coordinates of projection point
-    xs : ndarray (3,)
-        Current slave node position
     g : float
         Current gap value (negative for penetration)
     nor : ndarray (3,)
-        Unit normal at projection point (from D3Grg, equivalent to D1 × D2)
+        Unit normal at projection point
+    dndxs : ndarray (3, 3) or None
+        Pre-computed dn/dx_s matrix from projection. If None, only n⊗n is used.
 
     Returns
     -------
     K_con : ndarray (3, 3)
         Contact Hessian contribution for this node
     """
-    patch = patches[pid]
-
-    # Get surface point, first and second derivatives w.r.t. parametric coords
-    # Shapes (from compute_tr_projection_batch.py):
-    #   xc: (3,)
-    #   dxcdt: (3, 2) - columns are tangent vectors D1, D2
-    #   d2xcd2t: (3, 2, 2) - second derivatives
-    xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
-
-    # ── Compute dt/dx_s via implicit function theorem ──
-    # The projection minimizes |x_s - x_c(t)|^2, so at the minimum:
-    #   f(t, x_s) = d/dt |x_s - x_c(t)|^2 = -2 * (x_s - x_c) · dx_c/dt = 0
-    #
-    # Differentiating: df/dt * dt + df/dx_s * dx_s = 0
-    # => dt/dx_s = -(df/dt)^{-1} @ (df/dx_s)
-
-    delta = xs - xc  # (3,)
-
-    # df/dt (2x2 Hessian of distance^2 w.r.t. t)
-    # Using tensordot as in compute_tr_projection_batch.py:
-    #   dfdt = -2 * tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
-    # tensordot contracts delta (3,) with d2xcd2t (3,2,2) over first axis → (2,2)
-    # dxcdt.T @ dxcdt is (2,3) @ (3,2) → (2,2)
-    dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
-
-    # df/dx_s (2x3)
-    dfdxs = -2 * dxcdt.T  # (2, 3)
-
-    # dt/dx_s (2x3) via implicit function theorem
-    try:
-        dtdxs = np.linalg.solve(-dfdt, dfdxs)  # (2, 3)
-    except np.linalg.LinAlgError:
-        # Singular Hessian (degenerate projection) - fall back to n⊗n only
-        return kn * np.outer(nor, nor)
-
-    # ── Compute dn/dx_s ──
-    dndt = patch.dndt(t)  # (3, 2) - dn/dt
-    dndxs = dndt @ dtdxs  # (3, 3) - dn/dx_s
-
-    # ── Full contact Hessian ──
-    # K_con = kn * (n ⊗ n + g * dn/dx_s)
-    #
-    # The curvature term (g * dndxs) can make the Hessian indefinite when
-    # |g| is large relative to the surface curvature. This causes Newton
-    # to diverge or the matrix to become singular.
-    #
-    # Safeguard: limit the curvature contribution to avoid indefiniteness.
-    # The n⊗n term has spectral norm 1. We limit |g * dndxs| relative to this.
     K_base = np.outer(nor, nor)
-    K_curv = g * dndxs
 
-    # The curvature term can make the Hessian indefinite or singular when |g| is
-    # large relative to the surface curvature. Only include if --full_hessian is set.
-    if args.full_hessian:
+    # Include curvature term only if --full_hessian and dndxs is available
+    if args.full_hessian and dndxs is not None and np.any(dndxs):
+        K_curv = g * dndxs
+
         # Safeguard: limit curvature contribution to avoid indefiniteness
+        # The n⊗n term has spectral norm 1. Limit |g * dndxs| relative to this.
         curv_norm = np.linalg.norm(K_curv, ord=2)  # Spectral norm
         max_curv_ratio = 0.3  # Limit curvature contribution to 30% of base term
 
@@ -643,12 +680,13 @@ def newton_active_set_solve():
     gn_out, normals_out, active_out = None, None, None
 
     for as_iter in range(args.max_as):
-        # ── Full contact evaluation (expensive TR projection) ──
+        # ── Full contact evaluation (expensive TR projection, with Hessian data) ──
         contact_cache.reset()
         slave_pos = compute_slave_pos()
-        gn_out, normals_out, active_out = contact_cache.evaluate(slave_pos)
+        gn_out, normals_out, active_out, dndxs_out = contact_cache.evaluate(
+            slave_pos, compute_hessian=args.full_hessian
+        )
         active_idx = np.where(active_out)[0]
-
 
         # Active-set convergence check
         if prev_active_idx is not None and np.array_equal(active_idx, prev_active_idx):
@@ -672,22 +710,41 @@ def newton_active_set_solve():
 
             # 2. Add contact forces and compute Hessian data
             slave_pos_now = compute_slave_pos()
-            pen_data = []  # [(local_idx, gap, normal, K_con), ...] for penetrating nodes
+            pen_data = []  # [(local_idx, gap, normal, dndxs, K_con), ...] for penetrating nodes
 
             for j in range(n_act):
                 pid = int(saved_pids[j])
                 t = saved_params[j]
                 xs = slave_pos_now[active_idx[j]]
+                patch = patches[pid]
 
-                # Get surface point and normal for gap computation
-                xc  = patches[pid].Grg(t, deriv=0)
-                n_raw = patches[pid].D3Grg(t)
-                nor = n_raw / np.linalg.norm(n_raw)
+                # Get surface point, normal, and optionally dndxs for Hessian
+                if args.full_hessian:
+                    xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
+                    n_raw = patch.D3Grg(t)
+                    nor = n_raw / np.linalg.norm(n_raw)
+
+                    # Compute dndxs via implicit function theorem
+                    delta = xs - xc
+                    dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
+                    dfdxs = -2 * dxcdt.T
+                    try:
+                        dtdxs = np.linalg.solve(-dfdt, dfdxs)
+                        dndt = patch.dndt(t)
+                        dndxs = dndt @ dtdxs
+                    except np.linalg.LinAlgError:
+                        dndxs = None
+                else:
+                    xc = patch.Grg(t, deriv=0)
+                    n_raw = patch.D3Grg(t)
+                    nor = n_raw / np.linalg.norm(n_raw)
+                    dndxs = None
+
                 g = (xs - xc) @ nor
 
                 if g < 0:  # penetrating
-                    # Compute full consistent contact Hessian
-                    K_con = compute_contact_hessian(pid, t, xs, g, nor)
+                    # Compute contact Hessian using pre-computed dndxs
+                    K_con = compute_contact_hessian(g, nor, dndxs)
                     pen_data.append((j, g, nor, K_con))
 
                     # Add contact force to residual
@@ -705,7 +762,7 @@ def newton_active_set_solve():
             # 4. Material tangent (linearization at current state)
             a_form.AssembleLinearization(gfu.vec)
 
-            # 5. Add full contact Hessian: kn * (n ⊗ n + g * dn/dx_s)
+            # 5. Add contact Hessian: kn * (n ⊗ n + g * dn/dx_s)
             mat = a_form.mat
             for j_local, g, nor, K_con in pen_data:
                 v = int(slave_verts[active_idx[j_local]])
@@ -799,7 +856,7 @@ for step in range(1, nsteps + 1):
     def finalize_contact_state():
         """Evaluate contact state and update output fields. Returns (gn, normals, active, n_active, max_pen)."""
         slave_pos = compute_slave_pos()
-        gn, normals, active = contact_cache.evaluate(slave_pos)
+        gn, normals, active, _ = contact_cache.evaluate(slave_pos)
         f_con = np.zeros(ndof)
         if np.any(active):
             act = np.where(active)[0]
