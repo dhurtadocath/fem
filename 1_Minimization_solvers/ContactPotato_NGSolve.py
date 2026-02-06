@@ -210,6 +210,63 @@ RADIUS_FACTOR = 1.5
 K_SURF = 15
 
 
+def _evaluate_projection(patch, t, xs, compute_hessian=False):
+    """Evaluate gap, normal, and optionally dndxs at a projection point.
+
+    This is the core computation shared by:
+    - _project_single (after TR finds the best patch)
+    - ContactCache.evaluate (when reusing cached patch/params)
+    - Newton inner loop (recomputing during iterations)
+
+    Parameters
+    ----------
+    patch : GregoryPatch
+        The patch containing the projection point
+    t : ndarray (2,)
+        Parametric coordinates on the patch
+    xs : ndarray (3,)
+        Slave node position
+    compute_hessian : bool
+        If True, compute dn/dx_s for contact Hessian
+
+    Returns
+    -------
+    gn : float
+        Gap value (negative = penetration)
+    nor : ndarray (3,)
+        Unit normal at projection point
+    dndxs : ndarray (3, 3) or None
+        dn/dx_s matrix (only if compute_hessian=True and successful)
+    """
+    if compute_hessian:
+        # Get surface point and derivatives for Hessian
+        xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
+        n_raw = patch.D3Grg(t)
+        nor = n_raw / np.linalg.norm(n_raw)
+
+        # Compute dn/dx_s via implicit function theorem
+        # Projection minimizes |xs - xc(t)|^2, so at minimum:
+        #   f(t) = -2*(xs - xc)·(dxc/dt) = 0
+        # Implicit diff: dt/dxs = -(df/dt)^{-1} @ (df/dxs)
+        delta = xs - xc
+        dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
+        dfdxs = -2 * dxcdt.T
+        try:
+            dtdxs = np.linalg.solve(-dfdt, dfdxs)  # (2, 3)
+            dndt = patch.dndt(t)  # (3, 2)
+            dndxs = dndt @ dtdxs  # (3, 3)
+        except np.linalg.LinAlgError:
+            dndxs = None  # Singular — skip curvature term
+    else:
+        xc = patch.Grg(t, deriv=0)
+        n_raw = patch.D3Grg(t)
+        nor = n_raw / np.linalg.norm(n_raw)
+        dndxs = None
+
+    gn = (xs - xc) @ nor
+    return gn, nor, dndxs
+
+
 def _project_single(xsi, distances, sorted_idx, kd_pids, compute_hessian=False):
     """TR projection for a single slave node.
 
@@ -260,32 +317,9 @@ def _project_single(xsi, distances, sorted_idx, kd_pids, compute_hessian=False):
         if int(best_patch) >= 0:
             pid = int(best_patch)
             t   = np.array([t1, t2], dtype=np.float64)
-            patch = patches[pid]
-
-            # Get surface point and normal
-            if compute_hessian:
-                # Get derivatives for Hessian computation
-                xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
-                n_raw = patch.D3Grg(t)
-                nor = n_raw / np.linalg.norm(n_raw)
-
-                # Compute dn/dx_s via implicit function theorem
-                delta = xsi - xc
-                dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
-                dfdxs = -2 * dxcdt.T
-                try:
-                    dtdxs = np.linalg.solve(-dfdt, dfdxs)  # (2, 3)
-                    dndt = patch.dndt(t)  # (3, 2)
-                    dndxs = dndt @ dtdxs  # (3, 3)
-                except np.linalg.LinAlgError:
-                    dndxs = None  # Singular, skip curvature term
-            else:
-                xc = patch.Grg(t, deriv=0)
-                n_raw = patch.D3Grg(t)
-                nor = n_raw / np.linalg.norm(n_raw)
-                dndxs = None
-
-            gn = (xsi - xc) @ nor
+            gn, nor, dndxs = _evaluate_projection(
+                patches[pid], t, xsi, compute_hessian=compute_hessian
+            )
             return gn, nor, pid, t, dndxs
 
         radius_factor *= 2.0
@@ -394,31 +428,12 @@ class ContactCache:
                 pid = self.patch_ids[i]
                 if pid < 0:
                     continue
-                t   = self.params[i]
-                patch = patches[pid]
-
-                if compute_hessian:
-                    # Recompute with Hessian data
-                    xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
-                    n_raw = patch.D3Grg(t)
-                    nor = n_raw / np.linalg.norm(n_raw)
-
-                    delta = slave_pos[i] - xc
-                    dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
-                    dfdxs = -2 * dxcdt.T
-                    try:
-                        dtdxs = np.linalg.solve(-dfdt, dfdxs)
-                        dndt = patch.dndt(t)
-                        dndxs_all[i] = dndt @ dtdxs
-                    except np.linalg.LinAlgError:
-                        pass  # Keep zeros (will use n⊗n only)
-                else:
-                    xc = patch.Grg(t, deriv=0)
-                    n_raw = patch.D3Grg(t)
-                    nor = n_raw / np.linalg.norm(n_raw)
-
-                gn[i]      = (slave_pos[i] - xc) @ nor
-                normals[i] = nor
+                t = self.params[i]
+                gn[i], normals[i], dndxs = _evaluate_projection(
+                    patches[pid], t, slave_pos[i], compute_hessian=compute_hessian
+                )
+                if compute_hessian and dndxs is not None:
+                    dndxs_all[i] = dndxs
                 need_full[i] = False
 
         # Full TR projection for nodes that need it
@@ -716,31 +731,11 @@ def newton_active_set_solve():
                 pid = int(saved_pids[j])
                 t = saved_params[j]
                 xs = slave_pos_now[active_idx[j]]
-                patch = patches[pid]
 
-                # Get surface point, normal, and optionally dndxs for Hessian
-                if args.full_hessian:
-                    xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
-                    n_raw = patch.D3Grg(t)
-                    nor = n_raw / np.linalg.norm(n_raw)
-
-                    # Compute dndxs via implicit function theorem
-                    delta = xs - xc
-                    dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
-                    dfdxs = -2 * dxcdt.T
-                    try:
-                        dtdxs = np.linalg.solve(-dfdt, dfdxs)
-                        dndt = patch.dndt(t)
-                        dndxs = dndt @ dtdxs
-                    except np.linalg.LinAlgError:
-                        dndxs = None
-                else:
-                    xc = patch.Grg(t, deriv=0)
-                    n_raw = patch.D3Grg(t)
-                    nor = n_raw / np.linalg.norm(n_raw)
-                    dndxs = None
-
-                g = (xs - xc) @ nor
+                # Evaluate gap, normal, and optionally dndxs
+                g, nor, dndxs = _evaluate_projection(
+                    patches[pid], t, xs, compute_hessian=args.full_hessian
+                )
 
                 if g < 0:  # penetrating
                     # Compute contact Hessian using pre-computed dndxs
