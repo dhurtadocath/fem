@@ -112,11 +112,21 @@ J_gfu  = Det(F_gfu)
 I1_gfu = Trace(F_gfu.trans * F_gfu)
 
 # --- Stress CFs for VTK output -------------------------------------------
-# Cauchy stress:  sigma = (1/J) * P * F^T   with P = dW/dF
-# For this neo-Hookean:  sigma = (1/J)[2*c10*(F*F^T - I) + 2*d1*ln(J)*I]
-sigma_cf = (1/J_gfu) * (2*c10*(F_gfu * F_gfu.trans - Id(3)) + 2*d1*log(J_gfu)*Id(3))
-s_dev    = sigma_cf - (1.0/3.0) * Trace(sigma_cf) * Id(3)
-vonmises_cf = sqrt(1.5 * InnerProduct(s_dev, s_dev))
+# 1st Piola-Kirchhoff stress: P = dW/dF = 2*c10*(F - F^{-T}) + 2*d1*ln(J)*F^{-T}
+# Cauchy stress: sigma = (1/J) * P * F^T = (1/J)[2*c10*(F*F^T - I) + 2*d1*ln(J)*I]
+# Mandel stress: M = F^T * P (work conjugate to velocity gradient in material frame)
+F_inv_T = Inv(F_gfu).trans
+stress_1piola = 2*c10*(F_gfu - F_inv_T) + 2*d1*log(J_gfu)*F_inv_T
+stress_cauchy = (1/J_gfu) * (2*c10*(F_gfu * F_gfu.trans - Id(3)) + 2*d1*log(J_gfu)*Id(3))
+stress_mandel = F_gfu.trans * stress_1piola
+
+# Von Mises from Cauchy stress
+s_dev_cauchy = stress_cauchy - (1.0/3.0) * Trace(stress_cauchy) * Id(3)
+vm_cauchy = sqrt(1.5 * InnerProduct(s_dev_cauchy, s_dev_cauchy))
+
+# Von Mises from Mandel stress
+s_dev_mandel = stress_mandel - (1.0/3.0) * Trace(stress_mandel) * Id(3)
+vm_mandel = sqrt(1.5 * InnerProduct(s_dev_mandel, s_dev_mandel))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3.  POTATO + GREGORY PATCHES
@@ -738,9 +748,11 @@ def update_contact_fields(gn, normals, active, f_con):
 
 vtk = VTKOutput(
     mesh,
-    coefs=[gfu, sigma_cf, vonmises_cf,
+    coefs=[gfu, stress_1piola, stress_cauchy, stress_mandel,
+           vm_cauchy, vm_mandel,
            gf_contact_active, gf_penetration, gf_contact_rx],
-    names=["displacement", "stress", "vonmises",
+    names=["displacement", "stress_1piola", "stress_cauchy", "stress_mandel",
+           "vm_cauchy", "vm_mandel",
            "contact_active", "penetration", "contact_reaction"],
     filename=os.path.join(out_dir, "contact_potato"),
     subdivision=0, order=1,
