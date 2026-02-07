@@ -30,6 +30,7 @@ Usage
 # 1.  IMPORTS & CLI
 # ══════════════════════════════════════════════════════════════════════════════
 import argparse, os, sys, pickle
+from contextlib import nullcontext
 from datetime import datetime
 from time import perf_counter
 
@@ -52,7 +53,7 @@ parser.add_argument("--solver",     type=str,   default="newton",
                     help="solver: newton, newton-cg, trust-ncg, trust-krylov, trust-constr, bfgs, cg, tnc, slsqp, or lbfgsb")
 parser.add_argument("--E",          type=float, default=0.05,    help="Young's modulus")
 parser.add_argument("--nu",         type=float, default=0.3,     help="Poisson ratio")
-parser.add_argument("--kn_factor",  type=float, default=20.0,    help="kn = kn_factor * E")
+parser.add_argument("--kn_factor",  type=float, default=20.0,    help="kn = kn_factor * E / h (mesh-dependent, Wriggers 2006)")
 parser.add_argument("--nsteps",     type=int,   default=100,     help="number of load steps")
 parser.add_argument("--max_iter",   type=int,   default=50,      help="max iterations per step (Newton inner or L-BFGS-B)")
 parser.add_argument("--max_as",     type=int,   default=5,       help="max active-set iterations (Newton only)")
@@ -60,12 +61,15 @@ parser.add_argument("--gtol",       type=float, default=1e-8,    help="gradient/
 parser.add_argument("--full_hessian", action="store_true",       help="use full contact Hessian with curvature term (experimental)")
 parser.add_argument("--compare",    action="store_true",         help="write comparison outputs")
 parser.add_argument("--plot",       type=int,   default=1,       help="VTK export every N steps (0=off)")
+parser.add_argument("--taskmanager", action="store_true",        help="enable NGSolve TaskManager (parallel assembly, beneficial for large meshes)")
+parser.add_argument("--realcompile", action="store_true",        help="use realcompile=True for C++ JIT of energy form (startup cost, faster iterations)")
 args = parser.parse_args()
 
 n       = args.mesh
 E_val   = args.E
 nu_val  = args.nu
-kn      = args.kn_factor * E_val
+h_contact = 4.0 / n              # element edge length at contact surface ([-2,2]^3 block)
+kn      = args.kn_factor * E_val / h_contact   # Wriggers (2006): kn ~ alpha * E / h
 nsteps  = args.nsteps
 max_iter = args.max_iter
 
@@ -104,7 +108,7 @@ I1_sym = Trace(F_sym.trans * F_sym)
 psi_sym = c10 * (I1_sym - 3 - 2*log(J_sym)) + d1 * log(J_sym)**2
 
 a_form = BilinearForm(fes)
-a_form += Variation(psi_sym.Compile() * dx)
+a_form += Variation(psi_sym.Compile(realcompile=args.realcompile, wait=True) * dx)
 
 # Energy CF defined on gfu (for VTK stress output)
 F_gfu  = Id(3) + Grad(gfu)
@@ -116,17 +120,17 @@ I1_gfu = Trace(F_gfu.trans * F_gfu)
 # Cauchy stress: sigma = (1/J) * P * F^T = (1/J)[2*c10*(F*F^T - I) + 2*d1*ln(J)*I]
 # Mandel stress: M = F^T * P (work conjugate to velocity gradient in material frame)
 F_inv_T = Inv(F_gfu).trans
-stress_1piola = 2*c10*(F_gfu - F_inv_T) + 2*d1*log(J_gfu)*F_inv_T
-stress_cauchy = (1/J_gfu) * (2*c10*(F_gfu * F_gfu.trans - Id(3)) + 2*d1*log(J_gfu)*Id(3))
-stress_mandel = F_gfu.trans * stress_1piola
+stress_1piola = (2*c10*(F_gfu - F_inv_T) + 2*d1*log(J_gfu)*F_inv_T).Compile()
+stress_cauchy = ((1/J_gfu) * (2*c10*(F_gfu * F_gfu.trans - Id(3)) + 2*d1*log(J_gfu)*Id(3))).Compile()
+stress_mandel = (F_gfu.trans * stress_1piola).Compile()
 
 # Von Mises from Cauchy stress
 s_dev_cauchy = stress_cauchy - (1.0/3.0) * Trace(stress_cauchy) * Id(3)
-vm_cauchy = sqrt(1.5 * InnerProduct(s_dev_cauchy, s_dev_cauchy))
+vm_cauchy = sqrt(1.5 * InnerProduct(s_dev_cauchy, s_dev_cauchy)).Compile()
 
 # Von Mises from Mandel stress
 s_dev_mandel = stress_mandel - (1.0/3.0) * Trace(stress_mandel) * Id(3)
-vm_mandel = sqrt(1.5 * InnerProduct(s_dev_mandel, s_dev_mandel))
+vm_mandel = sqrt(1.5 * InnerProduct(s_dev_mandel, s_dev_mandel)).Compile()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3.  POTATO + GREGORY PATCHES
@@ -203,8 +207,8 @@ top_dofs_z = np.array([v + 2*nv for v in top_verts], dtype=np.int32)    # z-comp
 TR_INIT = 0.1
 TR_MIN  = 1e-15
 TR_MAX  = 1.0
-BASE_NCAND = 24
-MIN_NCAND  = 10
+BASE_NCAND = 12 #24
+MIN_NCAND  = 5 #10
 MAX_NCAND  = 96
 RADIUS_FACTOR = 1.5
 K_SURF = 15
@@ -476,6 +480,34 @@ contact_cache = ContactCache()
 res_vec = gfu.vec.CreateVector()       # scratch vector for Apply
 
 
+def compute_contact_forces(gn, normals, active):
+    """Assemble nodal contact penalty forces into a full DOF vector.
+
+    f_con[v]    = kn * gn * n_x   for each active (penetrating) slave node
+    f_con[v+nv] = kn * gn * n_y
+    f_con[v+2nv]= kn * gn * n_z
+
+    Parameters
+    ----------
+    gn : (n_slave,) array — gap values (negative = penetration)
+    normals : (n_slave, 3) array — unit normals at projection points
+    active : (n_slave,) bool array — mask of penetrating nodes
+
+    Returns
+    -------
+    f_con : (ndof,) array — contact force vector in full DOF space
+    """
+    f_con = np.zeros(ndof)
+    if np.any(active):
+        act = np.where(active)[0]
+        verts_act = slave_verts[act]
+        kgn = kn * gn[act]
+        f_con[verts_act]          = kgn * normals[act, 0]
+        f_con[verts_act + nv]     = kgn * normals[act, 1]
+        f_con[verts_act + 2*nv]   = kgn * normals[act, 2]
+    return f_con
+
+
 def objective(x_free):
     """Return (total_energy, gradient_on_free_dofs) for scipy.minimize."""
     vec = gfu.vec.FV().NumPy()
@@ -496,15 +528,7 @@ def objective(x_free):
     # --- Contact penalty (cached TR projection) ----------------------------
     gn, normals, active, _ = contact_cache.evaluate(slave_pos)
     E_con = 0.5 * kn * np.sum(gn[active]**2)
-
-    f_con = np.zeros(ndof)
-    if np.any(active):
-        act = np.where(active)[0]
-        verts_act = slave_verts[act]
-        kgn = kn * gn[act]                              # (n_active,)
-        f_con[verts_act]          = kgn * normals[act, 0]
-        f_con[verts_act + nv]     = kgn * normals[act, 1]
-        f_con[verts_act + 2*nv]   = kgn * normals[act, 2]
+    f_con = compute_contact_forces(gn, normals, active)
 
     f_total = f_mat + f_con
     return E_mat + E_con, f_total[free_dofs].copy()
@@ -517,6 +541,25 @@ def objective(x_free):
 _hess_tmp = gfu.vec.CreateVector()
 _hess_out = gfu.vec.CreateVector()
 
+# Cache for AssembleLinearization and contact state in hessp.
+# Scipy Newton-CG calls hessp(x_free, p) many times at the SAME x_free with
+# different p (CG inner iterations). Reassembling the tangent and recomputing
+# contact state each time is wasteful. We cache both and only recompute when
+# x_free actually changes.
+_hessp_cache = {
+    "x_free": None,           # last linearization point
+    "contact_data": None,     # (gn, normals, active_idx, dndxs_all)
+}
+
+# Precompute mapping from slave vertex DOFs to free_dofs index (avoids
+# searchsorted in inner loop). -1 means the DOF is not free (Dirichlet).
+_slave_dof_to_free = {}
+for sv in slave_verts:
+    for dof in [int(sv), int(sv) + nv, int(sv) + 2*nv]:
+        idx = np.searchsorted(free_dofs, dof)
+        if idx < len(free_dofs) and free_dofs[idx] == dof:
+            _slave_dof_to_free[dof] = int(idx)
+
 
 def hessp(x_free, p):
     """Hessian-vector product: H @ p for scipy Newton-CG.
@@ -524,6 +567,9 @@ def hessp(x_free, p):
     Computes (K_mat + K_con) @ p where:
     - K_mat: material tangent from NGSolve (linearization of hyperelastic energy)
     - K_con: contact Hessian = kn * (n ⊗ n + g * dn/dx_s) for penetrating nodes
+
+    Caches the tangent assembly and contact evaluation across CG inner
+    iterations (same x_free, different p).
 
     Parameters
     ----------
@@ -538,52 +584,60 @@ def hessp(x_free, p):
         Hessian-vector product on free DOFs
     """
     vec = gfu.vec.FV().NumPy()
-    vec[free_dofs] = x_free
+
+    # Check if linearization point changed
+    need_reassemble = (
+        _hessp_cache["x_free"] is None
+        or not np.array_equal(x_free, _hessp_cache["x_free"])
+    )
+
+    if need_reassemble:
+        vec[free_dofs] = x_free
+
+        # Assemble material tangent at new state
+        a_form.AssembleLinearization(gfu.vec)
+
+        # Evaluate contact state at new state
+        slave_pos = np.column_stack([
+            X_ref[slave_verts, 0] + vec[slave_verts],
+            X_ref[slave_verts, 1] + vec[slave_verts + nv],
+            X_ref[slave_verts, 2] + vec[slave_verts + 2*nv],
+        ])
+        gn, normals, active, dndxs_all = contact_cache.evaluate(
+            slave_pos, compute_hessian=args.full_hessian
+        )
+        active_idx = np.where(active)[0] if np.any(active) else np.array([], dtype=int)
+
+        _hessp_cache["x_free"] = x_free.copy()
+        _hessp_cache["contact_data"] = (gn, normals, active_idx, dndxs_all)
+    else:
+        gn, normals, active_idx, dndxs_all = _hessp_cache["contact_data"]
 
     # --- Material Hessian-vector product ---
-    # Assemble linearization (tangent stiffness) at current state
-    a_form.AssembleLinearization(gfu.vec)
-
-    # Set up direction vector
     _hess_tmp.FV().NumPy()[:] = 0.0
     _hess_tmp.FV().NumPy()[free_dofs] = p
 
-    # Apply material tangent: K_mat @ p
     _hess_out.data = a_form.mat * _hess_tmp
     Hp = _hess_out.FV().NumPy()[free_dofs].copy()
 
     # --- Contact Hessian-vector product ---
-    # Get current slave positions
-    slave_pos = np.column_stack([
-        X_ref[slave_verts, 0] + vec[slave_verts],
-        X_ref[slave_verts, 1] + vec[slave_verts + nv],
-        X_ref[slave_verts, 2] + vec[slave_verts + 2*nv],
-    ])
+    if len(active_idx) > 0:
+        p_full = np.zeros(ndof)
+        p_full[free_dofs] = p
+        p_slave = np.column_stack([
+            p_full[slave_verts],
+            p_full[slave_verts + nv],
+            p_full[slave_verts + 2*nv],
+        ])
 
-    # Get direction components for slave nodes
-    p_full = np.zeros(ndof)
-    p_full[free_dofs] = p
-    p_slave = np.column_stack([
-        p_full[slave_verts],
-        p_full[slave_verts + nv],
-        p_full[slave_verts + 2*nv],
-    ])
-
-    # Contact contribution using cached projection (with Hessian data if requested)
-    gn, normals, active, dndxs_all = contact_cache.evaluate(
-        slave_pos, compute_hessian=args.full_hessian
-    )
-
-    if np.any(active):
-        act_idx = np.where(active)[0]
-        for i in act_idx:
+        for i in active_idx:
             g = gn[i]
             if g >= 0:
-                continue  # Not penetrating
+                continue
 
             nor = normals[i]
             v = int(slave_verts[i])
-            p_v = p_slave[i]  # (3,) direction at this node
+            p_v = p_slave[i]
 
             # Simple Hessian: kn * (n ⊗ n) @ p_v = kn * (n · p_v) * n
             Hp_contact = kn * (nor @ p_v) * nor
@@ -591,24 +645,18 @@ def hessp(x_free, p):
             # Full Hessian with curvature term (if enabled and available)
             if args.full_hessian and dndxs_all is not None:
                 dndxs = dndxs_all[i]
-                if np.any(dndxs):  # Non-zero (successfully computed)
-                    # Curvature contribution: kn * g * dndxs @ p_v
+                if np.any(dndxs):
                     curv_contrib = kn * g * (dndxs @ p_v)
-
-                    # Safeguard: limit magnitude
                     curv_norm = np.linalg.norm(curv_contrib)
                     base_norm = np.linalg.norm(Hp_contact)
                     if curv_norm > 0.3 * max(base_norm, 1e-10):
                         curv_contrib *= 0.3 * base_norm / curv_norm
-
                     Hp_contact += curv_contrib
 
-            # Map back to DOF indices
-            dofs_v = np.array([v, v + nv, v + 2*nv])
-            # Find which DOFs are free
-            for k, dof in enumerate(dofs_v):
-                idx_in_free = np.searchsorted(free_dofs, dof)
-                if idx_in_free < len(free_dofs) and free_dofs[idx_in_free] == dof:
+            # Map back to free DOF indices via precomputed lookup
+            for k, dof in enumerate([v, v + nv, v + 2*nv]):
+                idx_in_free = _slave_dof_to_free.get(dof, -1)
+                if idx_in_free >= 0:
                     Hp[idx_in_free] += Hp_contact[k]
 
     return Hp
@@ -671,11 +719,42 @@ def compute_contact_hessian(g, nor, dndxs=None):
     return K_con
 
 
-def newton_active_set_solve():
-    """Newton solver with active-set iteration for contact.
+_w_vec = gfu.vec.CreateVector()   # scratch for Newton direction
+_uh_vec = gfu.vec.CreateVector()  # scratch for linesearch trial
 
-    The outer loop iterates the active set (which nodes are in contact).
-    The inner loop performs Newton iterations with fixed active set.
+
+def _total_energy_at(u_vec, saved_pids, saved_params, active_idx):
+    """Evaluate total energy (material + contact) at a given state.
+
+    Used by the linesearch to decide on step size.
+    """
+    E_mat = a_form.Energy(u_vec)
+    if len(active_idx) == 0:
+        return E_mat
+
+    vec_np = u_vec.FV().NumPy()
+    slave_pos = np.column_stack([
+        X_ref[slave_verts, 0] + vec_np[slave_verts],
+        X_ref[slave_verts, 1] + vec_np[slave_verts + nv],
+        X_ref[slave_verts, 2] + vec_np[slave_verts + 2*nv],
+    ])
+    E_con = 0.0
+    for j, idx in enumerate(active_idx):
+        pid = int(saved_pids[j])
+        t = saved_params[j]
+        xs = slave_pos[idx]
+        g, _, _ = _evaluate_projection(patches[pid], t, xs)
+        if g < 0:
+            E_con += 0.5 * kn * g**2
+    return E_mat + E_con
+
+
+def newton_active_set_solve():
+    """Newton solver with active-set iteration and energy-based linesearch.
+
+    Outer loop: iterate the active set (which nodes are in contact).
+    Inner loop: Newton iterations with fixed active set and backtracking
+    linesearch following the pattern in NGSolve's NewtonSolver.Solve().
 
     Returns
     -------
@@ -725,24 +804,21 @@ def newton_active_set_solve():
 
             # 2. Add contact forces and compute Hessian data
             slave_pos_now = compute_slave_pos()
-            pen_data = []  # [(local_idx, gap, normal, dndxs, K_con), ...] for penetrating nodes
+            pen_data = []
 
             for j in range(n_act):
                 pid = int(saved_pids[j])
                 t = saved_params[j]
                 xs = slave_pos_now[active_idx[j]]
 
-                # Evaluate gap, normal, and optionally dndxs
                 g, nor, dndxs = _evaluate_projection(
                     patches[pid], t, xs, compute_hessian=args.full_hessian
                 )
 
-                if g < 0:  # penetrating
-                    # Compute contact Hessian using pre-computed dndxs
+                if g < 0:
                     K_con = compute_contact_hessian(g, nor, dndxs)
                     pen_data.append((j, g, nor, K_con))
 
-                    # Add contact force to residual
                     v = int(slave_verts[active_idx[j]])
                     r_np[v]          += kn * g * nor[0]
                     r_np[v + nv]     += kn * g * nor[1]
@@ -757,7 +833,7 @@ def newton_active_set_solve():
             # 4. Material tangent (linearization at current state)
             a_form.AssembleLinearization(gfu.vec)
 
-            # 5. Add contact Hessian: kn * (n ⊗ n + g * dn/dx_s)
+            # 5. Add contact Hessian
             mat = a_form.mat
             for j_local, g, nor, K_con in pen_data:
                 v = int(slave_verts[active_idx[j_local]])
@@ -766,9 +842,38 @@ def newton_active_set_solve():
                     for b in range(3):
                         mat[dofs[a], dofs[b]] = mat[dofs[a], dofs[b]] + K_con[a, b]
 
-            # 6. Solve K·Δu = -r and update
-            inv = mat.Inverse(fes.FreeDofs(), inverse="umfpack")
-            gfu.vec.data -= inv * res_vec
+            # 6. Solve K·Δu = -r (with fallback to gradient on singular matrix)
+            try:
+                inv = mat.Inverse(fes.FreeDofs(), inverse="umfpack")
+                _w_vec.data = inv * res_vec
+            except Exception:
+                # Singular tangent: fall back to scaled residual (gradient descent).
+                # Use a small step to avoid element inversion.
+                _w_vec.data = res_vec
+                r2 = float(InnerProduct(res_vec, res_vec))
+                if r2 > 1e-30:
+                    # Cauchy (steepest descent) step: alpha = ||r||^2 / (r^T K r)
+                    # Since K is singular, use a safe fixed scaling instead
+                    _w_vec.data = (0.01 / (r2**0.5)) * res_vec
+
+            # 7. Energy-based backtracking linesearch
+            #    Following NGSolve NewtonSolver pattern (nonlinearsolvers.py:63-72)
+            energy_old = _total_energy_at(
+                gfu.vec, saved_pids, saved_params, active_idx
+            )
+            tau = 1.0
+            _uh_vec.data = gfu.vec - tau * _w_vec
+            energy_new = _total_energy_at(
+                _uh_vec, saved_pids, saved_params, active_idx
+            )
+            ls_tol = max(1e-14 * abs(energy_old), args.gtol)
+            while energy_new > energy_old + ls_tol and tau > 1e-8:
+                tau *= 0.5
+                _uh_vec.data = gfu.vec - tau * _w_vec
+                energy_new = _total_energy_at(
+                    _uh_vec, saved_pids, saved_params, active_idx
+                )
+            gfu.vec.data = _uh_vec
 
     return total_newton, as_iter + 1, gn_out, normals_out, active_out
 
@@ -831,132 +936,116 @@ print(f"{'='*60}\n")
 
 t_wall_start = perf_counter()
 
-for step in range(1, nsteps + 1):
-    t_step = perf_counter()
+# Enable multi-threaded NGSolve operations (assembly, integration, solve).
+# TaskManager activates parallel element-loop assembly, integration, and
+# matrix-vector products inside Apply/AssembleLinearization/Inverse.
+# See: NGSolve howto_parallel.rst, py_tutorials/navierstokes.py
+# NOTE: For small problems (<1000 elements), threading overhead may dominate.
+#       Benefit grows with mesh size (10k+ elements).
+with TaskManager() if args.taskmanager else nullcontext():
+    for step in range(1, nsteps + 1):
+        t_step = perf_counter()
 
-    # Reset contact cache at each load step (force full re-projection once)
-    contact_cache.reset()
+        # Reset contact cache at each load step (force full re-projection once)
+        contact_cache.reset()
 
-    # --- Incremental Dirichlet on "top" boundary --------------------------
-    vec = gfu.vec.FV().NumPy()
-    vec[top_dofs_x] += disp_increment[0]
-    vec[top_dofs_y] += disp_increment[1]
-    vec[top_dofs_z] += disp_increment[2]
+        # --- Incremental Dirichlet on "top" boundary ----------------------
+        vec = gfu.vec.FV().NumPy()
+        vec[top_dofs_x] += disp_increment[0]
+        vec[top_dofs_y] += disp_increment[1]
+        vec[top_dofs_z] += disp_increment[2]
 
-    # ══════════════════════════════════════════════════════════════════════
-    # SOLVER DISPATCH
-    # ══════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════
+        # SOLVER DISPATCH
+        # ══════════════════════════════════════════════════════════════════
 
-    # --- Helper: compute contact forces and update fields ---
-    def finalize_contact_state():
-        """Evaluate contact state and update output fields. Returns (gn, normals, active, n_active, max_pen)."""
-        slave_pos = compute_slave_pos()
-        gn, normals, active, _ = contact_cache.evaluate(slave_pos)
-        f_con = np.zeros(ndof)
-        if np.any(active):
-            act = np.where(active)[0]
-            verts_act = slave_verts[act]
-            kgn = kn * gn[act]
-            f_con[verts_act]          = kgn * normals[act, 0]
-            f_con[verts_act + nv]     = kgn * normals[act, 1]
-            f_con[verts_act + 2*nv]   = kgn * normals[act, 2]
-        update_contact_fields(gn, normals, active, f_con)
-        n_active = int(np.sum(active))
-        max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
-        return gn, normals, active, n_active, max_pen
+        # --- Helper: compute contact forces and update fields ---
+        def finalize_contact_state():
+            """Evaluate contact state and update output fields."""
+            slave_pos = compute_slave_pos()
+            gn, normals, active, _ = contact_cache.evaluate(slave_pos)
+            f_con = compute_contact_forces(gn, normals, active)
+            update_contact_fields(gn, normals, active, f_con)
+            n_active = int(np.sum(active))
+            max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
+            return gn, normals, active, n_active, max_pen
 
-    if args.solver == "newton":
-        # ── Newton + active-set solver ──
-        n_newton, n_as, gn, normals, active = newton_active_set_solve()
+        if args.solver == "newton":
+            # ── Newton + active-set solver ──
+            n_newton, n_as, gn, normals, active = newton_active_set_solve()
 
-        # Compute contact forces for output
-        f_con = np.zeros(ndof)
-        if np.any(active):
-            act = np.where(active)[0]
-            verts_act = slave_verts[act]
-            kgn = kn * gn[act]
-            f_con[verts_act]          = kgn * normals[act, 0]
-            f_con[verts_act + nv]     = kgn * normals[act, 1]
-            f_con[verts_act + 2*nv]   = kgn * normals[act, 2]
-        update_contact_fields(gn, normals, active, f_con)
+            # Compute contact forces for output
+            f_con = compute_contact_forces(gn, normals, active)
+            update_contact_fields(gn, normals, active, f_con)
 
-        # Compute final residual norm for reporting
-        a_form.Apply(gfu.vec, res_vec)
-        r_np = res_vec.FV().NumPy()
-        if np.any(active):
-            for i in np.where(active)[0]:
-                v, g = int(slave_verts[i]), gn[i]
-                if g < 0:
-                    nor = normals[i]
-                    r_np[v]          += kn * g * nor[0]
-                    r_np[v + nv]     += kn * g * nor[1]
-                    r_np[v + 2*nv]   += kn * g * nor[2]
-        rnorm = np.linalg.norm(r_np[free_dofs])
+            # Compute final residual norm for reporting
+            a_form.Apply(gfu.vec, res_vec)
+            res_vec.FV().NumPy()[:]  += f_con
+            rnorm = np.linalg.norm(res_vec.FV().NumPy()[free_dofs])
 
-        n_active = int(np.sum(active))
-        max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
-        dt_step  = perf_counter() - t_step
-        print(f"Step {step:3d}/{nsteps}  Newton: nit={n_newton:2d} as={n_as}  "
-              f"|r|={rnorm:.2e}  active={n_active:3d}  maxpen={max_pen:.2e}  "
-              f"t={dt_step:.1f}s")
+            n_active = int(np.sum(active))
+            max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
+            dt_step  = perf_counter() - t_step
+            print(f"Step {step:3d}/{nsteps}  Newton: nit={n_newton:2d} as={n_as}  "
+                  f"|r|={rnorm:.2e}  active={n_active:3d}  maxpen={max_pen:.2e}  "
+                  f"t={dt_step:.1f}s")
 
-    else:
-        # ── Scipy minimize solvers ──
-        # Solver configurations: (method_name, uses_hessp, options_override)
-        SCIPY_SOLVERS = {
-            "newton-cg":    ("Newton-CG",    True,  {"xtol": args.gtol}),
-            "trust-ncg":    ("trust-ncg",    True,  {"gtol": args.gtol}),
-            "trust-krylov": ("trust-krylov", True,  {"gtol": args.gtol}),
-            "trust-constr": ("trust-constr", True,  {"gtol": args.gtol}),
-            "bfgs":         ("BFGS",         False, {"gtol": args.gtol}),
-            "cg":           ("CG",           False, {"gtol": args.gtol}),
-            "tnc":          ("TNC",          False, {"gtol": args.gtol}),
-            "slsqp":        ("SLSQP",        False, {"ftol": args.gtol}),
-            "lbfgsb":       ("L-BFGS-B",     False, {"gtol": args.gtol, "maxls": 40, "ftol": 0}),
-        }
-
-        method_name, uses_hessp, opts_override = SCIPY_SOLVERS[args.solver]
-        options = {"maxiter": max_iter, **opts_override}
-
-        x0 = vec[free_dofs].copy()
-        if uses_hessp:
-            result = minimize(objective, x0, method=method_name, jac=True,
-                              hessp=hessp, options=options)
         else:
-            result = minimize(objective, x0, method=method_name, jac=True,
-                              options=options)
-        vec[free_dofs] = result.x
+            # ── Scipy minimize solvers ──
+            SCIPY_SOLVERS = {
+                "newton-cg":    ("Newton-CG",    True,  {"xtol": args.gtol}),
+                "trust-ncg":    ("trust-ncg",    True,  {"gtol": args.gtol}),
+                "trust-krylov": ("trust-krylov", True,  {"gtol": args.gtol}),
+                "trust-constr": ("trust-constr", True,  {"gtol": args.gtol}),
+                "bfgs":         ("BFGS",         False, {"gtol": args.gtol}),
+                "cg":           ("CG",           False, {"gtol": args.gtol}),
+                "tnc":          ("TNC",          False, {"gtol": args.gtol}),
+                "slsqp":        ("SLSQP",        False, {"ftol": args.gtol}),
+                "lbfgsb":       ("L-BFGS-B",     False, {"gtol": args.gtol, "maxls": 40, "ftol": 0}),
+            }
 
-        # Finalize contact state and get metrics
-        _, _, _, n_active, max_pen = finalize_contact_state()
-        dt_step   = perf_counter() - t_step
-        grad_norm = np.linalg.norm(result.jac) if result.jac is not None else float("nan")
+            method_name, uses_hessp, opts_override = SCIPY_SOLVERS[args.solver]
+            options = {"maxiter": max_iter, **opts_override}
 
-        # Print result
-        print(f"Step {step:3d}/{nsteps}  {args.solver}: nit={result.nit:2d}  "
-              f"nfev={result.nfev:3d}  |grad|={grad_norm:.2e}  "
-              f"active={n_active:3d}  maxpen={max_pen:.2e}  t={dt_step:.1f}s")
-        if not result.success:
-            print(f"  >> {result.message}")
+            x0 = vec[free_dofs].copy()
+            if uses_hessp:
+                result = minimize(objective, x0, method=method_name, jac=True,
+                                  hessp=hessp, options=options)
+            else:
+                result = minimize(objective, x0, method=method_name, jac=True,
+                                  options=options)
+            vec[free_dofs] = result.x
 
-    # --- VTK snapshot ------------------------------------------------------
-    if args.plot > 0 and step % args.plot == 0:
-        vtk.Do(time=step * dt)
+            # Finalize contact state and get metrics
+            _, _, _, n_active, max_pen = finalize_contact_state()
+            dt_step   = perf_counter() - t_step
+            grad_norm = np.linalg.norm(result.jac) if result.jac is not None else float("nan")
 
-    # --- Comparison output -------------------------------------------------
-    if args.compare:
-        np.save(os.path.join(out_dir, f"u_step{step:04d}.npy"),
-                gfu.vec.FV().NumPy().copy())
-        # Reaction forces on top boundary
-        a_form.Apply(gfu.vec, res_vec)
-        f_top = res_vec.FV().NumPy()
-        rx = np.sum(f_top[top_dofs_x])
-        ry = np.sum(f_top[top_dofs_y])
-        rz = np.sum(f_top[top_dofs_z])
-        with open(os.path.join(out_dir, "reactions.csv"), "a") as fout:
-            if step == 1:
-                fout.write("step,time,rx,ry,rz\n")
-            fout.write(f"{step},{step*dt:.6f},{rx:.10e},{ry:.10e},{rz:.10e}\n")
+            # Print result
+            print(f"Step {step:3d}/{nsteps}  {args.solver}: nit={result.nit:2d}  "
+                  f"nfev={result.nfev:3d}  |grad|={grad_norm:.2e}  "
+                  f"active={n_active:3d}  maxpen={max_pen:.2e}  t={dt_step:.1f}s")
+            if not result.success:
+                print(f"  >> {result.message}")
+
+        # --- VTK snapshot --------------------------------------------------
+        if args.plot > 0 and step % args.plot == 0:
+            vtk.Do(time=step * dt)
+
+        # --- Comparison output ---------------------------------------------
+        if args.compare:
+            np.save(os.path.join(out_dir, f"u_step{step:04d}.npy"),
+                    gfu.vec.FV().NumPy().copy())
+            # Reaction forces on top boundary
+            a_form.Apply(gfu.vec, res_vec)
+            f_top = res_vec.FV().NumPy()
+            rx = np.sum(f_top[top_dofs_x])
+            ry = np.sum(f_top[top_dofs_y])
+            rz = np.sum(f_top[top_dofs_z])
+            with open(os.path.join(out_dir, "reactions.csv"), "a") as fout:
+                if step == 1:
+                    fout.write("step,time,rx,ry,rz\n")
+                fout.write(f"{step},{step*dt:.6f},{rx:.10e},{ry:.10e},{rz:.10e}\n")
 
 t_total = perf_counter() - t_wall_start
 print(f"\nTotal wall time: {t_total:.1f} s")
