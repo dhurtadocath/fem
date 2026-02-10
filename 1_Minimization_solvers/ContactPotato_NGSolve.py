@@ -48,9 +48,8 @@ from PyClasses import gregory_patch_backend as gb
 parser = argparse.ArgumentParser(description="NGSolve ContactPotato simulation")
 parser.add_argument("--mesh",       type=int,   default=20,      help="mesh density n (nxnxn hex)")
 parser.add_argument("--solver",     type=str,   default="newton",
-                    choices=["newton", "lbfgsb", "newton-cg", "trust-ncg", "trust-krylov",
-                             "trust-constr", "bfgs", "cg", "tnc", "slsqp"],
-                    help="solver: newton, newton-cg, trust-ncg, trust-krylov, trust-constr, bfgs, cg, tnc, slsqp, or lbfgsb")
+                    choices=["newton", "newton-cg", "trust-constr", "tnc", "lbfgsb"],
+                    help="solver: newton, newton-cg, trust-constr, tnc, or lbfgsb")
 parser.add_argument("--E",          type=float, default=0.05,    help="Young's modulus")
 parser.add_argument("--nu",         type=float, default=0.3,     help="Poisson ratio")
 parser.add_argument("--kn_factor",  type=float, default=20.0,    help="kn = kn_factor * E / h (mesh-dependent, Wriggers 2006)")
@@ -330,52 +329,6 @@ def _project_single(xsi, distances, sorted_idx, kd_pids, compute_hessian=False):
     return np.inf, np.zeros(3), -1, None, None
 
 
-def compute_contact(slave_pos, compute_hessian=False):
-    """Compute gap and normal for each slave node via TR projection.
-
-    Parameters
-    ----------
-    slave_pos : (n_slave, 3) array of current slave-node positions
-    compute_hessian : bool
-        If True, also compute dn/dx_s for contact Hessian
-
-    Returns
-    -------
-    gn      : (n_slave,) gap values (negative = penetration)
-    normals : (n_slave, 3) outward unit normals on master surface
-    active  : boolean mask of penetrating nodes
-    dndxs_all : (n_slave, 3, 3) or None
-        dn/dx_s matrices (only if compute_hessian=True)
-    """
-    n_slave = slave_pos.shape[0]
-    gn      = np.full(n_slave, np.inf)
-    normals = np.zeros((n_slave, 3))
-    dndxs_all = np.zeros((n_slave, 3, 3)) if compute_hessian else None
-
-    # Distance to each BS centre
-    dist_mat = np.linalg.norm(
-        xm_matrix[:, None, :] - slave_pos[None, :, :], axis=2
-    )  # (npatches, n_slave)
-
-    for i in range(n_slave):
-        xsi        = slave_pos[i].astype(np.float64)
-        distances  = dist_mat[:, i]
-        sorted_idx = np.argsort(distances)
-
-        # KD-tree candidates
-        _, idx_kd  = surf_kdtree.query(xsi, k=min(K_SURF, len(surf_pts)))
-        kd_pids    = np.unique(surf_pids[np.atleast_1d(idx_kd)])
-
-        gn[i], normals[i], _, _, dndxs = _project_single(
-            xsi, distances, sorted_idx, kd_pids, compute_hessian=compute_hessian
-        )
-        if compute_hessian and dndxs is not None:
-            dndxs_all[i] = dndxs
-
-    active = gn < 0
-    return gn, normals, active, dndxs_all
-
-
 # --- Contact cache for warm-starting within a load step -------------------
 # Between consecutive L-BFGS-B evaluations the slave positions barely move,
 # so we can reuse the previous projection result (patch id + parametric coords)
@@ -389,7 +342,6 @@ class ContactCache:
         self.prev_pos    = None      # (n_slave, 3)
         self.patch_ids   = None      # (n_slave,) int
         self.params      = None      # (n_slave, 2) parametric coords
-        self.dndxs       = None      # (n_slave, 3, 3) dn/dx_s matrices
         self.tol_reuse   = 0.05      # reuse if ||Δx|| < tol per node
 
     def reset(self):
@@ -459,13 +411,11 @@ class ContactCache:
                 if self.patch_ids is None:
                     self.patch_ids = np.full(n_slave, -1, dtype=np.int32)
                     self.params    = np.zeros((n_slave, 2), dtype=np.float64)
-                    self.dndxs     = np.zeros((n_slave, 3, 3), dtype=np.float64)
                 self.patch_ids[i] = pid
                 if t is not None:
                     self.params[i] = t
                 if compute_hessian and dndxs is not None:
                     dndxs_all[i] = dndxs
-                    self.dndxs[i] = dndxs
 
         self.prev_pos = slave_pos.copy()
         active = gn < 0
@@ -508,9 +458,6 @@ def compute_contact_forces(gn, normals, active):
     return f_con
 
 
-_last_valid_grad = [None]  # mutable container for NaN fallback gradient
-
-
 def objective(x_free):
     """Return (total_energy, gradient_on_free_dofs) for scipy.minimize."""
     vec = gfu.vec.FV().NumPy()
@@ -550,9 +497,7 @@ def objective(x_free):
     f_con = compute_contact_forces(gn, normals, active)
 
     f_total = f_mat + f_con
-    grad = f_total[free_dofs].copy()
-    _last_valid_grad[0] = grad
-    return E_mat + E_con, grad
+    return E_mat + E_con, f_total[free_dofs].copy()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -948,7 +893,7 @@ print(f"  ContactPotato NGSolve — mesh {n}x{n}x{n}")
 print(f"  E={E_val}, nu={nu_val}, kn={kn:.4f}")
 if args.solver == "newton":
     print(f"  {nsteps} steps, solver=Newton, max_iter={max_iter}, max_as={args.max_as}, gtol={args.gtol:.0e}")
-elif args.solver in ("newton-cg", "trust-ncg", "trust-krylov", "trust-constr"):
+elif args.solver in ("newton-cg", "trust-constr"):
     hess_type = "full (with curvature)" if args.full_hessian else "simple (n⊗n)"
     print(f"  {nsteps} steps, solver={args.solver}, max_iter={max_iter}, gtol={args.gtol:.0e}, hess={hess_type}")
 else:
@@ -1015,13 +960,8 @@ with TaskManager() if args.taskmanager else nullcontext():
             # ── Scipy minimize solvers ──
             SCIPY_SOLVERS = {
                 "newton-cg":    ("Newton-CG",    True,  {"xtol": args.gtol}),
-                "trust-ncg":    ("trust-ncg",    True,  {"gtol": args.gtol, "initial_trust_radius": 0.0010, "max_trust_radius": 100.0}),
-                "trust-krylov": ("trust-krylov", True,  {"gtol": args.gtol}),
                 "trust-constr": ("trust-constr", True,  {"gtol": args.gtol}),
-                "bfgs":         ("BFGS",         False, {"gtol": args.gtol}),
-                "cg":           ("CG",           False, {"gtol": args.gtol}),
                 "tnc":          ("TNC",          False, {"gtol": args.gtol}),
-                "slsqp":        ("SLSQP",        False, {"ftol": args.gtol}),
                 "lbfgsb":       ("L-BFGS-B",     False, {"gtol": args.gtol, "maxls": 40, "ftol": 0}),
             }
 
@@ -1056,7 +996,6 @@ with TaskManager() if args.taskmanager else nullcontext():
                   f"active={n_active:3d}  maxpen={max_pen:.2e}  t={dt_step:.1f}s")
             if not result.success:
                 print(f"  >> {result.message}")
-                # Gradient consistency check at the failing point
 
         # --- VTK snapshot --------------------------------------------------
         if args.plot > 0 and step % args.plot == 0:
