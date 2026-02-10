@@ -48,8 +48,8 @@ from PyClasses import gregory_patch_backend as gb
 parser = argparse.ArgumentParser(description="NGSolve ContactPotato simulation")
 parser.add_argument("--mesh",       type=int,   default=20,      help="mesh density n (nxnxn hex)")
 parser.add_argument("--solver",     type=str,   default="newton",
-                    choices=["newton", "newton-cg", "trust-constr", "tnc", "lbfgsb"],
-                    help="solver: newton, newton-cg, trust-constr, tnc, or lbfgsb")
+                    choices=["newton", "newton-cg", "trust-constr", "lbfgsb"],
+                    help="solver: newton, newton-cg, trust-constr, or lbfgsb")
 parser.add_argument("--E",          type=float, default=0.05,    help="Young's modulus")
 parser.add_argument("--nu",         type=float, default=0.3,     help="Poisson ratio")
 parser.add_argument("--kn_factor",  type=float, default=20.0,    help="kn = kn_factor * E / h (mesh-dependent, Wriggers 2006)")
@@ -687,12 +687,19 @@ def _total_energy_at(u_vec, saved_pids, saved_params, active_idx):
     """Evaluate total energy (material + contact) at a given state.
 
     Used by the linesearch to decide on step size.
+    Returns np.inf for invalid states (NaN, element inversion).
     """
     E_mat = a_form.Energy(u_vec)
+    if not np.isfinite(E_mat):
+        return np.inf
+
     if len(active_idx) == 0:
         return E_mat
 
     vec_np = u_vec.FV().NumPy()
+    if not np.isfinite(vec_np).all():
+        return np.inf
+
     slave_pos = np.column_stack([
         X_ref[slave_verts, 0] + vec_np[slave_verts],
         X_ref[slave_verts, 1] + vec_np[slave_verts + nv],
@@ -716,6 +723,9 @@ def newton_active_set_solve():
     Inner loop: Newton iterations with fixed active set and backtracking
     linesearch following the pattern in NGSolve's NewtonSolver.Solve().
 
+    Includes NaN safeguards for UMFPACK near-singular cases, stagnation
+    detection, and state recovery.
+
     Returns
     -------
     total_newton : int
@@ -733,10 +743,24 @@ def newton_active_set_solve():
     total_newton = 0
     gn_out, normals_out, active_out = None, None, None
 
+    # Newton convergence floor: contact projection accuracy limits
+    # achievable residual to ~1e-10.  Prevent infinite looping when
+    # args.gtol is set very tight (e.g. 1e-18 for scipy solvers).
+    newton_gtol = max(args.gtol, 1e-10)
+
+    # Save state before this step for NaN recovery
+    _u_backup = gfu.vec.FV().NumPy().copy()
+
     for as_iter in range(args.max_as):
         # ── Full contact evaluation (expensive TR projection, with Hessian data) ──
         contact_cache.reset()
         slave_pos = compute_slave_pos()
+
+        # Guard: if state is corrupted, restore backup and abort
+        if not np.isfinite(slave_pos).all():
+            gfu.vec.FV().NumPy()[:] = _u_backup
+            break
+
         gn_out, normals_out, active_out, dndxs_out = contact_cache.evaluate(
             slave_pos, compute_hessian=args.full_hessian
         )
@@ -757,6 +781,9 @@ def newton_active_set_solve():
             saved_params = np.zeros((0, 2))
 
         # ── Newton iterations (fixed active set) ──
+        rnorm_prev = np.inf
+        stagnation_count = 0
+
         for nit in range(args.max_iter):
             # 1. Material residual via NGSolve
             a_form.Apply(gfu.vec, res_vec)
@@ -787,8 +814,19 @@ def newton_active_set_solve():
             # 3. Convergence check on free DOFs
             rnorm = np.linalg.norm(r_np[free_dofs])
             total_newton += 1
-            if rnorm < args.gtol:
+            if rnorm < newton_gtol:
                 break
+
+            # Stagnation detection: if residual doesn't decrease by at
+            # least 10% over 3 consecutive iterations, the fixed-projection
+            # Newton has exhausted its accuracy — break early.
+            if rnorm > 0.9 * rnorm_prev:
+                stagnation_count += 1
+                if stagnation_count >= 3:
+                    break
+            else:
+                stagnation_count = 0
+            rnorm_prev = rnorm
 
             # 4. Material tangent (linearization at current state)
             a_form.AssembleLinearization(gfu.vec)
@@ -802,38 +840,51 @@ def newton_active_set_solve():
                     for b in range(3):
                         mat[dofs[a], dofs[b]] = mat[dofs[a], dofs[b]] + K_con[a, b]
 
-            # 6. Solve K·Δu = -r (with fallback to gradient on singular matrix)
+            # 6. Solve K·Δu = -r
+            solve_ok = False
             try:
                 inv = mat.Inverse(fes.FreeDofs(), inverse="umfpack")
                 _w_vec.data = inv * res_vec
+                # UMFPACK near-singular: returns NaN without exception
+                if np.isfinite(_w_vec.FV().NumPy()).all():
+                    solve_ok = True
             except Exception:
-                # Singular tangent: fall back to scaled residual (gradient descent).
-                # Use a small step to avoid element inversion.
-                _w_vec.data = res_vec
-                r2 = float(InnerProduct(res_vec, res_vec))
-                if r2 > 1e-30:
-                    # Cauchy (steepest descent) step: alpha = ||r||^2 / (r^T K r)
-                    # Since K is singular, use a safe fixed scaling instead
-                    _w_vec.data = (0.01 / (r2**0.5)) * res_vec
+                pass
 
-            # 7. Energy-based backtracking linesearch
-            #    Following NGSolve NewtonSolver pattern (nonlinearsolvers.py:63-72)
+            if not solve_ok:
+                # Fallback: scaled gradient descent with physical step size.
+                # Step proportional to element size to avoid element inversion.
+                r_max = np.max(np.abs(r_np[free_dofs]))
+                if r_max > 1e-30:
+                    scale = 0.1 * h_contact / r_max
+                    _w_vec.FV().NumPy()[:] = scale * r_np
+                else:
+                    break
+
+            # 7. Energy-based backtracking linesearch with NaN guard
             energy_old = _total_energy_at(
                 gfu.vec, saved_pids, saved_params, active_idx
             )
             tau = 1.0
-            _uh_vec.data = gfu.vec - tau * _w_vec
-            energy_new = _total_energy_at(
-                _uh_vec, saved_pids, saved_params, active_idx
-            )
-            ls_tol = max(1e-14 * abs(energy_old), args.gtol)
-            while energy_new > energy_old + ls_tol and tau > 1e-8:
-                tau *= 0.5
+            accepted = False
+            ls_tol = max(1e-14 * abs(energy_old), newton_gtol)
+            for _ in range(30):  # max 30 halvings (tau down to ~1e-9)
                 _uh_vec.data = gfu.vec - tau * _w_vec
                 energy_new = _total_energy_at(
                     _uh_vec, saved_pids, saved_params, active_idx
                 )
-            gfu.vec.data = _uh_vec
+                if np.isfinite(energy_new) and energy_new <= energy_old + ls_tol:
+                    accepted = True
+                    break
+                tau *= 0.5
+
+            if accepted:
+                gfu.vec.data = _uh_vec
+            # else: keep current state (don't write NaN or bad state)
+
+    # If state got corrupted despite guards, restore backup
+    if not np.isfinite(gfu.vec.FV().NumPy()).all():
+        gfu.vec.FV().NumPy()[:] = _u_backup
 
     return total_newton, as_iter + 1, gn_out, normals_out, active_out
 
@@ -955,7 +1006,6 @@ with TaskManager() if args.taskmanager else nullcontext():
             SCIPY_SOLVERS = {
                 "newton-cg":    ("Newton-CG",    True,  {"xtol": args.gtol}),
                 "trust-constr": ("trust-constr", True,  {"gtol": args.gtol, "xtol": 1e-30}),
-                "tnc":          ("TNC",          False, {"gtol": args.gtol}),
                 "lbfgsb":       ("L-BFGS-B",     False, {"gtol": args.gtol, "maxls": 40, "ftol": 0}),
             }
 
