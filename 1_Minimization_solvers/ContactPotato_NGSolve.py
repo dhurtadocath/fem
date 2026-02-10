@@ -46,7 +46,7 @@ from PyClasses import gregory_patch_backend as gb
 
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="NGSolve ContactPotato simulation")
-parser.add_argument("--mesh",       type=int,   default=10,      help="mesh density n (nxnxn hex)")
+parser.add_argument("--mesh",       type=int,   default=20,      help="mesh density n (nxnxn hex)")
 parser.add_argument("--solver",     type=str,   default="newton",
                     choices=["newton", "lbfgsb", "newton-cg", "trust-ncg", "trust-krylov",
                              "trust-constr", "bfgs", "cg", "tnc", "slsqp"],
@@ -508,6 +508,9 @@ def compute_contact_forces(gn, normals, active):
     return f_con
 
 
+_last_valid_grad = [None]  # mutable container for NaN fallback gradient
+
+
 def objective(x_free):
     """Return (total_energy, gradient_on_free_dofs) for scipy.minimize."""
     vec = gfu.vec.FV().NumPy()
@@ -515,8 +518,24 @@ def objective(x_free):
 
     # --- Material energy + forces (NGSolve) --------------------------------
     E_mat = a_form.Energy(gfu.vec)
+
+    # Guard against invalid states (element inversion J<0 → NaN energy).
+    # Return a large but scaled energy so L-BFGS-B's linesearch backs off
+    # without corrupting its internal Hessian approximation.  The gradient
+    # is set to a large positive multiple of x_free (elastic restoring force
+    # toward reference configuration) so the search direction stays valid.
+    if not np.isfinite(E_mat):
+        E_penalty = 1e4 * (1.0 + np.dot(x_free, x_free))
+        g_penalty = 2e4 * x_free
+        return E_penalty, g_penalty
+
     a_form.Apply(gfu.vec, res_vec)
     f_mat = res_vec.FV().NumPy().copy()        # residual = dE/du
+
+    if not np.isfinite(f_mat[free_dofs]).all():
+        E_penalty = 1e4 * (1.0 + np.dot(x_free, x_free))
+        g_penalty = 2e4 * x_free
+        return E_penalty, g_penalty
 
     # --- Current slave-node positions --------------------------------------
     slave_pos = np.column_stack([
@@ -531,7 +550,9 @@ def objective(x_free):
     f_con = compute_contact_forces(gn, normals, active)
 
     f_total = f_mat + f_con
-    return E_mat + E_con, f_total[free_dofs].copy()
+    grad = f_total[free_dofs].copy()
+    _last_valid_grad[0] = grad
+    return E_mat + E_con, grad
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -994,7 +1015,7 @@ with TaskManager() if args.taskmanager else nullcontext():
             # ── Scipy minimize solvers ──
             SCIPY_SOLVERS = {
                 "newton-cg":    ("Newton-CG",    True,  {"xtol": args.gtol}),
-                "trust-ncg":    ("trust-ncg",    True,  {"gtol": args.gtol}),
+                "trust-ncg":    ("trust-ncg",    True,  {"gtol": args.gtol, "initial_trust_radius": 0.0010, "max_trust_radius": 100.0}),
                 "trust-krylov": ("trust-krylov", True,  {"gtol": args.gtol}),
                 "trust-constr": ("trust-constr", True,  {"gtol": args.gtol}),
                 "bfgs":         ("BFGS",         False, {"gtol": args.gtol}),
@@ -1008,12 +1029,20 @@ with TaskManager() if args.taskmanager else nullcontext():
             options = {"maxiter": max_iter, **opts_override}
 
             x0 = vec[free_dofs].copy()
+            # Lock contact projections during optimization: always reuse the
+            # projection points found on the first objective() call after
+            # reset().  Prevents energy discontinuities from cache-switching
+            # mid-linesearch (full re-projection can find a different patch,
+            # violating Wolfe conditions).
+            saved_tol_reuse = contact_cache.tol_reuse
+            contact_cache.tol_reuse = np.inf
             if uses_hessp:
                 result = minimize(objective, x0, method=method_name, jac=True,
                                   hessp=hessp, options=options)
             else:
                 result = minimize(objective, x0, method=method_name, jac=True,
                                   options=options)
+            contact_cache.tol_reuse = saved_tol_reuse
             vec[free_dofs] = result.x
 
             # Finalize contact state and get metrics
@@ -1027,6 +1056,7 @@ with TaskManager() if args.taskmanager else nullcontext():
                   f"active={n_active:3d}  maxpen={max_pen:.2e}  t={dt_step:.1f}s")
             if not result.success:
                 print(f"  >> {result.message}")
+                # Gradient consistency check at the failing point
 
         # --- VTK snapshot --------------------------------------------------
         if args.plot > 0 and step % args.plot == 0:

@@ -66,15 +66,21 @@
 - **Status**: DONE — all stress tensors and von Mises CFs now use `.Compile()`
 - **Notes**: only affects VTK export cost, not solver performance
 
-### [ ] 6. Reuse symbolic factorization (`sparsecholesky` + `.Update()`)
+### [x] 6. Reuse symbolic factorization (UMFPACK `.Update()`)
 - **Type**: PERF | **Expected**: ~30-50% faster linear solve in Newton
-- **Status**: TODO
-- **Problem**: `mat.Inverse(fes.FreeDofs(), inverse="umfpack")` is called every Newton
-  iteration, recomputing the symbolic factorization each time.
-- **Fix**: use `"sparsecholesky"` with `.Update()` method that only does numeric refactorization
-  when sparsity pattern is unchanged (which it is — only values change between Newton steps).
-- **Note**: the sparsity pattern includes contact entries only if the hyperelastic energy
-  already couples those DOFs. Need to verify pattern stability.
+- **Status**: DONE — cache UMFPACK inverse, reuse symbolic factorization via `inv.Update()`
+- **Implementation**: `_cached_inv` created on first Newton iteration via `mat.Inverse()`.
+  On subsequent iterations, after `AssembleLinearization` + contact Hessian + regularization
+  modify matrix values in-place, `_cached_inv.Update()` redoes only numeric factorization
+  (reuses the symbolic factorization — elimination tree, permutation, etc.).
+  Cache invalidated on exception (singular matrix) and re-created on next attempt.
+- **Note**: Used UMFPACK (not sparsecholesky) because `UmfpackInverse.SupportsUpdate()==True`
+  and it handles non-symmetric matrices (contact Hessian breaks symmetry). SparseCholesky
+  also supports Update but only for symmetric matrices.
+- **Results** (newton, 30 steps):
+  - mesh=5: 18.7s (was 17.9s — within noise, too few DOFs for symbolic to matter)
+  - mesh=10: **112.6s (was 142.3s — 21% faster)**
+  - Residuals at steps 1-2 match exactly: |r|=2.99e-10 and 1.78e-05
 
 ### [x] 7. Mesh-dependent penalty `kn = factor * E / h`
 - **Type**: PRECISION | **Impact**: correct scaling across mesh densities
@@ -85,57 +91,58 @@
   - mesh=10: kn 1.0→2.5, maxpen 4.7mm→1.9mm (**2.5x reduction**), time 199.4s→150.8s
   - Penetration now scales consistently across mesh densities
 
-### [ ] 8. Vectorize contact force assembly
+### [x] 8. Vectorize contact force assembly
 - **Type**: PERF | **Expected**: minor for small active sets, noticeable for large ones
-- **Status**: TODO
-- **Problem**: Python loops over active nodes for both residual and Hessian modification
-- **Fix for residual** (easy): already partially vectorized (lines 504-510 use fancy indexing)
-- **Fix for Hessian** (harder): the 9 `mat[dofs[a], dofs[b]]` writes per node are inherently
-  sequential due to NGSolve sparse matrix access pattern
+- **Status**: DONE — vectorized residual scatter and hessp Hv product
+- **Changes**:
+  - Precomputed `_slave_free_x/y/z` index arrays (replace dict lookup)
+  - `hessp()`: batch `kn*(n·p)*n` via numpy broadcasting + `np.add.at` scatter
+  - Newton inner loop: collect arrays during projection, vectorized force scatter
+  - Hessian `mat[i,j]` writes left sequential (NGSolve sparse matrix API limitation)
+- **Results**: mesh=5 29.5s→27.6s (7%), mesh=10 150.8s→147.9s (2%).
+  Marginal on current mesh sizes — benefit grows with larger active sets.
 
 ---
 
 ## Tier 3 — Low Impact (code quality + safety)
 
-### [ ] 9. Deduplicate contact force computation
+### [x] 9. Deduplicate contact force computation
 - **Type**: CODE | **Impact**: maintainability
-- **Status**: TODO
-- **Problem**: contact force assembly is written 3 times: in `objective()`, in
-  `newton_active_set_solve()` post-processing, and in `finalize_contact_state()`
-- **Fix**: extract to a single helper function
+- **Status**: DONE — extracted `compute_contact_forces(gn, normals, active)` helper
+- **Changes**: replaced 3 identical 7-line blocks in `objective()`, `finalize_contact_state()`,
+  and Newton post-processing with single-line calls to `compute_contact_forces()`.
+  Newton inner loop kept separate (different pattern: per-node from cached projections + Hessian).
 
-### [ ] 10. Fix sparsity assumption on `mat[i,j]` writes for contact Hessian
+### [x] 10. Fix sparsity assumption on `mat[i,j]` writes for contact Hessian
 - **Type**: CODE/ROBUSTNESS | **Impact**: prevent silent bugs with different energy models
-- **Status**: TODO
-- **Problem**: `mat[dofs[a], dofs[b]] = mat[dofs[a], dofs[b]] + K_con[a,b]` assumes the entry
-  exists in the sparsity pattern. This is true for hyperelastic energy (couples all components
-  of the same vertex) but would silently produce wrong results for decoupled/linear elastic
-  models where off-diagonal blocks (x-y, x-z, y-z) are absent from the sparsity.
-- **Fix (preferred)**: use `BaseMatrix.AddElementMatrix()` which safely handles sparsity:
-  ```python
-  # dof_ids = [v, v+nv, v+2*nv] as IntRange or list
-  # K_con_3x3 = FlatMatrix(3, 3, ...) or create via Matrix(3,3)
-  mat.AddElementMatrix(dof_ids, dof_ids, K_con_mat, replace=False)
-  ```
-  Requires verifying AddElementMatrix Python binding signature in NGSolve source.
-- **Fix (fallback)**: add a runtime assertion on first call to detect missing entries:
-  ```python
-  if _first_contact_hessian_write:
-      for a in range(3):
-          for b in range(3):
-              if mat[dofs[a], dofs[b]] == 0.0 and K_con[a,b] != 0.0:
-                  assert False, f"Sparsity pattern missing entry ({dofs[a]},{dofs[b]})"
-  ```
+- **Status**: DONE — one-time assertion using `mat.COO()` on first contact vertex
+- **Investigation findings** (test_sparsity.py):
+  - `mat[i,j]` read on missing entry returns 0 silently (no error)
+  - `mat[i,j] = val` write on missing entry **raises** `"sparse matrix row full"` (not silent)
+  - VectorH1 hyperelastic form always couples all 3 components at same vertex (confirmed via COO)
+  - So the current code already crashes loudly on wrong sparsity, but with a cryptic message
+- **Implementation**: On first Newton iteration with contact, extract COO from `a_form.mat`,
+  build (row,col) set, assert all 9 entries of the 3×3 block `[v, v+nv, v+2*nv]²` exist.
+  Clear error message explains the coupling requirement. Check runs once, costs ~0.
 
-### [ ] 11. Guard `hessp` side-effect on `gfu.vec`
+### [x] 11. Guard `hessp` side-effect on `gfu.vec`
 - **Type**: CODE | **Impact**: defensive robustness
-- **Status**: TODO
-- **Problem**: `hessp()` modifies `gfu.vec.FV().NumPy()[free_dofs] = x_free` which is a global
-  side effect. Safe for current scipy Newton-CG usage but fragile.
+- **Status**: DONE — save/restore `gfu.vec` free DOFs around the reassembly in `hessp()`
+- **Problem**: `hessp()` modified `gfu.vec.FV().NumPy()[free_dofs] = x_free` as a global
+  side effect. Safe for current scipy Newton-CG usage but fragile if other code reads
+  `gfu.vec` between hessp calls (e.g., logging, energy evaluation, postprocessing).
+- **Fix**: Save `_saved_free = vec[free_dofs].copy()` before modifying, restore after
+  `AssembleLinearization` and contact evaluation. Cost: one small array copy per reassembly
+  (only on the `need_reassemble` path, not on cached CG inner iterations).
 
-### [ ] 12. Vectorize KD-tree surface sampling setup
-- **Type**: PERF | **Impact**: marginal (one-time init cost ~0.5s)
-- **Status**: TODO — low priority since it only runs once at startup
+### [x] 12. Vectorize KD-tree surface sampling setup
+- **Type**: PERF | **Impact**: marginal (one-time init cost)
+- **Status**: DONE — pre-allocate arrays, meshgrid parametric grid, call C++ backend directly
+- **Changes**: Replaced triple-nested Python loop with list.append by:
+  (1) `np.meshgrid` + `ravel` for the (u,v) sample grid (2500 pairs, computed once)
+  (2) Pre-allocated `surf_pts` and `surf_pids` arrays (no append overhead)
+  (3) Direct `gb.Grg(ctrlpts, u, v, eps)` call bypassing `Grg0` → `Grg` Python dispatch
+  (4) `_flatCtrlPts_array()` and `eps` cached per-patch (one lookup instead of 2500)
 
 ---
 
@@ -169,25 +176,41 @@ full TR projection (~5ms/node, 36 nodes = 180ms/eval).
 
 ---
 
-## Critical Finding: Singular Tangent on mesh=10+
+## Critical Finding: Singular Tangent on mesh=10+ — FIXED
 
-The Newton solver hits singular tangent matrix (UMFPACK failure) on mesh=10 at step 2. The
-linesearch prevents divergence but cannot fix a genuinely singular tangent.
+The Newton solver previously crashed on mesh=10 at step 3 due to singular tangent matrix
+(UMFPACK failure). NaN from the failed solve propagated to all subsequent steps.
 
-**Likely causes**:
-1. Element inversion (J<0) during large load steps — the linesearch should prevent this but
-   the energy tolerance `max(1e-14*|E|, gtol)` may be too permissive
-2. Near-zero stiffness in lateral directions — the block is only constrained on "top" face,
-   with "bottom" slave nodes free to slide. Without contact, the structure has near-zero
-   lateral stiffness.
-3. Contact Hessian `kn*(n x n)` adds rank-1 updates per active node — if contact is lost
-   between active-set iterations, the stiffness suddenly drops.
+**Root causes identified**:
+1. UMFPACK has two failure modes: (a) raises `NgException` on hard singular, (b) silently
+   returns NaN on near-singular (only prints WARNING). The original `try/except` only
+   caught case (a).
+2. Gradient descent fallback produced NaN when state was already corrupted.
+3. Linesearch accepted NaN steps (`energy_new > energy_old + tol` evaluates to False when
+   both are NaN).
+4. No recovery mechanism — once NaN entered `gfu.vec`, all subsequent steps were corrupted.
 
-**Possible fixes** (not yet implemented):
-- Add small regularization to diagonal: `mat[i,i] += eps` for slave DOFs
-- Use `"sparsecholesky"` which handles near-singular better than UMFPACK
-- Check for J<0 before accepting linesearch step
-- Reduce load increment size (increase `--nsteps`)
+**Fixes implemented** (multiple safeguards):
+1. `_total_energy_at()` returns `np.inf` for NaN/inf states (rejects bad trial points)
+2. Linesearch: explicit `np.isfinite(energy_new)` check before accepting; if no step is
+   accepted, keeps previous state (never writes NaN to `gfu.vec`)
+3. Steepest descent fallback: physically scaled step size (`0.1 * h_contact / max|r|`),
+   NaN guard on residual
+4. NaN detection at active-set loop entry — breaks early if state is corrupted
+5. Step-level NaN recovery: if Newton produces NaN, restores `_u_prev_vec` (state from
+   before the step) + re-applies Dirichlet increment
+
+**Results**:
+- mesh=5, 30 steps: 17.9s, all complete, no crashes (same as before)
+- mesh=10, 30 steps: **142.3s, all 30 steps complete** (previously crashed at step 3)
+- Contact steps (3-25) have residuals ~0.3-3.6 and penetration ~0.1-0.4 due to active-set
+  not converging in 5 iterations (fundamental limitation, not a bug)
+- Newton-CG on same problem: 149.0s, |grad|<1e-7, maxpen~0.002 (much better convergence)
+
+**Remaining limitation**: Active-set oscillation during contact. The direct Newton solver
+doesn't fully converge the contact equilibrium. Newton-CG converges 100-200x better
+penetration because it minimizes the combined energy. Augmented Lagrangian or semi-smooth
+Newton would be needed for true active-set convergence in the direct Newton path.
 
 ---
 
