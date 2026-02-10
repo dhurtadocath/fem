@@ -605,19 +605,14 @@ def hessp(x_free, p):
             v = int(slave_verts[i])
             p_v = p_slave[i]
 
-            # Simple Hessian: kn * (n ⊗ n) @ p_v = kn * (n · p_v) * n
-            Hp_contact = kn * (nor @ p_v) * nor
-
-            # Full Hessian with curvature term (if enabled and available)
-            if args.full_hessian and dndxs_all is not None:
-                dndxs = dndxs_all[i]
-                if np.any(dndxs):
-                    curv_contrib = kn * g * (dndxs @ p_v)
-                    curv_norm = np.linalg.norm(curv_contrib)
-                    base_norm = np.linalg.norm(Hp_contact)
-                    if curv_norm > 0.3 * max(base_norm, 1e-10):
-                        curv_contrib *= 0.3 * base_norm / curv_norm
-                    Hp_contact += curv_contrib
+            # Full contact Hessian-vector product: K_con @ p_v
+            # Uses absolute eigenvalue filtering for PSD guarantee
+            if args.full_hessian and dndxs_all is not None and np.any(dndxs_all[i]):
+                K_con = compute_contact_hessian(g, nor, dndxs_all[i])
+                Hp_contact = K_con @ p_v
+            else:
+                # Simple Hessian: kn * (n ⊗ n) @ p_v = kn * (n · p_v) * n
+                Hp_contact = kn * (nor @ p_v) * nor
 
             # Map back to free DOF indices via precomputed lookup
             for k, dof in enumerate([v, v + nv, v + 2*nv]):
@@ -643,11 +638,17 @@ def compute_slave_pos():
 
 
 def compute_contact_hessian(g, nor, dndxs=None):
-    """Compute the contact Hessian for a penetrating node.
+    """Compute the PSD contact Hessian for a penetrating node.
 
     The contact energy is E_con = (1/2) * kn * g_n^2, where g_n = (x_s - x_c) · n.
     The full Hessian is:
         K_con = kn * (n ⊗ n + g_n * dn/dx_s)
+
+    When --full_hessian is enabled and the curvature term g*dn/dx_s makes K_con
+    indefinite, we project to PSD via absolute eigenvalue filtering:
+        K_con = Q |Λ| Qᵀ
+    This preserves the magnitude of all curvature information while guaranteeing
+    positive semi-definiteness (Li et al. 2020 / SIGGRAPH 2024 pattern).
 
     Parameters
     ----------
@@ -661,25 +662,18 @@ def compute_contact_hessian(g, nor, dndxs=None):
     Returns
     -------
     K_con : ndarray (3, 3)
-        Contact Hessian contribution for this node
+        PSD contact Hessian contribution for this node
     """
     K_base = np.outer(nor, nor)
 
-    # Include curvature term only if --full_hessian and dndxs is available
     if args.full_hessian and dndxs is not None and np.any(dndxs):
-        K_curv = g * dndxs
+        K_raw = kn * (K_base + g * dndxs)
 
-        # Safeguard: limit curvature contribution to avoid indefiniteness
-        # The n⊗n term has spectral norm 1. Limit |g * dndxs| relative to this.
-        curv_norm = np.linalg.norm(K_curv, ord=2)  # Spectral norm
-        max_curv_ratio = 0.3  # Limit curvature contribution to 30% of base term
-
-        if curv_norm > max_curv_ratio:
-            K_curv = K_curv * (max_curv_ratio / curv_norm)
-
-        K_con = kn * (K_base + K_curv)
+        # Absolute eigenvalue filtering: K_psd = Q |Λ| Qᵀ
+        eigvals, Q = np.linalg.eigh(K_raw)
+        eigvals = np.abs(eigvals)
+        K_con = (Q * eigvals) @ Q.T
     else:
-        # Simple Hessian: just n ⊗ n (more robust)
         K_con = kn * K_base
 
     return K_con
