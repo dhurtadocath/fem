@@ -954,7 +954,7 @@ with TaskManager() if args.taskmanager else nullcontext():
             # ── Scipy minimize solvers ──
             SCIPY_SOLVERS = {
                 "newton-cg":    ("Newton-CG",    True,  {"xtol": args.gtol}),
-                "trust-constr": ("trust-constr", True,  {"gtol": args.gtol}),
+                "trust-constr": ("trust-constr", True,  {"gtol": args.gtol, "xtol": 1e-30}),
                 "tnc":          ("TNC",          False, {"gtol": args.gtol}),
                 "lbfgsb":       ("L-BFGS-B",     False, {"gtol": args.gtol, "maxls": 40, "ftol": 0}),
             }
@@ -982,7 +982,15 @@ with TaskManager() if args.taskmanager else nullcontext():
             # Finalize contact state and get metrics
             _, _, _, n_active, max_pen = finalize_contact_state()
             dt_step   = perf_counter() - t_step
-            grad_norm = np.linalg.norm(result.jac) if result.jac is not None else float("nan")
+            # trust-constr: result.jac is constraint Jacobians (empty for
+            # unconstrained); use result.optimality (||∇f||_∞) instead.
+            # Other methods: result.jac is the objective gradient.
+            if hasattr(result, "optimality") and result.optimality is not None:
+                grad_norm = result.optimality
+            elif result.jac is not None and np.size(result.jac) > 0:
+                grad_norm = np.linalg.norm(result.jac)
+            else:
+                grad_norm = float("nan")
 
             # Print result
             print(f"Step {step:3d}/{nsteps}  {args.solver}: nit={result.nit:2d}  "
