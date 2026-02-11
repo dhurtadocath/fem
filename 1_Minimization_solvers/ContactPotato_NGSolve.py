@@ -8,11 +8,10 @@ the existing Gregory-patch / trust-region projection backend.
 
 Solvers
 -------
-- **newton**: Full Newton with active-set iteration for contact. Uses the
-  material tangent from NGSolve plus contact Hessian (kn * n ⊗ n). Optionally
-  includes the curvature term (dn/dx_s) via --full_hessian flag (experimental,
-  can cause matrix singularity). Typically converges in 10-25 iterations per
-  load step during contact.
+- **newton**: Full Newton with direct UMFPACK solve. Uses the material tangent
+  from NGSolve plus contact Hessian (kn * n ⊗ n). Contact is evaluated
+  dynamically at each iteration (no outer active-set loop). Projections are
+  locked during the solve for energy consistency. Armijo linesearch.
 - **newton-cg**: Newton-CG via scipy.optimize.minimize with Hessian-vector
   product. More robust than direct Newton for ill-conditioned problems.
   Supports --full_hessian for curvature term without matrix singularity risk.
@@ -46,7 +45,7 @@ from PyClasses import gregory_patch_backend as gb
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 5 #20            # mesh density (n x n x n hex elements)
+n           = 10 #20            # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -56,10 +55,9 @@ nu_val      = 0.3           # Poisson ratio
 kn_factor   = 20.0          # kn = kn_factor * E / h  (Wriggers 2006)
 
 # Solver: "newton", "newton-cg", "trust-constr", "lbfgsb"
-solver      = "lbfgsb"
+solver      = "newton"
 nsteps      = 100           # number of load steps
-max_iter    = 5000            # max iterations per step
-max_as      = 500            # max active-set iterations (Newton only)
+max_iter    = 200            # max iterations per step
 gtol        = 1e-8          # gradient/residual tolerance
 
 # Hessian
@@ -688,210 +686,181 @@ _w_vec = gfu.vec.CreateVector()   # scratch for Newton direction
 _uh_vec = gfu.vec.CreateVector()  # scratch for linesearch trial
 
 
-def _total_energy_at(u_vec, saved_pids, saved_params, active_idx):
-    """Evaluate total energy (material + contact) at a given state.
+def _linesearch_energy(u_vec):
+    """Total energy (material + contact) at u_vec using cached projections.
 
-    Used by the linesearch to decide on step size.
+    Evaluates contact for ALL slave nodes (not just the current active set),
+    so that nodes entering/exiting contact during linesearch are accounted for.
     Returns np.inf for invalid states (NaN, element inversion).
     """
     E_mat = a_form.Energy(u_vec)
     if not np.isfinite(E_mat):
         return np.inf
 
-    if len(active_idx) == 0:
-        return E_mat
-
     vec_np = u_vec.FV().NumPy()
     if not np.isfinite(vec_np).all():
         return np.inf
 
-    slave_pos = np.column_stack([
-        X_ref[slave_verts, 0] + vec_np[slave_verts],
-        X_ref[slave_verts, 1] + vec_np[slave_verts + nv],
-        X_ref[slave_verts, 2] + vec_np[slave_verts + 2*nv],
-    ])
     E_con = 0.0
-    for j, idx in enumerate(active_idx):
-        pid = int(saved_pids[j])
-        t = saved_params[j]
-        xs = slave_pos[idx]
-        g, _, _ = _evaluate_projection(patches[pid], t, xs)
-        if g < 0:
-            E_con += 0.5 * kn * g**2
+    if contact_cache.patch_ids is not None:
+        slave_pos = np.column_stack([
+            X_ref[slave_verts, 0] + vec_np[slave_verts],
+            X_ref[slave_verts, 1] + vec_np[slave_verts + nv],
+            X_ref[slave_verts, 2] + vec_np[slave_verts + 2*nv],
+        ])
+        for i in range(len(slave_verts)):
+            pid = int(contact_cache.patch_ids[i])
+            if pid < 0:
+                continue
+            t = contact_cache.params[i]
+            g, _, _ = _evaluate_projection(patches[pid], t, slave_pos[i])
+            if g < 0:
+                E_con += 0.5 * kn * g**2
     return E_mat + E_con
 
 
-def newton_active_set_solve():
-    """Newton solver with active-set iteration and energy-based linesearch.
+def newton_solve():
+    """Newton solver with dynamic contact and Armijo linesearch.
 
-    Outer loop: iterate the active set (which nodes are in contact).
-    Inner loop: Newton iterations with fixed active set and backtracking
-    linesearch following the pattern in NGSolve's NewtonSolver.Solve().
+    Unlike the previous active-set Newton, this solver does NOT use an
+    outer active-set loop.  Instead it evaluates contact at every Newton
+    iteration through the cache (projections locked for consistency,
+    same strategy as the Newton-CG / L-BFGS-B scipy paths).
 
-    Includes NaN safeguards for UMFPACK near-singular cases, stagnation
-    detection, and state recovery.
+    The active set evolves naturally: nodes enter/exit contact as their
+    gap changes sign during Newton iterations.  This avoids the active-
+    set oscillation that plagued the old approach.
 
     Returns
     -------
-    total_newton : int
-        Total Newton iterations across all active-set iterations
-    n_as : int
-        Number of active-set iterations
-    gn : ndarray
-        Final gap values for all slave nodes
-    normals : ndarray
-        Final surface normals for all slave nodes
-    active : ndarray
-        Boolean mask of nodes in contact
+    n_iter : int
+        Number of Newton iterations
+    gn, normals, active : arrays
+        Final contact state (from last iteration)
     """
-    prev_active_idx = None
-    total_newton = 0
-    gn_out, normals_out, active_out = None, None, None
-
-    # Newton convergence floor: contact projection accuracy limits
-    # achievable residual to ~1e-10.  Prevent infinite looping when
-    # gtol is set very tight (e.g. 1e-18 for scipy solvers).
     newton_gtol = max(gtol, 1e-10)
-
-    # Save state before this step for NaN recovery
     _u_backup = gfu.vec.FV().NumPy().copy()
 
-    for as_iter in range(max_as):
-        # ── Full contact evaluation (expensive TR projection, with Hessian data) ──
-        contact_cache.reset()
-        slave_pos = compute_slave_pos()
+    # Lock projections during Newton (same as scipy paths).
+    # Prevents energy discontinuities from projection switching.
+    saved_tol = contact_cache.tol_reuse
+    contact_cache.tol_reuse = np.inf
 
-        # Guard: if state is corrupted, restore backup and abort
+    rnorm_prev = np.inf
+    stag_count = 0
+    gn_out, normals_out, active_out = None, None, None
+
+    for nit in range(max_iter):
+        # 1. Material residual
+        a_form.Apply(gfu.vec, res_vec)
+        r_np = res_vec.FV().NumPy()
+
+        # 2. Contact evaluation (cached projections, first call does full TR)
+        slave_pos = compute_slave_pos()
         if not np.isfinite(slave_pos).all():
             gfu.vec.FV().NumPy()[:] = _u_backup
             break
 
-        gn_out, normals_out, active_out, dndxs_out = contact_cache.evaluate(
+        gn_out, normals_out, active_out, dndxs = contact_cache.evaluate(
             slave_pos, compute_hessian=full_hessian
         )
         active_idx = np.where(active_out)[0]
 
-        # Active-set convergence check
-        if prev_active_idx is not None and np.array_equal(active_idx, prev_active_idx):
+        # 3. Add contact forces + collect Hessian data
+        pen_data = []
+        for i in active_idx:
+            g   = gn_out[i]
+            nor = normals_out[i]
+            v   = int(slave_verts[i])
+            r_np[v]          += kn * g * nor[0]
+            r_np[v + nv]     += kn * g * nor[1]
+            r_np[v + 2*nv]   += kn * g * nor[2]
+            K_con = compute_contact_hessian(
+                g, nor, dndxs[i] if dndxs is not None else None
+            )
+            pen_data.append((i, g, nor, K_con))
+
+        # 4. Convergence check
+        rnorm = np.linalg.norm(r_np[free_dofs])
+        if rnorm < newton_gtol:
             break
-        prev_active_idx = active_idx.copy()
 
-        # Cache projection data for cheap Newton re-evaluation
-        n_act = len(active_idx)
-        if n_act > 0 and contact_cache.patch_ids is not None:
-            saved_pids = contact_cache.patch_ids[active_idx].copy()
-            saved_params = contact_cache.params[active_idx].copy()
+        # 5. Stagnation detection (5% decrease over 5 iterations)
+        if rnorm > 0.95 * rnorm_prev:
+            stag_count += 1
+            if stag_count >= 5:
+                break
         else:
-            saved_pids = np.array([], dtype=np.int32)
-            saved_params = np.zeros((0, 2))
+            stag_count = 0
+        rnorm_prev = rnorm
 
-        # ── Newton iterations (fixed active set) ──
-        rnorm_prev = np.inf
-        stagnation_count = 0
+        # 6. Material tangent
+        a_form.AssembleLinearization(gfu.vec)
 
-        for nit in range(max_iter):
-            # 1. Material residual via NGSolve
-            a_form.Apply(gfu.vec, res_vec)
-            r_np = res_vec.FV().NumPy()
+        # 7. Add contact Hessian: K_con = kn * (n⊗n + g·dn/dx_s)
+        mat = a_form.mat
+        for idx, g, nor, K_con in pen_data:
+            v = int(slave_verts[idx])
+            dofs = [v, v + nv, v + 2*nv]
+            for a in range(3):
+                for b in range(3):
+                    mat[dofs[a], dofs[b]] = mat[dofs[a], dofs[b]] + K_con[a, b]
 
-            # 2. Add contact forces and compute Hessian data
-            slave_pos_now = compute_slave_pos()
-            pen_data = []
+        # 8. Solve K·Δu = -r
+        solve_ok = False
+        try:
+            inv = mat.Inverse(fes.FreeDofs(), inverse="umfpack")
+            _w_vec.data = inv * res_vec
+            if np.isfinite(_w_vec.FV().NumPy()).all():
+                solve_ok = True
+        except Exception:
+            pass
 
-            for j in range(n_act):
-                pid = int(saved_pids[j])
-                t = saved_params[j]
-                xs = slave_pos_now[active_idx[j]]
-
-                g, nor, dndxs = _evaluate_projection(
-                    patches[pid], t, xs, compute_hessian=full_hessian
-                )
-
-                if g < 0:
-                    K_con = compute_contact_hessian(g, nor, dndxs)
-                    pen_data.append((j, g, nor, K_con))
-
-                    v = int(slave_verts[active_idx[j]])
-                    r_np[v]          += kn * g * nor[0]
-                    r_np[v + nv]     += kn * g * nor[1]
-                    r_np[v + 2*nv]   += kn * g * nor[2]
-
-            # 3. Convergence check on free DOFs
-            rnorm = np.linalg.norm(r_np[free_dofs])
-            total_newton += 1
-            if rnorm < newton_gtol:
+        if not solve_ok:
+            r_max = np.max(np.abs(r_np[free_dofs]))
+            if r_max > 1e-30:
+                scale = 0.1 * h_contact / r_max
+                _w_vec.FV().NumPy()[:] = scale * r_np
+            else:
                 break
 
-            # Stagnation detection: if residual doesn't decrease by at
-            # least 10% over 3 consecutive iterations, the fixed-projection
-            # Newton has exhausted its accuracy — break early.
-            if rnorm > 0.9 * rnorm_prev:
-                stagnation_count += 1
-                if stagnation_count >= 3:
-                    break
+        # 9. Armijo linesearch
+        w_free = _w_vec.FV().NumPy()[free_dofs]
+        slope = -np.dot(r_np[free_dofs], w_free)  # φ'(0) = -∇E·w
+
+        if slope >= 0:
+            # Not a descent direction — use gradient step
+            r_max = np.max(np.abs(r_np[free_dofs]))
+            if r_max > 1e-30:
+                scale = 0.1 * h_contact / r_max
+                _w_vec.FV().NumPy()[:] = scale * r_np
+                w_free = _w_vec.FV().NumPy()[free_dofs]
+                slope = -np.dot(r_np[free_dofs], w_free)
             else:
-                stagnation_count = 0
-            rnorm_prev = rnorm
+                break
 
-            # 4. Material tangent (linearization at current state)
-            a_form.AssembleLinearization(gfu.vec)
+        energy_old = _linesearch_energy(gfu.vec)
+        tau = 1.0
+        accepted = False
+        c1 = 1e-4
+        for _ in range(30):
+            _uh_vec.data = gfu.vec - tau * _w_vec
+            energy_new = _linesearch_energy(_uh_vec)
+            if np.isfinite(energy_new) and energy_new <= energy_old + c1 * tau * slope:
+                accepted = True
+                break
+            tau *= 0.5
 
-            # 5. Add contact Hessian
-            mat = a_form.mat
-            for j_local, g, nor, K_con in pen_data:
-                v = int(slave_verts[active_idx[j_local]])
-                dofs = [v, v + nv, v + 2*nv]
-                for a in range(3):
-                    for b in range(3):
-                        mat[dofs[a], dofs[b]] = mat[dofs[a], dofs[b]] + K_con[a, b]
+        if accepted:
+            gfu.vec.data = _uh_vec
 
-            # 6. Solve K·Δu = -r
-            solve_ok = False
-            try:
-                inv = mat.Inverse(fes.FreeDofs(), inverse="umfpack")
-                _w_vec.data = inv * res_vec
-                # UMFPACK near-singular: returns NaN without exception
-                if np.isfinite(_w_vec.FV().NumPy()).all():
-                    solve_ok = True
-            except Exception:
-                pass
+    # Restore cache tolerance
+    contact_cache.tol_reuse = saved_tol
 
-            if not solve_ok:
-                # Fallback: scaled gradient descent with physical step size.
-                # Step proportional to element size to avoid element inversion.
-                r_max = np.max(np.abs(r_np[free_dofs]))
-                if r_max > 1e-30:
-                    scale = 0.1 * h_contact / r_max
-                    _w_vec.FV().NumPy()[:] = scale * r_np
-                else:
-                    break
-
-            # 7. Energy-based backtracking linesearch with NaN guard
-            energy_old = _total_energy_at(
-                gfu.vec, saved_pids, saved_params, active_idx
-            )
-            tau = 1.0
-            accepted = False
-            ls_tol = max(1e-14 * abs(energy_old), newton_gtol)
-            for _ in range(30):  # max 30 halvings (tau down to ~1e-9)
-                _uh_vec.data = gfu.vec - tau * _w_vec
-                energy_new = _total_energy_at(
-                    _uh_vec, saved_pids, saved_params, active_idx
-                )
-                if np.isfinite(energy_new) and energy_new <= energy_old + ls_tol:
-                    accepted = True
-                    break
-                tau *= 0.5
-
-            if accepted:
-                gfu.vec.data = _uh_vec
-            # else: keep current state (don't write NaN or bad state)
-
-    # If state got corrupted despite guards, restore backup
     if not np.isfinite(gfu.vec.FV().NumPy()).all():
         gfu.vec.FV().NumPy()[:] = _u_backup
 
-    return total_newton, as_iter + 1, gn_out, normals_out, active_out
+    return nit + 1, gn_out, normals_out, active_out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -942,7 +911,7 @@ print(f"\n{'='*60}")
 print(f"  ContactPotato NGSolve — mesh {n}x{n}x{n}")
 print(f"  E={E_val}, nu={nu_val}, kn={kn:.4f}")
 if solver == "newton":
-    print(f"  {nsteps} steps, solver=Newton, max_iter={max_iter}, max_as={max_as}, gtol={gtol:.0e}")
+    print(f"  {nsteps} steps, solver=newton, max_iter={max_iter}, gtol={gtol:.0e}")
 elif solver in ("newton-cg", "trust-constr"):
     hess_type = "full (with curvature)" if full_hessian else "simple (n⊗n)"
     print(f"  {nsteps} steps, solver={solver}, max_iter={max_iter}, gtol={gtol:.0e}, hess={hess_type}")
@@ -987,12 +956,10 @@ with TaskManager() if taskmanager else nullcontext():
             return gn, normals, active, n_active, max_pen
 
         if solver == "newton":
-            # ── Newton + active-set solver ──
-            n_newton, n_as, _, _, _ = newton_active_set_solve()
+            # ── Newton solver (dynamic contact, no active-set loop) ──
+            n_newton, _, _, _ = newton_solve()
 
-            # Recompute contact state at converged gfu.vec (the values
-            # returned by newton_active_set_solve are from the start of the
-            # last AS iteration, before Newton iterations modified gfu.vec).
+            # Finalize contact state at converged solution
             gn, normals, active, n_active, max_pen = finalize_contact_state()
 
             # Compute final residual norm for reporting
@@ -1002,7 +969,7 @@ with TaskManager() if taskmanager else nullcontext():
             rnorm = np.linalg.norm(res_vec.FV().NumPy()[free_dofs])
 
             dt_step  = perf_counter() - t_step
-            print(f"Step {step:3d}/{nsteps}  Newton: nit={n_newton:2d} as={n_as}  "
+            print(f"Step {step:3d}/{nsteps}  newton: nit={n_newton:3d}  "
                   f"|r|={rnorm:.2e}  active={n_active:3d}  maxpen={max_pen:.2e}  "
                   f"t={dt_step:.1f}s")
 
