@@ -41,10 +41,11 @@ from ngsolve.meshes import MakeStructured3DMesh
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from PyClasses import gregory_patch_backend as gb
+from PyClasses._contact_tr_multi_helpers import project_points_tr_multi_batch
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 20                # mesh density (n x n x n hex elements)
+n           = 10                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -64,12 +65,67 @@ full_hessian = True         # include curvature term dn/dx_s in contact Hessian
 
 # Output
 compare     = False         # write comparison outputs (u arrays, reactions CSV)
-plot        = 1             # VTK export every N steps (0 = off)
+plot        = 1            # VTK export every N steps (0 = off)
+vtk_fields  = "minimal"    # "minimal" | "standard" | "full" (see Section 7)
 
 # Performance
-taskmanager = True         # NGSolve TaskManager (parallel assembly, large meshes)
-realcompile = True         # C++ JIT of energy form (startup cost, faster iterations)
+taskmanager = "auto"       # True/False/"auto" — auto enables for n >= 30 (27k+ elements)
+realcompile = "auto"       # True/False/"auto" — auto enables for nsteps >= 20
+profile     = False         # built-in per-operation timing (prints breakdown per step)
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ── Profiling instrumentation ────────────────────────────────────────────────
+class PerfCounters:
+    """Lightweight per-operation timing accumulator."""
+    def __init__(self):
+        self.data = {}
+        self.step_data = {}
+
+    def reset_step(self):
+        self.step_data = {}
+
+    def record(self, name, duration):
+        self.data.setdefault(name, []).append(duration)
+        self.step_data.setdefault(name, []).append(duration)
+
+    def step_summary(self, step):
+        if not self.step_data:
+            return ""
+        lines = [f"  [PROFILE] Step {step} breakdown:"]
+        for name, times in sorted(self.step_data.items(), key=lambda x: -sum(x[1])):
+            total = sum(times)
+            count = len(times)
+            lines.append(f"    {name:30s}  {total:8.3f}s  ({count:4d} calls, "
+                         f"avg {total/count*1000:7.2f}ms)")
+        lines.append(f"    {'STEP TOTAL':30s}  {sum(sum(v) for v in self.step_data.values()):8.3f}s")
+        return "\n".join(lines)
+
+    def final_summary(self):
+        if not self.data:
+            return ""
+        total_all = sum(sum(v) for v in self.data.values())
+        lines = ["\n" + "=" * 70, "  PROFILING SUMMARY (all steps)", "=" * 70]
+        for name, times in sorted(self.data.items(), key=lambda x: -sum(x[1])):
+            total = sum(times)
+            count = len(times)
+            pct = 100.0 * total / total_all if total_all > 0 else 0
+            lines.append(f"  {name:30s}  {total:8.2f}s  ({pct:5.1f}%)  "
+                         f"[{count} calls, avg {total/count*1000:.2f}ms]")
+        lines.append(f"  {'TOTAL':30s}  {total_all:8.2f}s")
+        return "\n".join(lines)
+
+perf = PerfCounters() if profile else None
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Resolve "auto" performance settings based on problem size.
+# TaskManager: thread dispatch overhead dominates for small meshes (~250 el/thread
+# at n=20 with 32 threads).  Profiling shows 2-3x slowdown on Python-touching
+# operations due to GIL contention.  Only beneficial for n>=30 (27k+ elements).
+# realcompile: 5-10s JIT startup cost amortizes over 20+ steps.
+if taskmanager == "auto":
+    taskmanager = (n**3 >= 27000)
+if realcompile == "auto":
+    realcompile = (nsteps >= 20)
 
 h_contact = 4.0 / n              # element edge length at contact surface ([-2,2]^3 block)
 kn      = kn_factor * E_val / h_contact   # Wriggers (2006): kn ~ alpha * E / h
@@ -111,26 +167,29 @@ psi_sym = c10 * (I1_sym - 3 - 2*log(J_sym)) + d1 * log(J_sym)**2
 a_form = BilinearForm(fes)
 a_form += Variation(psi_sym.Compile(realcompile=realcompile, wait=True) * dx)
 
-# Deformation gradient CFs evaluated on gfu (for VTK stress output)
-F_gfu  = Id(3) + Grad(gfu)
-J_gfu  = Det(F_gfu)
-
-# --- Stress CFs for VTK output -------------------------------------------
-# 1st Piola-Kirchhoff stress: P = dW/dF = 2*c10*(F - F^{-T}) + 2*d1*ln(J)*F^{-T}
-# Cauchy stress: sigma = (1/J) * P * F^T = (1/J)[2*c10*(F*F^T - I) + 2*d1*ln(J)*I]
-# Mandel stress: M = F^T * P (work conjugate to velocity gradient in material frame)
+# --- Stress CFs for VTK output (built only if needed by vtk_fields) ------
+# Only compile what's needed — matrix-valued stress tensors are expensive.
+F_gfu   = Id(3) + Grad(gfu)
+J_gfu   = Det(F_gfu)
 F_inv_T = Inv(F_gfu).trans
-stress_1piola = (2*c10*(F_gfu - F_inv_T) + 2*d1*log(J_gfu)*F_inv_T).Compile()
-stress_cauchy = ((1/J_gfu) * (2*c10*(F_gfu * F_gfu.trans - Id(3)) + 2*d1*log(J_gfu)*Id(3))).Compile()
-stress_mandel = (F_gfu.trans * stress_1piola).Compile()
 
-# Von Mises from Cauchy stress
-s_dev_cauchy = stress_cauchy - (1.0/3.0) * Trace(stress_cauchy) * Id(3)
-vm_cauchy = sqrt(1.5 * InnerProduct(s_dev_cauchy, s_dev_cauchy)).Compile()
+stress_1piola = stress_cauchy = stress_mandel = None
+vm_cauchy = vm_mandel = None
 
-# Von Mises from Mandel stress
-s_dev_mandel = stress_mandel - (1.0/3.0) * Trace(stress_mandel) * Id(3)
-vm_mandel = sqrt(1.5 * InnerProduct(s_dev_mandel, s_dev_mandel)).Compile()
+if plot > 0:
+    # Cauchy + vm_cauchy: needed by "minimal", "standard", "full"
+    stress_cauchy = ((1/J_gfu) * (2*c10*(F_gfu * F_gfu.trans - Id(3))
+                     + 2*d1*log(J_gfu)*Id(3))).Compile()
+    s_dev_cauchy = stress_cauchy - (1.0/3.0) * Trace(stress_cauchy) * Id(3)
+    vm_cauchy = sqrt(1.5 * InnerProduct(s_dev_cauchy, s_dev_cauchy)).Compile()
+
+    if vtk_fields == "full":
+        # 1st Piola-Kirchhoff, Mandel, vm_mandel
+        stress_1piola = (2*c10*(F_gfu - F_inv_T)
+                         + 2*d1*log(J_gfu)*F_inv_T).Compile()
+        stress_mandel = (F_gfu.trans * stress_1piola).Compile()
+        s_dev_mandel = stress_mandel - (1.0/3.0) * Trace(stress_mandel) * Id(3)
+        vm_mandel = sqrt(1.5 * InnerProduct(s_dev_mandel, s_dev_mandel)).Compile()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3.  POTATO + GREGORY PATCHES
@@ -381,6 +440,7 @@ class ContactCache:
             disp = np.linalg.norm(slave_pos - self.prev_pos, axis=1)
             can_reuse = disp < self.tol_reuse
 
+            if perf: _t0 = perf_counter()
             for i in np.where(can_reuse)[0]:
                 pid = self.patch_ids[i]
                 if pid < 0:
@@ -392,31 +452,46 @@ class ContactCache:
                 if compute_hessian and dndxs is not None:
                     dndxs_all[i] = dndxs
                 need_full[i] = False
+            if perf: perf.record("contact_cached", perf_counter() - _t0)
 
-        # Full TR projection for nodes that need it
+        # Full TR projection for nodes that need it (batch C++ with OpenMP)
         idx_full = np.where(need_full)[0]
         if idx_full.size > 0:
-            pos_full = slave_pos[idx_full]
-            dist_mat = np.linalg.norm(
-                xm_matrix[:, None, :] - pos_full[None, :, :], axis=2
+            if perf: _t0 = perf_counter()
+            if self.patch_ids is None:
+                self.patch_ids = np.full(n_slave, -1, dtype=np.int32)
+                self.params    = np.zeros((n_slave, 2), dtype=np.float64)
+
+            pos_full = slave_pos[idx_full].astype(np.float64)
+            pids_b, t1_b, t2_b, gn_b, nor_b, _ = project_points_tr_multi_batch(
+                pos_full, xm_matrix, ctrlpts_all, radii, eps,
+                TR_INIT, TR_MIN, TR_MAX,
+                surf_kdtree, surf_pids, BASE_NCAND, MIN_NCAND,
+                MAX_NCAND, RADIUS_FACTOR, K_SURF,
             )
+
+            # Scatter batch results back
             for j, i in enumerate(idx_full):
-                xsi        = slave_pos[i].astype(np.float64)
-                distances  = dist_mat[:, j]
-                sorted_idx = np.argsort(distances)
-                _, idx_kd  = surf_kdtree.query(xsi, k=min(K_SURF, len(surf_pts)))
-                kd_pids    = np.unique(surf_pids[np.atleast_1d(idx_kd)])
-                gn[i], normals[i], pid, t, dndxs = _project_single(
-                    xsi, distances, sorted_idx, kd_pids, compute_hessian=compute_hessian
-                )
-                if self.patch_ids is None:
-                    self.patch_ids = np.full(n_slave, -1, dtype=np.int32)
-                    self.params    = np.zeros((n_slave, 2), dtype=np.float64)
+                pid = int(pids_b[j])
+                gn[i] = gn_b[j]
+                normals[i] = nor_b[j]
                 self.patch_ids[i] = pid
-                if t is not None:
-                    self.params[i] = t
-                if compute_hessian and dndxs is not None:
-                    dndxs_all[i] = dndxs
+                if pid >= 0:
+                    self.params[i] = [t1_b[j], t2_b[j]]
+
+            # Compute Hessian data from known (patch, params) if needed
+            if compute_hessian:
+                for j, i in enumerate(idx_full):
+                    pid = int(pids_b[j])
+                    if pid < 0:
+                        continue
+                    t = np.array([t1_b[j], t2_b[j]], dtype=np.float64)
+                    _, _, dndxs_i = _evaluate_projection(
+                        patches[pid], t, slave_pos[i], compute_hessian=True
+                    )
+                    if dndxs_i is not None:
+                        dndxs_all[i] = dndxs_i
+            if perf: perf.record("contact_full_tr", perf_counter() - _t0)
 
         self.prev_pos = slave_pos.copy()
         active = gn < 0
@@ -683,16 +758,54 @@ def compute_contact_hessian(g, nor, dndxs=None):
 
 _w_vec = gfu.vec.CreateVector()   # scratch for Newton direction
 _uh_vec = gfu.vec.CreateVector()  # scratch for linesearch trial
+_cached_inv = None                # UMFPACK inverse (symbolic reuse via .Update())
+
+# Precomputed surface data for vectorized linesearch energy evaluation.
+# Populated once per Newton iteration in newton_solve(); used by _linesearch_energy().
+# Since projections are locked during Newton (tol_reuse=inf), the surface points
+# and normals don't change between linesearch evaluations — only slave_pos changes.
+_ls_xc    = np.zeros((0, 3))     # surface projection points
+_ls_nor   = np.zeros((0, 3))     # unit normals at projection points
+_ls_valid = np.zeros(0, dtype=bool)  # mask: True if projection exists
+
+
+def _precompute_ls_data():
+    """Precompute surface points and normals for vectorized linesearch energy.
+
+    Called once per Newton iteration after contact_cache.evaluate().
+    Since projections are locked (tol_reuse=inf), the surface geometry at
+    each cached (patch, params) doesn't change during linesearch — only the
+    slave positions change.  Precomputing xc and nor here allows the
+    linesearch energy to use fully vectorized numpy instead of a per-node
+    Python loop with C++ calls.
+    """
+    global _ls_xc, _ls_nor, _ls_valid
+    n_slave = len(slave_verts)
+    _ls_xc    = np.zeros((n_slave, 3))
+    _ls_nor   = np.zeros((n_slave, 3))
+    _ls_valid = np.zeros(n_slave, dtype=bool)
+    if contact_cache.patch_ids is None:
+        return
+    for i in range(n_slave):
+        pid = int(contact_cache.patch_ids[i])
+        if pid < 0:
+            continue
+        t = contact_cache.params[i]
+        _ls_xc[i] = patches[pid].Grg(t, deriv=0)
+        _ls_nor[i] = patches[pid].D3Grg(t)
+        _ls_valid[i] = True
 
 
 def _linesearch_energy(u_vec):
-    """Total energy (material + contact) at u_vec using cached projections.
+    """Total energy (material + contact) at u_vec using precomputed projections.
 
-    Evaluates contact for ALL slave nodes (not just the current active set),
-    so that nodes entering/exiting contact during linesearch are accounted for.
+    Uses _ls_xc, _ls_nor, _ls_valid (precomputed once per Newton iteration)
+    to evaluate contact energy via vectorized numpy ops.
     Returns np.inf for invalid states (NaN, element inversion).
     """
+    if perf: _t0 = perf_counter()
     E_mat = a_form.Energy(u_vec)
+    if perf: perf.record("ls_energy_mat", perf_counter() - _t0)
     if not np.isfinite(E_mat):
         return np.inf
 
@@ -701,20 +814,19 @@ def _linesearch_energy(u_vec):
         return np.inf
 
     E_con = 0.0
-    if contact_cache.patch_ids is not None:
+    if np.any(_ls_valid):
+        if perf: _t0 = perf_counter()
         slave_pos = np.column_stack([
             X_ref[slave_verts, 0] + vec_np[slave_verts],
             X_ref[slave_verts, 1] + vec_np[slave_verts + nv],
             X_ref[slave_verts, 2] + vec_np[slave_verts + 2*nv],
         ])
-        for i in range(len(slave_verts)):
-            pid = int(contact_cache.patch_ids[i])
-            if pid < 0:
-                continue
-            t = contact_cache.params[i]
-            g, _, _ = _evaluate_projection(patches[pid], t, slave_pos[i])
-            if g < 0:
-                E_con += 0.5 * kn * g**2
+        # Vectorized gap computation: g_n = (x_s - x_c) · n
+        gaps = np.einsum('ij,ij->i', slave_pos - _ls_xc, _ls_nor)
+        pen_mask = _ls_valid & (gaps < 0)
+        if np.any(pen_mask):
+            E_con = 0.5 * kn * np.sum(gaps[pen_mask]**2)
+        if perf: perf.record("ls_energy_contact", perf_counter() - _t0)
     return E_mat + E_con
 
 
@@ -751,7 +863,9 @@ def newton_solve():
 
     for nit in range(max_iter):
         # 1. Material residual
+        if perf: _t0 = perf_counter()
         a_form.Apply(gfu.vec, res_vec)
+        if perf: perf.record("apply", perf_counter() - _t0)
         r_np = res_vec.FV().NumPy()
 
         # 2. Contact evaluation (cached projections, first call does full TR)
@@ -760,24 +874,32 @@ def newton_solve():
             gfu.vec.FV().NumPy()[:] = _u_backup
             break
 
+        if perf: _t0 = perf_counter()
         gn_out, normals_out, active_out, dndxs = contact_cache.evaluate(
             slave_pos, compute_hessian=full_hessian
         )
+        if perf: perf.record("contact_eval", perf_counter() - _t0)
         active_idx = np.where(active_out)[0]
 
-        # 3. Add contact forces + collect Hessian data
+        # 2b. Precompute surface data for vectorized linesearch energy
+        _precompute_ls_data()
+
+        # 3. Add contact forces (vectorized) + collect Hessian data
+        if perf: _t0 = perf_counter()
         pen_data = []
-        for i in active_idx:
-            g   = gn_out[i]
-            nor = normals_out[i]
-            v   = int(slave_verts[i])
-            r_np[v]          += kn * g * nor[0]
-            r_np[v + nv]     += kn * g * nor[1]
-            r_np[v + 2*nv]   += kn * g * nor[2]
-            K_con = compute_contact_hessian(
-                g, nor, dndxs[i] if dndxs is not None else None
-            )
-            pen_data.append((i, g, nor, K_con))
+        if len(active_idx) > 0:
+            verts_act = slave_verts[active_idx]
+            kgn = kn * gn_out[active_idx]
+            r_np[verts_act]          += kgn * normals_out[active_idx, 0]
+            r_np[verts_act + nv]     += kgn * normals_out[active_idx, 1]
+            r_np[verts_act + 2*nv]   += kgn * normals_out[active_idx, 2]
+            for i in active_idx:
+                K_con = compute_contact_hessian(
+                    gn_out[i], normals_out[i],
+                    dndxs[i] if dndxs is not None else None
+                )
+                pen_data.append((i, gn_out[i], normals_out[i], K_con))
+        if perf: perf.record("contact_force_asm", perf_counter() - _t0)
 
         # 4. Convergence check
         rnorm = np.linalg.norm(r_np[free_dofs])
@@ -794,9 +916,12 @@ def newton_solve():
         rnorm_prev = rnorm
 
         # 6. Material tangent
+        if perf: _t0 = perf_counter()
         a_form.AssembleLinearization(gfu.vec)
+        if perf: perf.record("assemble_lin", perf_counter() - _t0)
 
         # 7. Add contact Hessian: K_con = kn * (n⊗n + g·dn/dx_s)
+        if perf: _t0 = perf_counter()
         mat = a_form.mat
         for idx, g, nor, K_con in pen_data:
             v = int(slave_verts[idx])
@@ -804,16 +929,25 @@ def newton_solve():
             for a in range(3):
                 for b in range(3):
                     mat[dofs[a], dofs[b]] = mat[dofs[a], dofs[b]] + K_con[a, b]
+        if perf: perf.record("contact_hess_asm", perf_counter() - _t0)
 
-        # 8. Solve K·Δu = -r
+        # 8. Solve K·Δu = -r (reuse symbolic factorization via .Update())
+        if perf: _t0 = perf_counter()
+        global _cached_inv
         solve_ok = False
         try:
-            inv = mat.Inverse(fes.FreeDofs(), inverse="umfpack")
-            _w_vec.data = inv * res_vec
+            if _cached_inv is None:
+                _cached_inv = mat.Inverse(fes.FreeDofs(), inverse="umfpack")
+            else:
+                _cached_inv.Update()
+            _w_vec.data = _cached_inv * res_vec
             if np.isfinite(_w_vec.FV().NumPy()).all():
                 solve_ok = True
+            else:
+                _cached_inv = None  # invalidate on NaN
         except Exception:
-            pass
+            _cached_inv = None  # invalidate on failure
+        if perf: perf.record("umfpack_solve", perf_counter() - _t0)
 
         if not solve_ok:
             r_max = np.max(np.abs(r_np[free_dofs]))
@@ -824,6 +958,7 @@ def newton_solve():
                 break
 
         # 9. Armijo linesearch
+        if perf: _t0 = perf_counter()
         w_free = _w_vec.FV().NumPy()[free_dofs]
         slope = -np.dot(r_np[free_dofs], w_free)  # φ'(0) = -∇E·w
 
@@ -836,6 +971,7 @@ def newton_solve():
                 w_free = _w_vec.FV().NumPy()[free_dofs]
                 slope = -np.dot(r_np[free_dofs], w_free)
             else:
+                if perf: perf.record("linesearch", perf_counter() - _t0)
                 break
 
         energy_old = _linesearch_energy(gfu.vec)
@@ -849,6 +985,7 @@ def newton_solve():
                 accepted = True
                 break
             tau *= 0.5
+        if perf: perf.record("linesearch", perf_counter() - _t0)
 
         if accepted:
             gfu.vec.data = _uh_vec
@@ -887,17 +1024,29 @@ def update_contact_fields(gn, normals, active, f_con):
     gf_contact_rx.vec.FV().NumPy()[:] = f_con
 
 
+# Build VTK field list based on vtk_fields setting
+_vtk_coefs = [gfu, vm_cauchy, gf_contact_active, gf_penetration, gf_contact_rx]
+_vtk_names = ["displacement", "vm_cauchy", "contact_active", "penetration", "contact_reaction"]
+
+if vtk_fields in ("standard", "full") and stress_cauchy is not None:
+    _vtk_coefs.insert(1, stress_cauchy)
+    _vtk_names.insert(1, "stress_cauchy")
+
+if vtk_fields == "full":
+    for cf, nm in [(stress_1piola, "stress_1piola"),
+                   (stress_mandel, "stress_mandel"),
+                   (vm_mandel, "vm_mandel")]:
+        if cf is not None:
+            _vtk_coefs.append(cf)
+            _vtk_names.append(nm)
+
 vtk = VTKOutput(
     mesh,
-    coefs=[gfu, stress_1piola, stress_cauchy, stress_mandel,
-           vm_cauchy, vm_mandel,
-           gf_contact_active, gf_penetration, gf_contact_rx],
-    names=["displacement", "stress_1piola", "stress_cauchy", "stress_mandel",
-           "vm_cauchy", "vm_mandel",
-           "contact_active", "penetration", "contact_reaction"],
+    coefs=_vtk_coefs,
+    names=_vtk_names,
     filename=os.path.join(out_dir, "contact_potato"),
     subdivision=0, order=1,
-)
+) if plot > 0 else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -916,6 +1065,12 @@ elif solver in ("newton-cg", "trust-constr"):
     print(f"  {nsteps} steps, solver={solver}, max_iter={max_iter}, gtol={gtol:.0e}, hess={hess_type}")
 else:
     print(f"  {nsteps} steps, solver={solver}, max_iter={max_iter}, gtol={gtol:.0e}")
+perf_opts = []
+if taskmanager: perf_opts.append("TaskManager")
+if realcompile: perf_opts.append("realcompile")
+if profile:     perf_opts.append("profile")
+print(f"  VTK: every {plot} steps ({vtk_fields}), "
+      f"perf: {', '.join(perf_opts) if perf_opts else 'none'}")
 print(f"{'='*60}\n")
 
 t_wall_start = perf_counter()
@@ -1022,7 +1177,9 @@ with TaskManager() if taskmanager else nullcontext():
 
         # --- VTK snapshot --------------------------------------------------
         if plot > 0 and step % plot == 0:
+            if perf: _t0 = perf_counter()
             vtk.Do(time=step * dt)
+            if perf: perf.record("vtk_output", perf_counter() - _t0)
 
         # --- Comparison output ---------------------------------------------
         if compare:
@@ -1040,6 +1197,14 @@ with TaskManager() if taskmanager else nullcontext():
                     fout.write("step,time,rx,ry,rz\n")
                 fout.write(f"{step},{step*dt:.6f},{rx:.10e},{ry:.10e},{rz:.10e}\n")
 
+        # --- Profiling step summary ----------------------------------------
+        if perf:
+            perf.record("step_total", perf_counter() - t_step)
+            print(perf.step_summary(step))
+            perf.reset_step()
+
 t_total = perf_counter() - t_wall_start
 print(f"\nTotal wall time: {t_total:.1f} s")
 print(f"Output directory: {out_dir}")
+if perf:
+    print(perf.final_summary())
