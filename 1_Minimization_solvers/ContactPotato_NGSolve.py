@@ -6,23 +6,22 @@ rigid "potato" body.  ALL FE computations use the NGSolve API (mesh, FE space,
 hyperelastic energy via Variation, Dirichlet BCs).  Contact detection reuses
 the existing Gregory-patch / trust-region projection backend.
 
+Configuration is via variables in the "Configuration" section below.
+
 Solvers
 -------
-- **newton**: Full Newton with direct UMFPACK solve. Uses the material tangent
-  from NGSolve plus contact Hessian (kn * n ⊗ n). Contact is evaluated
-  dynamically at each iteration (no outer active-set loop). Projections are
-  locked during the solve for energy consistency. Armijo linesearch.
+- **newton**: Full Newton with direct UMFPACK solve and Armijo linesearch.
+  Uses the material tangent from NGSolve plus contact Hessian
+  kn * (n ⊗ n + g * dn/dx_s) when full_hessian=True.  Contact is
+  evaluated dynamically at each iteration with locked projections for
+  energy consistency.
 - **newton-cg**: Newton-CG via scipy.optimize.minimize with Hessian-vector
-  product. More robust than direct Newton for ill-conditioned problems.
-  Supports --full_hessian for curvature term without matrix singularity risk.
-- **lbfgsb**: L-BFGS-B quasi-Newton via scipy.optimize.minimize. Uses cached
-  TR projections for efficiency (~500 iterations per step).
-
-Usage
------
-    python ContactPotato_NGSolve.py --mesh 10 --solver newton
-    python ContactPotato_NGSolve.py --mesh 10 --solver lbfgsb --max_iter 500
-    python ContactPotato_NGSolve.py --mesh 5  --solver newton --compare
+  product (hessp).  Uses CG to approximately solve each Newton system.
+  Supports full_hessian for curvature term without matrix singularity risk.
+- **trust-constr**: Trust-region constrained minimizer (unconstrained mode).
+  Uses hessp for Hessian-vector products.
+- **lbfgsb**: L-BFGS-B quasi-Newton via scipy.optimize.minimize.  No Hessian
+  needed; uses only gradient information with limited-memory BFGS updates.
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -45,7 +44,7 @@ from PyClasses import gregory_patch_backend as gb
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 10 #20            # mesh density (n x n x n hex elements)
+n           = 20                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -61,15 +60,15 @@ max_iter    = 200            # max iterations per step
 gtol        = 1e-8          # gradient/residual tolerance
 
 # Hessian
-full_hessian = True #False        # include curvature term dn/dx_s in contact Hessian
+full_hessian = True         # include curvature term dn/dx_s in contact Hessian
 
 # Output
 compare     = False         # write comparison outputs (u arrays, reactions CSV)
 plot        = 1             # VTK export every N steps (0 = off)
 
 # Performance
-taskmanager = False         # NGSolve TaskManager (parallel assembly, large meshes)
-realcompile = False         # C++ JIT of energy form (startup cost, faster iterations)
+taskmanager = True         # NGSolve TaskManager (parallel assembly, large meshes)
+realcompile = True         # C++ JIT of energy form (startup cost, faster iterations)
 # ──────────────────────────────────────────────────────────────────────────────
 
 h_contact = 4.0 / n              # element edge length at contact surface ([-2,2]^3 block)
@@ -112,10 +111,9 @@ psi_sym = c10 * (I1_sym - 3 - 2*log(J_sym)) + d1 * log(J_sym)**2
 a_form = BilinearForm(fes)
 a_form += Variation(psi_sym.Compile(realcompile=realcompile, wait=True) * dx)
 
-# Energy CF defined on gfu (for VTK stress output)
+# Deformation gradient CFs evaluated on gfu (for VTK stress output)
 F_gfu  = Id(3) + Grad(gfu)
 J_gfu  = Det(F_gfu)
-I1_gfu = Trace(F_gfu.trans * F_gfu)
 
 # --- Stress CFs for VTK output -------------------------------------------
 # 1st Piola-Kirchhoff stress: P = dW/dF = 2*c10*(F - F^{-T}) + 2*d1*ln(J)*F^{-T}
@@ -197,7 +195,7 @@ print(f"Block mesh: {nv} vertices, {len(slave_verts)} slave (bottom), "
 freedofs_ba = fes.FreeDofs()
 free_dofs   = np.array([i for i in range(ndof) if freedofs_ba[i]], dtype=np.int32)
 
-# DOF indices for top boundary (x-component only, for prescribed sliding)
+# DOF indices for top boundary (all 3 components, for prescribed displacement)
 top_dofs_x = np.array([v for v in top_verts], dtype=np.int32)           # x-comp
 top_dofs_y = np.array([v + nv for v in top_verts], dtype=np.int32)      # y-comp
 top_dofs_z = np.array([v + 2*nv for v in top_verts], dtype=np.int32)    # z-comp
@@ -209,8 +207,8 @@ top_dofs_z = np.array([v + 2*nv for v in top_verts], dtype=np.int32)    # z-comp
 TR_INIT = 0.1
 TR_MIN  = 1e-15
 TR_MAX  = 1.0
-BASE_NCAND = 12 #24
-MIN_NCAND  = 5 #10
+BASE_NCAND = 12
+MIN_NCAND  = 5
 MAX_NCAND  = 96
 RADIUS_FACTOR = 1.5
 K_SURF = 15
@@ -333,10 +331,10 @@ def _project_single(xsi, distances, sorted_idx, kd_pids, compute_hessian=False):
 
 
 # --- Contact cache for warm-starting within a load step -------------------
-# Between consecutive L-BFGS-B evaluations the slave positions barely move,
+# Between consecutive solver evaluations the slave positions barely move,
 # so we can reuse the previous projection result (patch id + parametric coords)
-# and only recompute gap/normal cheaply via Grg + D3Grg (0.006 ms/node)
-# instead of a full TR search (5 ms/node).
+# and only recompute gap/normal cheaply via Grg + D3Grg (~0.006 ms/node)
+# instead of a full TR search (~5 ms/node).
 
 class ContactCache:
     """Caches TR projection results; recomputes gap from cached patch/param."""
@@ -428,7 +426,7 @@ contact_cache = ContactCache()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6.  OBJECTIVE FUNCTION  (energy + gradient for scipy)
+# 6.  OBJECTIVE + CONTACT FORCES  (shared across solvers)
 # ══════════════════════════════════════════════════════════════════════════════
 res_vec = gfu.vec.CreateVector()       # scratch vector for Apply
 
@@ -438,7 +436,7 @@ def compute_contact_forces(gn, normals, active):
 
     f_con[v]    = kn * gn * n_x   for each active (penetrating) slave node
     f_con[v+nv] = kn * gn * n_y
-    f_con[v+2nv]= kn * gn * n_z
+    f_con[v+2*nv]= kn * gn * n_z
 
     Parameters
     ----------
@@ -627,7 +625,7 @@ def hessp(x_free, p):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6b. NEWTON SOLVER WITH ACTIVE-SET ITERATION
+# 6b. NEWTON SOLVER WITH DYNAMIC CONTACT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_slave_pos():
@@ -647,11 +645,12 @@ def compute_contact_hessian(g, nor, dndxs=None):
     The full Hessian is:
         K_con = kn * (n ⊗ n + g_n * dn/dx_s)
 
-    When --full_hessian is enabled and the curvature term g*dn/dx_s makes K_con
+    When full_hessian is enabled and the curvature term g*dn/dx_s makes K_con
     indefinite, we project to PSD via absolute eigenvalue filtering:
         K_con = Q |Λ| Qᵀ
     This preserves the magnitude of all curvature information while guaranteeing
-    positive semi-definiteness (Li et al. 2020 / SIGGRAPH 2024 pattern).
+    positive semi-definiteness (Chen et al. 2024, "Stabler Neo-Hookean Simulation:
+    Absolute Eigenvalue Filtering for Projected Newton", SIGGRAPH 2024).
 
     Parameters
     ----------
@@ -1029,7 +1028,8 @@ with TaskManager() if taskmanager else nullcontext():
         if compare:
             np.save(os.path.join(out_dir, f"u_step{step:04d}.npy"),
                     gfu.vec.FV().NumPy().copy())
-            # Reaction forces on top boundary
+            # Reaction forces on top boundary (material internal forces only,
+            # contact forces are not included since top boundary is not in contact)
             a_form.Apply(gfu.vec, res_vec)
             f_top = res_vec.FV().NumPy()
             rx = np.sum(f_top[top_dofs_x])
