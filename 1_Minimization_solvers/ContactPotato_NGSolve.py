@@ -27,9 +27,9 @@ Usage
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  IMPORTS & CLI
+# 1.  IMPORTS & CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
-import argparse, os, sys, pickle
+import os, sys, pickle
 from contextlib import nullcontext
 from datetime import datetime
 from time import perf_counter
@@ -44,33 +44,38 @@ from ngsolve.meshes import MakeStructured3DMesh
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from PyClasses import gregory_patch_backend as gb
 
-# ---------------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="NGSolve ContactPotato simulation")
-parser.add_argument("--mesh",       type=int,   default=20,      help="mesh density n (nxnxn hex)")
-parser.add_argument("--solver",     type=str,   default="newton",
-                    choices=["newton", "newton-cg", "trust-constr", "lbfgsb"],
-                    help="solver: newton, newton-cg, trust-constr, or lbfgsb")
-parser.add_argument("--E",          type=float, default=0.05,    help="Young's modulus")
-parser.add_argument("--nu",         type=float, default=0.3,     help="Poisson ratio")
-parser.add_argument("--kn_factor",  type=float, default=20.0,    help="kn = kn_factor * E / h (mesh-dependent, Wriggers 2006)")
-parser.add_argument("--nsteps",     type=int,   default=100,     help="number of load steps")
-parser.add_argument("--max_iter",   type=int,   default=50,      help="max iterations per step (Newton inner or L-BFGS-B)")
-parser.add_argument("--max_as",     type=int,   default=5,       help="max active-set iterations (Newton only)")
-parser.add_argument("--gtol",       type=float, default=1e-8,    help="gradient/residual tolerance for convergence")
-parser.add_argument("--full_hessian", action="store_true",       help="use full contact Hessian with curvature term (experimental)")
-parser.add_argument("--compare",    action="store_true",         help="write comparison outputs")
-parser.add_argument("--plot",       type=int,   default=1,       help="VTK export every N steps (0=off)")
-parser.add_argument("--taskmanager", action="store_true",        help="enable NGSolve TaskManager (parallel assembly, beneficial for large meshes)")
-parser.add_argument("--realcompile", action="store_true",        help="use realcompile=True for C++ JIT of energy form (startup cost, faster iterations)")
-args = parser.parse_args()
+# ── Configuration ─────────────────────────────────────────────────────────────
+# Mesh
+n           = 5 #20            # mesh density (n x n x n hex elements)
 
-n       = args.mesh
-E_val   = args.E
-nu_val  = args.nu
+# Material (compressible neo-Hookean)
+E_val       = 0.05          # Young's modulus
+nu_val      = 0.3           # Poisson ratio
+
+# Contact
+kn_factor   = 20.0          # kn = kn_factor * E / h  (Wriggers 2006)
+
+# Solver: "newton", "newton-cg", "trust-constr", "lbfgsb"
+solver      = "lbfgsb"
+nsteps      = 100           # number of load steps
+max_iter    = 5000            # max iterations per step
+max_as      = 500            # max active-set iterations (Newton only)
+gtol        = 1e-8          # gradient/residual tolerance
+
+# Hessian
+full_hessian = True #False        # include curvature term dn/dx_s in contact Hessian
+
+# Output
+compare     = False         # write comparison outputs (u arrays, reactions CSV)
+plot        = 1             # VTK export every N steps (0 = off)
+
+# Performance
+taskmanager = False         # NGSolve TaskManager (parallel assembly, large meshes)
+realcompile = False         # C++ JIT of energy form (startup cost, faster iterations)
+# ──────────────────────────────────────────────────────────────────────────────
+
 h_contact = 4.0 / n              # element edge length at contact surface ([-2,2]^3 block)
-kn      = args.kn_factor * E_val / h_contact   # Wriggers (2006): kn ~ alpha * E / h
-nsteps  = args.nsteps
-max_iter = args.max_iter
+kn      = kn_factor * E_val / h_contact   # Wriggers (2006): kn ~ alpha * E / h
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -107,7 +112,7 @@ I1_sym = Trace(F_sym.trans * F_sym)
 psi_sym = c10 * (I1_sym - 3 - 2*log(J_sym)) + d1 * log(J_sym)**2
 
 a_form = BilinearForm(fes)
-a_form += Variation(psi_sym.Compile(realcompile=args.realcompile, wait=True) * dx)
+a_form += Variation(psi_sym.Compile(realcompile=realcompile, wait=True) * dx)
 
 # Energy CF defined on gfu (for VTK stress output)
 F_gfu  = Id(3) + Grad(gfu)
@@ -570,7 +575,7 @@ def hessp(x_free, p):
             X_ref[slave_verts, 2] + vec[slave_verts + 2*nv],
         ])
         gn, normals, active, dndxs_all = contact_cache.evaluate(
-            slave_pos, compute_hessian=args.full_hessian
+            slave_pos, compute_hessian=full_hessian
         )
         active_idx = np.where(active)[0] if np.any(active) else np.array([], dtype=int)
 
@@ -607,7 +612,7 @@ def hessp(x_free, p):
 
             # Full contact Hessian-vector product: K_con @ p_v
             # Uses absolute eigenvalue filtering for PSD guarantee
-            if args.full_hessian and dndxs_all is not None and np.any(dndxs_all[i]):
+            if full_hessian and dndxs_all is not None and np.any(dndxs_all[i]):
                 K_con = compute_contact_hessian(g, nor, dndxs_all[i])
                 Hp_contact = K_con @ p_v
             else:
@@ -666,7 +671,7 @@ def compute_contact_hessian(g, nor, dndxs=None):
     """
     K_base = np.outer(nor, nor)
 
-    if args.full_hessian and dndxs is not None and np.any(dndxs):
+    if full_hessian and dndxs is not None and np.any(dndxs):
         K_raw = kn * (K_base + g * dndxs)
 
         # Absolute eigenvalue filtering: K_psd = Q |Λ| Qᵀ
@@ -745,13 +750,13 @@ def newton_active_set_solve():
 
     # Newton convergence floor: contact projection accuracy limits
     # achievable residual to ~1e-10.  Prevent infinite looping when
-    # args.gtol is set very tight (e.g. 1e-18 for scipy solvers).
-    newton_gtol = max(args.gtol, 1e-10)
+    # gtol is set very tight (e.g. 1e-18 for scipy solvers).
+    newton_gtol = max(gtol, 1e-10)
 
     # Save state before this step for NaN recovery
     _u_backup = gfu.vec.FV().NumPy().copy()
 
-    for as_iter in range(args.max_as):
+    for as_iter in range(max_as):
         # ── Full contact evaluation (expensive TR projection, with Hessian data) ──
         contact_cache.reset()
         slave_pos = compute_slave_pos()
@@ -762,7 +767,7 @@ def newton_active_set_solve():
             break
 
         gn_out, normals_out, active_out, dndxs_out = contact_cache.evaluate(
-            slave_pos, compute_hessian=args.full_hessian
+            slave_pos, compute_hessian=full_hessian
         )
         active_idx = np.where(active_out)[0]
 
@@ -784,7 +789,7 @@ def newton_active_set_solve():
         rnorm_prev = np.inf
         stagnation_count = 0
 
-        for nit in range(args.max_iter):
+        for nit in range(max_iter):
             # 1. Material residual via NGSolve
             a_form.Apply(gfu.vec, res_vec)
             r_np = res_vec.FV().NumPy()
@@ -799,7 +804,7 @@ def newton_active_set_solve():
                 xs = slave_pos_now[active_idx[j]]
 
                 g, nor, dndxs = _evaluate_projection(
-                    patches[pid], t, xs, compute_hessian=args.full_hessian
+                    patches[pid], t, xs, compute_hessian=full_hessian
                 )
 
                 if g < 0:
@@ -936,13 +941,13 @@ disp_increment = np.array([12.0, 0.0, 0.0]) * dt   # prescribed sliding
 print(f"\n{'='*60}")
 print(f"  ContactPotato NGSolve — mesh {n}x{n}x{n}")
 print(f"  E={E_val}, nu={nu_val}, kn={kn:.4f}")
-if args.solver == "newton":
-    print(f"  {nsteps} steps, solver=Newton, max_iter={max_iter}, max_as={args.max_as}, gtol={args.gtol:.0e}")
-elif args.solver in ("newton-cg", "trust-constr"):
-    hess_type = "full (with curvature)" if args.full_hessian else "simple (n⊗n)"
-    print(f"  {nsteps} steps, solver={args.solver}, max_iter={max_iter}, gtol={args.gtol:.0e}, hess={hess_type}")
+if solver == "newton":
+    print(f"  {nsteps} steps, solver=Newton, max_iter={max_iter}, max_as={max_as}, gtol={gtol:.0e}")
+elif solver in ("newton-cg", "trust-constr"):
+    hess_type = "full (with curvature)" if full_hessian else "simple (n⊗n)"
+    print(f"  {nsteps} steps, solver={solver}, max_iter={max_iter}, gtol={gtol:.0e}, hess={hess_type}")
 else:
-    print(f"  {nsteps} steps, solver={args.solver}, max_iter={max_iter}, gtol={args.gtol:.0e}")
+    print(f"  {nsteps} steps, solver={solver}, max_iter={max_iter}, gtol={gtol:.0e}")
 print(f"{'='*60}\n")
 
 t_wall_start = perf_counter()
@@ -953,7 +958,7 @@ t_wall_start = perf_counter()
 # See: NGSolve howto_parallel.rst, py_tutorials/navierstokes.py
 # NOTE: For small problems (<1000 elements), threading overhead may dominate.
 #       Benefit grows with mesh size (10k+ elements).
-with TaskManager() if args.taskmanager else nullcontext():
+with TaskManager() if taskmanager else nullcontext():
     for step in range(1, nsteps + 1):
         t_step = perf_counter()
 
@@ -981,21 +986,21 @@ with TaskManager() if args.taskmanager else nullcontext():
             max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
             return gn, normals, active, n_active, max_pen
 
-        if args.solver == "newton":
+        if solver == "newton":
             # ── Newton + active-set solver ──
-            n_newton, n_as, gn, normals, active = newton_active_set_solve()
+            n_newton, n_as, _, _, _ = newton_active_set_solve()
 
-            # Compute contact forces for output
-            f_con = compute_contact_forces(gn, normals, active)
-            update_contact_fields(gn, normals, active, f_con)
+            # Recompute contact state at converged gfu.vec (the values
+            # returned by newton_active_set_solve are from the start of the
+            # last AS iteration, before Newton iterations modified gfu.vec).
+            gn, normals, active, n_active, max_pen = finalize_contact_state()
 
             # Compute final residual norm for reporting
             a_form.Apply(gfu.vec, res_vec)
-            res_vec.FV().NumPy()[:]  += f_con
+            f_con = compute_contact_forces(gn, normals, active)
+            res_vec.FV().NumPy()[:] += f_con
             rnorm = np.linalg.norm(res_vec.FV().NumPy()[free_dofs])
 
-            n_active = int(np.sum(active))
-            max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
             dt_step  = perf_counter() - t_step
             print(f"Step {step:3d}/{nsteps}  Newton: nit={n_newton:2d} as={n_as}  "
                   f"|r|={rnorm:.2e}  active={n_active:3d}  maxpen={max_pen:.2e}  "
@@ -1004,12 +1009,12 @@ with TaskManager() if args.taskmanager else nullcontext():
         else:
             # ── Scipy minimize solvers ──
             SCIPY_SOLVERS = {
-                "newton-cg":    ("Newton-CG",    True,  {"xtol": args.gtol}),
-                "trust-constr": ("trust-constr", True,  {"gtol": args.gtol, "xtol": 1e-30}),
-                "lbfgsb":       ("L-BFGS-B",     False, {"gtol": args.gtol, "maxls": 40, "ftol": 0}),
+                "newton-cg":    ("Newton-CG",    True,  {"xtol": gtol}),
+                "trust-constr": ("trust-constr", True,  {"gtol": gtol, "xtol": 1e-30}),
+                "lbfgsb":       ("L-BFGS-B",     False, {"gtol": gtol, "maxls": 4000, "ftol": 0}),
             }
 
-            method_name, uses_hessp, opts_override = SCIPY_SOLVERS[args.solver]
+            method_name, uses_hessp, opts_override = SCIPY_SOLVERS[solver]
             options = {"maxiter": max_iter, **opts_override}
 
             x0 = vec[free_dofs].copy()
@@ -1043,18 +1048,18 @@ with TaskManager() if args.taskmanager else nullcontext():
                 grad_norm = float("nan")
 
             # Print result
-            print(f"Step {step:3d}/{nsteps}  {args.solver}: nit={result.nit:2d}  "
+            print(f"Step {step:3d}/{nsteps}  {solver}: nit={result.nit:2d}  "
                   f"nfev={result.nfev:3d}  |grad|={grad_norm:.2e}  "
                   f"active={n_active:3d}  maxpen={max_pen:.2e}  t={dt_step:.1f}s")
             if not result.success:
                 print(f"  >> {result.message}")
 
         # --- VTK snapshot --------------------------------------------------
-        if args.plot > 0 and step % args.plot == 0:
+        if plot > 0 and step % plot == 0:
             vtk.Do(time=step * dt)
 
         # --- Comparison output ---------------------------------------------
-        if args.compare:
+        if compare:
             np.save(os.path.join(out_dir, f"u_step{step:04d}.npy"),
                     gfu.vec.FV().NumPy().copy())
             # Reaction forces on top boundary
