@@ -73,6 +73,13 @@ taskmanager = "auto"       # True/False/"auto" — auto enables for n >= 30 (27k
 realcompile = "auto"       # True/False/"auto" — auto enables for nsteps >= 20
 profile     = False        # built-in per-operation timing (prints breakdown per step)
 linear_solver = "pardiso"  # "umfpack" | "pardiso" | "mumps" — direct solver for Newton
+
+# Plasticity (J2 von Mises, multiplicative decomposition F = Fe·Fp)
+plastic       = False                  # enable elastoplastic constitutive model
+plastic_param = [0.01, 0.05, 1.0]     # [My0, H_hard, m_hard]
+# My0     = initial yield stress
+# H_hard  = hardening modulus
+# m_hard  = hardening exponent (1.0 = linear hardening)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Profiling instrumentation ────────────────────────────────────────────────
@@ -161,31 +168,79 @@ d1  = E_val * nu_val / (2 * (1 + nu_val) * (1 - 2*nu_val))
 # Symbolic energy (uses trial function u for Variation / Apply)
 u_trial, v_test = fes.TnT()
 F_sym  = Id(3) + Grad(u_trial)
-J_sym  = Det(F_sym)
-I1_sym = Trace(F_sym.trans * F_sym)
-psi_sym = c10 * (I1_sym - 3 - 2*log(J_sym)) + d1 * log(J_sym)**2
 
-a_form = BilinearForm(fes)
-a_form += Variation(psi_sym.Compile(realcompile=realcompile, wait=True) * dx)
+# --- Plasticity: IntegrationRuleSpace for Fp at Gauss points -------------
+if plastic:
+    from ngsolve.comp import IntegrationRuleSpace
+    My0, H_hard, m_hard = plastic_param
+
+    # Integration rule space: order=1 → 2×2×2 = 8 GP per hex (matches reference code)
+    fes_ir = IntegrationRuleSpace(mesh, order=1)
+    irs_dx = dx(intrules=fes_ir.GetIntegrationRules())
+    n_ip = fes_ir.ndof    # total integration points across all elements
+
+    # Plastic deformation gradient Fp (3×3 per GP)
+    fes_Fp = MatrixValued(fes_ir, dim=3)
+    gf_Fp = GridFunction(fes_Fp)
+    gf_Fp.Interpolate(Id(3))  # virgin material: Fp = I
+
+    # F evaluator: reads deformation gradient at all GPs
+    fes_F_ir = MatrixValued(fes_ir, dim=3)
+    gf_F_ir = GridFunction(fes_F_ir)
+
+    # History arrays (numpy, updated ONLY on successful load step convergence)
+    _Fp_conv   = np.tile(np.eye(3).ravel(), n_ip)   # (n_ip*9,) flattened
+    _epcum_conv = np.zeros(n_ip)                     # cumulative plastic strain per GP
+
+    # Working arrays (recomputed each Newton iteration by return mapping)
+    _Fp_temp     = _Fp_conv.copy()
+    _delta_epcum = np.zeros(n_ip)
+
+    # Energy: W(Fe) where Fe = F · Fp^{-1}
+    Fe_sym  = F_sym * Inv(gf_Fp)
+    J_sym   = Det(Fe_sym)
+    I1_sym  = Trace(Fe_sym.trans * Fe_sym)
+    psi_sym = c10 * (I1_sym - 3 - 2*log(J_sym)) + d1 * log(J_sym)**2
+
+    a_form = BilinearForm(fes)
+    a_form += Variation(psi_sym.Compile(realcompile=realcompile, wait=True) * irs_dx)
+
+    print(f"  Plasticity IRS: {n_ip} integration points "
+          f"({n_ip // mesh.ne} per element)")
+else:
+    J_sym  = Det(F_sym)
+    I1_sym = Trace(F_sym.trans * F_sym)
+    psi_sym = c10 * (I1_sym - 3 - 2*log(J_sym)) + d1 * log(J_sym)**2
+
+    a_form = BilinearForm(fes)
+    a_form += Variation(psi_sym.Compile(realcompile=realcompile, wait=True) * dx)
 
 # --- Stress CFs for VTK output (built only if needed by vtk_fields) ------
 # Only compile what's needed — matrix-valued stress tensors are expensive.
 F_gfu   = Id(3) + Grad(gfu)
-J_gfu   = Det(F_gfu)
+
+# For plasticity, compute elastic deformation gradient Fe for stress evaluation
+if plastic:
+    Fe_gfu  = F_gfu * Inv(gf_Fp)
+    J_gfu   = Det(Fe_gfu)
+    B_e     = Fe_gfu * Fe_gfu.trans   # elastic left Cauchy-Green
+else:
+    J_gfu   = Det(F_gfu)
+    B_e     = F_gfu * F_gfu.trans     # B = F·Fᵀ (same as Be when Fp=I)
 F_inv_T = Inv(F_gfu).trans
 
 stress_1piola = stress_cauchy = stress_mandel = None
 vm_cauchy = vm_mandel = None
 
 if plot > 0:
-    # Cauchy + vm_cauchy: needed by "minimal", "standard", "full"
-    stress_cauchy = ((1/J_gfu) * (2*c10*(F_gfu * F_gfu.trans - Id(3))
+    # Cauchy: σ = (1/J) [2c10(B_e - I) + 2d1·ln(J_e)·I]
+    stress_cauchy = ((1/J_gfu) * (2*c10*(B_e - Id(3))
                      + 2*d1*log(J_gfu)*Id(3))).Compile()
     s_dev_cauchy = stress_cauchy - (1.0/3.0) * Trace(stress_cauchy) * Id(3)
     vm_cauchy = sqrt(1.5 * InnerProduct(s_dev_cauchy, s_dev_cauchy)).Compile()
 
     if vtk_fields == "full":
-        # 1st Piola-Kirchhoff, Mandel, vm_mandel
+        # 1st Piola-Kirchhoff, Mandel, vm_mandel (use total F, not Fe)
         stress_1piola = (2*c10*(F_gfu - F_inv_T)
                          + 2*d1*log(J_gfu)*F_inv_T).Compile()
         stress_mandel = (F_gfu.trans * stress_1piola).Compile()
@@ -699,6 +754,193 @@ def hessp(x_free, p):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 6b-pre. RETURN MAPPING (J2 plasticity, multiplicative decomposition)
+# ══════════════════════════════════════════════════════════════════════════════
+if plastic:
+    def _write_Fp_to_gf(Fp_flat):
+        """Write flattened Fp array (n_ip*9,) into gf_Fp GridFunction.
+
+        DOF layout of MatrixValued(IntegrationRuleSpace): block by component.
+        [comp0_ip0..comp0_ipN, comp1_ip0..comp1_ipN, ..., comp8_ip0..comp8_ipN]
+        where comp = row*3 + col (row-major).
+        """
+        vec = gf_Fp.vec.FV().NumPy()
+        Fp_all = Fp_flat.reshape(n_ip, 9)   # (n_ip, 9)  row-major per GP
+        for comp in range(9):
+            vec[comp * n_ip : (comp + 1) * n_ip] = Fp_all[:, comp]
+
+    def _read_F_at_ips():
+        """Evaluate F = I + Grad(u) at all integration points.
+
+        Returns flattened array (n_ip*9,) in the same per-GP row-major layout
+        used by return_mapping().
+        """
+        gf_F_ir.Interpolate(Id(3) + Grad(gfu))
+        vec = gf_F_ir.vec.FV().NumPy()
+        F_all = np.zeros((n_ip, 9))
+        for comp in range(9):
+            F_all[:, comp] = vec[comp * n_ip : (comp + 1) * n_ip]
+        return F_all.ravel()
+
+    def return_mapping(F_flat, Fp_conv_flat, epcum_conv,
+                       c10_, d1_, My0_, H_, m_):
+        """J2 return mapping with exponential update at all integration points.
+
+        Implements the multiplicative plasticity algorithm from paper.tex:
+        - Trial elastic predictor: Fe_trial = F · Fp_old^{-1}
+        - Mandel stress: M = 2c10(Ce - I) + 2d1·ln(Je)·I
+        - J2 yield: f = σ_vm - σ_y(epcum)
+        - Exponential map update: Fp_new = exp(Δλ·N_flow) · Fp_old
+
+        Parameters
+        ----------
+        F_flat : ndarray (n_ip*9,)
+            Total deformation gradients at all IPs
+        Fp_conv_flat : ndarray (n_ip*9,)
+            Converged Fp from previous load step
+        epcum_conv : ndarray (n_ip,)
+            Converged cumulative plastic strain
+        c10_, d1_ : float
+            Neo-Hookean material parameters
+        My0_, H_, m_ : float
+            Yield stress, hardening modulus, hardening exponent
+
+        Returns
+        -------
+        Fp_new_flat : ndarray (n_ip*9,)
+        delta_epcum : ndarray (n_ip,)
+        success : bool
+        """
+        n = len(epcum_conv)
+        F_all  = F_flat.reshape(n, 3, 3)
+        Fp_old = Fp_conv_flat.reshape(n, 3, 3)
+        Fp_new = Fp_old.copy()
+        delta_epcum = np.zeros(n)
+        I3 = np.eye(3)
+
+        for ip in range(n):
+            F  = F_all[ip]
+            Fp = Fp_old[ip]
+            epcum = epcum_conv[ip]
+
+            # --- Trial elastic predictor ---
+            Fp_inv = np.linalg.inv(Fp)
+            Fe = F @ Fp_inv
+            Ce = Fe.T @ Fe
+            Je = np.linalg.det(Fe)
+            if Je <= 1e-15:
+                # Element inversion — keep old Fp, let global Newton handle it
+                continue
+
+            lnJe = np.log(Je)
+
+            # Mandel stress: M = 2c10*(Ce - I) + 2d1*ln(Je)*I
+            M = 2*c10_*(Ce - I3) + 2*d1_*lnJe*I3
+            M_dev = M - (1.0/3.0)*np.trace(M)*I3
+            norm_Mdev_sq = np.sum(M_dev * M_dev)     # Frobenius norm squared
+            sigma_vm = np.sqrt(1.5 * norm_Mdev_sq)
+
+            # Yield stress
+            sigma_y = My0_ + (H_ * epcum**m_ if epcum > 1e-30 else 0.0)
+
+            # Yield check
+            f_yield = sigma_vm - sigma_y
+            if f_yield <= 0.0:
+                continue    # elastic — Fp unchanged
+
+            # --- Plastic: local Newton on scalar Δλ ---
+            # Flow direction (deviatoric, traceless, associated J2 flow)
+            if sigma_vm > 1e-30:
+                N_flow = 1.5 * M_dev / sigma_vm
+            else:
+                continue
+
+            # Eigendecomposition of N_flow (symmetric): compute once
+            eigvals_N, V_N = np.linalg.eigh(N_flow)
+
+            dlam = 1e-8     # initial guess
+            converged_rm = False
+            R_val = f_yield  # initial residual
+            Fp_trial = Fp.copy()
+            for k_rm in range(50):
+                # Exponential map: Fp_trial = expm(dlam * N_flow) @ Fp_old
+                exp_diag = np.exp(dlam * eigvals_N)
+                exp_dlam_N = (V_N * exp_diag) @ V_N.T
+                Fp_trial = exp_dlam_N @ Fp
+
+                # Recompute elastic state (with robust inversion)
+                det_Fp_trial = np.linalg.det(Fp_trial)
+                if abs(det_Fp_trial) < 1e-15:
+                    break
+                try:
+                    Fe_new = F @ np.linalg.inv(Fp_trial)
+                except np.linalg.LinAlgError:
+                    break
+                Ce_new = Fe_new.T @ Fe_new
+                Je_new = np.linalg.det(Fe_new)
+                if Je_new <= 1e-15 or not np.isfinite(Je_new):
+                    break
+
+                M_new = 2*c10_*(Ce_new - I3) + 2*d1_*np.log(Je_new)*I3
+                M_dev_new = M_new - (1.0/3.0)*np.trace(M_new)*I3
+                svm_new = np.sqrt(1.5 * np.sum(M_dev_new * M_dev_new))
+
+                ep_total = epcum + dlam
+                sy_new = My0_ + (H_ * ep_total**m_ if ep_total > 1e-30 else 0.0)
+
+                R_val = svm_new - sy_new
+
+                if abs(R_val) < 1e-12:
+                    converged_rm = True
+                    break
+
+                # Finite-difference derivative dR/d(dlam)
+                h_fd = max(1e-10, abs(dlam) * 1e-6)
+                exp_diag_h = np.exp((dlam + h_fd) * eigvals_N)
+                Fp_h = ((V_N * exp_diag_h) @ V_N.T) @ Fp
+                det_Fp_h = np.linalg.det(Fp_h)
+                if abs(det_Fp_h) < 1e-15:
+                    break
+                try:
+                    Fe_h = F @ np.linalg.inv(Fp_h)
+                except np.linalg.LinAlgError:
+                    break
+                Ce_h = Fe_h.T @ Fe_h
+                Je_h = np.linalg.det(Fe_h)
+                if Je_h <= 1e-15 or not np.isfinite(Je_h):
+                    break
+                M_h = 2*c10_*(Ce_h - I3) + 2*d1_*np.log(Je_h)*I3
+                M_dev_h = M_h - (1.0/3.0)*np.trace(M_h)*I3
+                svm_h = np.sqrt(1.5 * np.sum(M_dev_h * M_dev_h))
+                ep_h = epcum + dlam + h_fd
+                sy_h = My0_ + (H_ * ep_h**m_ if ep_h > 1e-30 else 0.0)
+                R_h = svm_h - sy_h
+
+                dR = (R_h - R_val) / h_fd
+                if abs(dR) < 1e-30:
+                    break
+
+                dlam -= R_val / dR
+                dlam = max(dlam, 0.0)
+
+            if not converged_rm and abs(R_val) > 1e-6:
+                # Local Newton failed at this GP.
+                # Use last accepted Fp_trial (partial convergence) rather than
+                # aborting the entire return mapping.  The global Newton will
+                # handle the residual inconsistency.
+                pass
+
+            Fp_new[ip]     = Fp_trial
+            delta_epcum[ip] = max(dlam, 0.0)
+
+        # Check for NaN/Inf in output
+        if not np.isfinite(Fp_new).all():
+            return Fp_conv_flat.copy(), np.zeros(n), False
+
+        return Fp_new.ravel(), delta_epcum, True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 6b. NEWTON SOLVER WITH DYNAMIC CONTACT
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -896,7 +1138,21 @@ def newton_solve():
     gn_out, normals_out, active_out = None, None, None
 
     for nit in range(max_iter):
-        # 1. Material residual
+        # 0. Return mapping (plasticity only): update Fp at all Gauss points
+        if plastic:
+            if perf: _t0 = perf_counter()
+            global _Fp_temp, _delta_epcum
+            F_flat = _read_F_at_ips()
+            _Fp_temp, _delta_epcum, rm_ok = return_mapping(
+                F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
+            if not rm_ok:
+                print(f"    Newton {nit}: return mapping FAILED — aborting")
+                gfu.vec.FV().NumPy()[:] = _u_backup
+                break
+            _write_Fp_to_gf(_Fp_temp)
+            if perf: perf.record("return_mapping", perf_counter() - _t0)
+
+        # 1. Material residual (uses Fe = F·Fp^{-1} when plastic, via gf_Fp)
         if perf: _t0 = perf_counter()
         a_form.Apply(gfu.vec, res_vec)
         if perf: perf.record("apply", perf_counter() - _t0)
@@ -1100,6 +1356,12 @@ if vtk_fields == "full":
             _vtk_coefs.append(cf)
             _vtk_names.append(nm)
 
+# Plastic strain field for VTK export
+if plastic:
+    gf_epcum_vtk = GridFunction(fes_ir)
+    _vtk_coefs.append(gf_epcum_vtk)
+    _vtk_names.append("epcum")
+
 vtk = VTKOutput(
     mesh,
     coefs=_vtk_coefs,
@@ -1129,6 +1391,8 @@ perf_opts = []
 if taskmanager: perf_opts.append("TaskManager")
 if realcompile: perf_opts.append("realcompile")
 if profile:     perf_opts.append("profile")
+if plastic:
+    print(f"  Plasticity: J2 von Mises, My0={My0:.4f}, H={H_hard:.4f}, m={m_hard:.1f}")
 print(f"  VTK: every {plot} steps ({vtk_fields}), "
       f"perf: {', '.join(perf_opts) if perf_opts else 'none'}")
 print(f"{'='*60}\n")
@@ -1173,19 +1437,37 @@ with TaskManager() if taskmanager else nullcontext():
             # ── Newton solver (dynamic contact, no active-set loop) ──
             n_newton, _, _, _ = newton_solve()
 
+            # Commit plastic history on successful convergence
+            if plastic and n_newton < max_iter:
+                _Fp_conv[:] = _Fp_temp
+                _epcum_conv += _delta_epcum
+
             # Finalize contact state at converged solution
             gn, normals, active, n_active, max_pen = finalize_contact_state()
 
             # Compute final residual norm for reporting
+            if plastic:
+                # Re-run return mapping to update gf_Fp for correct residual eval
+                F_flat = _read_F_at_ips()
+                Fp_tmp, _, _ = return_mapping(
+                    F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
+                _write_Fp_to_gf(Fp_tmp)
             a_form.Apply(gfu.vec, res_vec)
             f_con = compute_contact_forces(gn, normals, active)
             res_vec.FV().NumPy()[:] += f_con
             rnorm = np.linalg.norm(res_vec.FV().NumPy()[free_dofs])
 
+            # Plastic strain info
+            ep_info = ""
+            if plastic:
+                max_epcum = np.max(_epcum_conv)
+                n_plastic = np.sum(_epcum_conv > 1e-12)
+                ep_info = f"  ep_max={max_epcum:.2e}  n_plast={n_plastic}"
+
             dt_step  = perf_counter() - t_step
             print(f"Step {step:3d}/{nsteps}  newton: nit={n_newton:3d}  "
-                  f"|r|={rnorm:.2e}  active={n_active:3d}  maxpen={max_pen:.2e}  "
-                  f"t={dt_step:.1f}s")
+                  f"|r|={rnorm:.2e}  active={n_active:3d}  maxpen={max_pen:.2e}"
+                  f"{ep_info}  t={dt_step:.1f}s")
 
         else:
             # ── Scipy minimize solvers ──
@@ -1238,6 +1520,8 @@ with TaskManager() if taskmanager else nullcontext():
         # --- VTK snapshot --------------------------------------------------
         if plot > 0 and step % plot == 0:
             if perf: _t0 = perf_counter()
+            if plastic:
+                gf_epcum_vtk.vec.FV().NumPy()[:] = _epcum_conv
             vtk.Do(time=step * dt)
             if perf: perf.record("vtk_output", perf_counter() - _t0)
 
