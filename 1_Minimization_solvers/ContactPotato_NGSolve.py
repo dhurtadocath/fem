@@ -45,7 +45,7 @@ from PyClasses._contact_tr_multi_helpers import project_points_tr_multi_batch
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 30                # mesh density (n x n x n hex elements)
+n           = 15                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -972,7 +972,9 @@ def newton_solve():
             positions = _csr_pos_map[idx]  # (3, 3) array of CSR positions
             for a in range(3):
                 for b in range(3):
-                    vals_np[positions[a, b]] += K_con[a, b]
+                    pos = positions[a, b]
+                    if pos >= 0:
+                        vals_np[pos] += K_con[a, b]
         if perf: perf.record("contact_hess_asm", perf_counter() - _t0)
 
         # 8. Solve K·Δu = -r
@@ -997,7 +999,9 @@ def newton_solve():
             r_max = np.max(np.abs(r_np[free_dofs]))
             if r_max > 1e-30:
                 scale = 0.1 * h_contact / r_max
-                _w_vec.FV().NumPy()[:] = scale * r_np
+                w_np = _w_vec.FV().NumPy()
+                w_np[:] = 0
+                w_np[free_dofs] = scale * r_np[free_dofs]
             else:
                 break
 
@@ -1011,8 +1015,10 @@ def newton_solve():
             r_max = np.max(np.abs(r_np[free_dofs]))
             if r_max > 1e-30:
                 scale = 0.1 * h_contact / r_max
-                _w_vec.FV().NumPy()[:] = scale * r_np
-                w_free = _w_vec.FV().NumPy()[free_dofs]
+                w_np = _w_vec.FV().NumPy()
+                w_np[:] = 0
+                w_np[free_dofs] = scale * r_np[free_dofs]
+                w_free = w_np[free_dofs]
                 slope = -np.dot(r_np[free_dofs], w_free)
             else:
                 if perf: perf.record("linesearch", perf_counter() - _t0)
@@ -1039,7 +1045,9 @@ def newton_solve():
             r_max = np.max(np.abs(r_np[free_dofs]))
             if r_max > 1e-30:
                 scale = 0.01 * h_contact / r_max
-                _uh_vec.FV().NumPy()[:] = gfu.vec.FV().NumPy() - scale * r_np
+                uh_np = _uh_vec.FV().NumPy()
+                uh_np[:] = gfu.vec.FV().NumPy()
+                uh_np[free_dofs] -= scale * r_np[free_dofs]
                 gfu.vec.data = _uh_vec
 
     # Restore cache tolerance
