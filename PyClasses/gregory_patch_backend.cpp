@@ -1538,6 +1538,175 @@ Eigen::Matrix<double, 8, 1> m_el_extra(const Eigen::Matrix<double, 8, 3> &X_hexa
 }
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Batch contact evaluation: compute gap, normal, surface point (and optionally
+// dn/dx_s Hessian) for multiple slave nodes in ONE C++ call.
+// Eliminates per-node Python→C++ boundary crossing overhead.
+// ═══════════════════════════════════════════════════════════════════════════
+
+static inline Eigen::Matrix3d skew_mat(const Eigen::Vector3d &v) {
+    Eigen::Matrix3d S;
+    S <<     0, -v(2),  v(1),
+          v(2),     0, -v(0),
+         -v(1),  v(0),     0;
+    return S;
+}
+
+py::tuple batch_evaluate_contact(
+    const Eigen::MatrixXd &CtrlPtsAll,   // (npatches*20, 3)
+    py::array_t<int> patch_ids_arr,      // (npoints,)  -1 = no projection
+    py::array_t<double> t_params_arr,    // (npoints, 2)  parametric coords
+    const Eigen::MatrixXd &slave_pos,    // (npoints, 3)
+    double eps,
+    bool compute_hessian)
+{
+    const int rows_per_patch = 20;
+    int nPatches = static_cast<int>(CtrlPtsAll.rows() / rows_per_patch);
+    int nPoints = static_cast<int>(slave_pos.rows());
+
+    // Access input arrays
+    auto pid_buf = patch_ids_arr.request();
+    int *pid_ptr = static_cast<int*>(pid_buf.ptr);
+
+    auto tp_buf = t_params_arr.request();
+    double *tp_ptr = static_cast<double*>(tp_buf.ptr);
+
+    // Allocate output arrays
+    py::array_t<double> gaps_out({nPoints});
+    py::array_t<double> normals_out({nPoints, 3});
+    py::array_t<double> xc_out({nPoints, 3});
+    py::array_t<double> dndxs_out;
+    if (compute_hessian) {
+        dndxs_out = py::array_t<double>({nPoints, 3, 3});
+    } else {
+        dndxs_out = py::array_t<double>({0, 3, 3});
+    }
+
+    auto g_buf = gaps_out.request();
+    auto n_buf = normals_out.request();
+    auto xc_buf = xc_out.request();
+    double *g_ptr = static_cast<double*>(g_buf.ptr);
+    double *n_ptr = static_cast<double*>(n_buf.ptr);
+    double *xc_ptr = static_cast<double*>(xc_buf.ptr);
+    double *dndxs_ptr = nullptr;
+    if (compute_hessian) {
+        auto dndxs_buf = dndxs_out.request();
+        dndxs_ptr = static_cast<double*>(dndxs_buf.ptr);
+    }
+
+    // Initialize outputs
+    for (int i = 0; i < nPoints; ++i) {
+        g_ptr[i] = std::numeric_limits<double>::infinity();
+        n_ptr[3*i] = 0.0; n_ptr[3*i+1] = 0.0; n_ptr[3*i+2] = 0.0;
+        xc_ptr[3*i] = 0.0; xc_ptr[3*i+1] = 0.0; xc_ptr[3*i+2] = 0.0;
+    }
+    if (compute_hessian) {
+        for (int i = 0; i < nPoints * 9; ++i) dndxs_ptr[i] = 0.0;
+    }
+
+    // Process each point
+    for (int i = 0; i < nPoints; ++i) {
+        int pid = pid_ptr[i];
+        if (pid < 0 || pid >= nPatches) continue;
+
+        double u = tp_ptr[2*i];
+        double v = tp_ptr[2*i + 1];
+        Eigen::Vector3d xs = slave_pos.row(i);
+
+        // Extract control points for this patch (20×3 block)
+        Eigen::Matrix<double, 20, 3> CP = CtrlPtsAll.block(pid * rows_per_patch, 0, rows_per_patch, 3);
+
+        if (!compute_hessian) {
+            // Fast path: just point and normal
+            Eigen::Vector3d xc, nor;
+            point_and_normal_internal(CP, u, v, eps, xc, nor);
+            double gn = (xs - xc).dot(nor);
+
+            g_ptr[i] = gn;
+            xc_ptr[3*i] = xc(0); xc_ptr[3*i+1] = xc(1); xc_ptr[3*i+2] = xc(2);
+            n_ptr[3*i] = nor(0); n_ptr[3*i+1] = nor(1); n_ptr[3*i+2] = nor(2);
+        } else {
+            // Hessian path: second derivatives + dn/dx_s
+            GrgDerivs2Result d = Grg_derivs2_impl_generic(CP, u, v, eps);
+
+            // Normal from cross product of tangents
+            Eigen::Vector3d tau1 = d.D1p;
+            Eigen::Vector3d tau2 = d.D2p;
+            Eigen::Vector3d N = tau1.cross(tau2);
+            double normN = N.norm();
+            if (normN < 1e-30) continue;  // degenerate — skip
+            Eigen::Vector3d nor = N / normN;
+
+            // Gap
+            Eigen::Vector3d delta = xs - d.p;
+            double gn = delta.dot(nor);
+
+            // Store basic results
+            g_ptr[i] = gn;
+            xc_ptr[3*i] = d.p(0); xc_ptr[3*i+1] = d.p(1); xc_ptr[3*i+2] = d.p(2);
+            n_ptr[3*i] = nor(0); n_ptr[3*i+1] = nor(1); n_ptr[3*i+2] = nor(2);
+
+            // --- Compute dn/dx_s via implicit function theorem ---
+            // dxcdt = [D1p, D2p] shape (3,2)
+            Eigen::Matrix<double, 3, 2> dxcdt;
+            dxcdt.col(0) = d.D1p;
+            dxcdt.col(1) = d.D2p;
+
+            // dfdt = -2 * delta · d2xcd2t + 2 * dxcdt^T * dxcdt  (2×2)
+            Eigen::Matrix2d delta_dot_d2xc;
+            delta_dot_d2xc(0, 0) = delta.dot(d.D1D1p);
+            delta_dot_d2xc(0, 1) = delta.dot(d.D1D2p);
+            delta_dot_d2xc(1, 0) = delta.dot(d.D1D2p);
+            delta_dot_d2xc(1, 1) = delta.dot(d.D2D2p);
+
+            Eigen::Matrix2d dfdt = -2.0 * delta_dot_d2xc + 2.0 * (dxcdt.transpose() * dxcdt);
+
+            // Check if dfdt is invertible
+            double det_dfdt = dfdt.determinant();
+            if (std::abs(det_dfdt) < 1e-30) continue;  // singular — skip Hessian
+
+            // dfdxs = -2 * dxcdt^T  (2×3)
+            Eigen::Matrix<double, 2, 3> dfdxs = -2.0 * dxcdt.transpose();
+
+            // dtdxs = (-dfdt)^{-1} * dfdxs  (2×3)
+            Eigen::Matrix<double, 2, 3> dtdxs = (-dfdt).inverse() * dfdxs;
+
+            // --- Compute dn/dt using chain rule ---
+            // dtau1/dt = [D1D1p, D1D2p] (3×2)
+            // dtau2/dt = [D1D2p, D2D2p] (3×2)
+            Eigen::Matrix<double, 3, 2> dtau1dt, dtau2dt;
+            dtau1dt.col(0) = d.D1D1p;
+            dtau1dt.col(1) = d.D1D2p;
+            dtau2dt.col(0) = d.D1D2p;
+            dtau2dt.col(1) = d.D2D2p;
+
+            // dndN = (I - n⊗n) / |N|
+            Eigen::Matrix3d dndN = (Eigen::Matrix3d::Identity() - nor * nor.transpose()) / normN;
+
+            // dN/dtau1 = -skew(tau2), dN/dtau2 = skew(tau1)
+            Eigen::Matrix3d dNdtau1 = -skew_mat(tau2);
+            Eigen::Matrix3d dNdtau2 = skew_mat(tau1);
+
+            // dN/dt = dN/dtau1 · dtau1/dt + dN/dtau2 · dtau2/dt  (3×2)
+            Eigen::Matrix<double, 3, 2> dNdt = dNdtau1 * dtau1dt + dNdtau2 * dtau2dt;
+
+            // dn/dt = dndN · dN/dt  (3×2)
+            Eigen::Matrix<double, 3, 2> dndt = dndN * dNdt;
+
+            // dn/dx_s = dn/dt · dt/dx_s  (3×2 · 2×3 = 3×3)
+            Eigen::Matrix3d dndxs = dndt * dtdxs;
+
+            // Store Hessian result (row-major: dndxs[a][b] at offset 9*i + 3*a + b)
+            for (int a = 0; a < 3; ++a)
+                for (int b = 0; b < 3; ++b)
+                    dndxs_ptr[9*i + 3*a + b] = dndxs(a, b);
+        }
+    }
+
+    return py::make_tuple(gaps_out, normals_out, xc_out, dndxs_out);
+}
+
+
 PYBIND11_MODULE(gregory_patch_backend, m) {
     m.doc() = "C++ backend for Gregory patch calculations and BoundingSphere operations";
     m.def("Grg", &Grg, "A function that calculates a point on a Gregory patch");
@@ -1558,4 +1727,8 @@ PYBIND11_MODULE(gregory_patch_backend, m) {
     m.def("ContainsNode", &ContainsNode, "Check if a point is contained within a bounding sphere");
     m.def("ContainsNodes", &ContainsNodes, "Vectorized check if multiple points are contained within a bounding sphere");
     m.def("m_el_extra", &m_el_extra, "Compute strain energy density at nodes for hyperelastic material");
+    m.def("batch_evaluate_contact", &batch_evaluate_contact,
+          "Batch evaluate contact gap, normal, surface point (and optionally dn/dxs) for multiple slave nodes",
+          py::arg("CtrlPtsAll"), py::arg("patch_ids"), py::arg("t_params"),
+          py::arg("slave_pos"), py::arg("eps"), py::arg("compute_hessian") = false);
 }

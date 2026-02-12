@@ -45,7 +45,7 @@ from PyClasses._contact_tr_multi_helpers import project_points_tr_multi_batch
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 10                # mesh density (n x n x n hex elements)
+n           = 30                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -71,7 +71,8 @@ vtk_fields  = "minimal"    # "minimal" | "standard" | "full" (see Section 7)
 # Performance
 taskmanager = "auto"       # True/False/"auto" — auto enables for n >= 30 (27k+ elements)
 realcompile = "auto"       # True/False/"auto" — auto enables for nsteps >= 20
-profile     = False         # built-in per-operation timing (prints breakdown per step)
+profile     = False        # built-in per-operation timing (prints breakdown per step)
+linear_solver = "pardiso"  # "umfpack" | "pardiso" | "mumps" — direct solver for Newton
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Profiling instrumentation ────────────────────────────────────────────────
@@ -440,19 +441,20 @@ class ContactCache:
             disp = np.linalg.norm(slave_pos - self.prev_pos, axis=1)
             can_reuse = disp < self.tol_reuse
 
-            if perf: _t0 = perf_counter()
-            for i in np.where(can_reuse)[0]:
-                pid = self.patch_ids[i]
-                if pid < 0:
-                    continue
-                t = self.params[i]
-                gn[i], normals[i], dndxs = _evaluate_projection(
-                    patches[pid], t, slave_pos[i], compute_hessian=compute_hessian
-                )
-                if compute_hessian and dndxs is not None:
-                    dndxs_all[i] = dndxs
-                need_full[i] = False
-            if perf: perf.record("contact_cached", perf_counter() - _t0)
+            # Batch C++ evaluation for cached nodes (single pybind11 dispatch)
+            idx_reuse = np.where(can_reuse)[0]
+            if idx_reuse.size > 0:
+                if perf: _t0 = perf_counter()
+                g_r, n_r, _, dndxs_r = gb.batch_evaluate_contact(
+                    ctrlpts_all, self.patch_ids[idx_reuse].astype(np.int32),
+                    self.params[idx_reuse], slave_pos[idx_reuse],
+                    eps, compute_hessian)
+                gn[idx_reuse] = g_r
+                normals[idx_reuse] = n_r
+                if compute_hessian and dndxs_r.size > 0:
+                    dndxs_all[idx_reuse] = dndxs_r
+                need_full[idx_reuse] = False
+                if perf: perf.record("contact_cached", perf_counter() - _t0)
 
         # Full TR projection for nodes that need it (batch C++ with OpenMP)
         idx_full = np.where(need_full)[0]
@@ -470,27 +472,24 @@ class ContactCache:
                 MAX_NCAND, RADIUS_FACTOR, K_SURF,
             )
 
-            # Scatter batch results back
-            for j, i in enumerate(idx_full):
-                pid = int(pids_b[j])
-                gn[i] = gn_b[j]
-                normals[i] = nor_b[j]
-                self.patch_ids[i] = pid
-                if pid >= 0:
-                    self.params[i] = [t1_b[j], t2_b[j]]
+            # Scatter batch results back (vectorized where possible)
+            gn[idx_full] = gn_b
+            normals[idx_full] = nor_b
+            self.patch_ids[idx_full] = pids_b.astype(np.int32)
+            valid = pids_b >= 0
+            if np.any(valid):
+                idx_valid = idx_full[valid]
+                self.params[idx_valid, 0] = t1_b[valid]
+                self.params[idx_valid, 1] = t2_b[valid]
 
-            # Compute Hessian data from known (patch, params) if needed
+            # Batch C++ Hessian computation from known (patch, params)
             if compute_hessian:
-                for j, i in enumerate(idx_full):
-                    pid = int(pids_b[j])
-                    if pid < 0:
-                        continue
-                    t = np.array([t1_b[j], t2_b[j]], dtype=np.float64)
-                    _, _, dndxs_i = _evaluate_projection(
-                        patches[pid], t, slave_pos[i], compute_hessian=True
-                    )
-                    if dndxs_i is not None:
-                        dndxs_all[i] = dndxs_i
+                params_full = np.column_stack([t1_b, t2_b])
+                _, _, _, dndxs_b = gb.batch_evaluate_contact(
+                    ctrlpts_all, pids_b.astype(np.int32), params_full,
+                    pos_full, eps, True)
+                if dndxs_b.size > 0:
+                    dndxs_all[idx_full] = dndxs_b
             if perf: perf.record("contact_full_tr", perf_counter() - _t0)
 
         self.prev_pos = slave_pos.copy()
@@ -758,7 +757,46 @@ def compute_contact_hessian(g, nor, dndxs=None):
 
 _w_vec = gfu.vec.CreateVector()   # scratch for Newton direction
 _uh_vec = gfu.vec.CreateVector()  # scratch for linesearch trial
-_cached_inv = None                # UMFPACK inverse (symbolic reuse via .Update())
+_cached_inv = None                # Direct solver inverse (symbolic reuse via .Update() when supported)
+# Solvers supporting .Update() (numeric refactorization only, reuses symbolic):
+#   umfpack, sparsecholesky
+# Solvers NOT supporting .Update() (must recreate each time):
+#   pardiso, mumps
+_inv_supports_update = linear_solver in ("umfpack", "sparsecholesky")
+
+# CSR position map for contact Hessian assembly (lazy-init on first use).
+# Maps each slave vertex's 3×3 DOF block to positions in the sparse matrix
+# CSR value array, enabling direct numpy += instead of 9 mat[i,j] accesses.
+_csr_pos_map = None     # ndarray (n_slave, 3, 3) of CSR value indices
+
+
+def _build_csr_pos_map():
+    """Build CSR position map for slave vertex DOF blocks.
+
+    Called once (lazy) after the first AssembleLinearization.
+    Maps (slave_idx, a, b) → position in CSR values array where
+    mat[slave_dofs[a], slave_dofs[b]] is stored.
+    """
+    global _csr_pos_map
+    mat = a_form.mat
+    _, cols_fv, firsti_fv = mat.CSR()
+    cols = np.array(cols_fv, copy=False)
+    firsti = np.array(firsti_fv, copy=False)
+    n_slave = len(slave_verts)
+    _csr_pos_map = np.full((n_slave, 3, 3), -1, dtype=np.int64)
+    for si in range(n_slave):
+        v = int(slave_verts[si])
+        dofs = [v, v + nv, v + 2*nv]
+        for a in range(3):
+            row = dofs[a]
+            row_start = int(firsti[row])
+            row_end = int(firsti[row + 1])
+            row_cols = cols[row_start:row_end]
+            for b in range(3):
+                col = dofs[b]
+                pos = np.searchsorted(row_cols, col)
+                if pos < len(row_cols) and row_cols[pos] == col:
+                    _csr_pos_map[si, a, b] = row_start + pos
 
 # Precomputed surface data for vectorized linesearch energy evaluation.
 # Populated once per Newton iteration in newton_solve(); used by _linesearch_energy().
@@ -773,27 +811,22 @@ def _precompute_ls_data():
     """Precompute surface points and normals for vectorized linesearch energy.
 
     Called once per Newton iteration after contact_cache.evaluate().
-    Since projections are locked (tol_reuse=inf), the surface geometry at
-    each cached (patch, params) doesn't change during linesearch — only the
-    slave positions change.  Precomputing xc and nor here allows the
-    linesearch energy to use fully vectorized numpy instead of a per-node
-    Python loop with C++ calls.
+    Uses batch C++ call (gb.batch_evaluate_contact) to evaluate all nodes
+    in a single pybind11 dispatch, eliminating per-node Python→C++ overhead.
     """
     global _ls_xc, _ls_nor, _ls_valid
     n_slave = len(slave_verts)
-    _ls_xc    = np.zeros((n_slave, 3))
-    _ls_nor   = np.zeros((n_slave, 3))
-    _ls_valid = np.zeros(n_slave, dtype=bool)
     if contact_cache.patch_ids is None:
+        _ls_xc    = np.zeros((n_slave, 3))
+        _ls_nor   = np.zeros((n_slave, 3))
+        _ls_valid = np.zeros(n_slave, dtype=bool)
         return
-    for i in range(n_slave):
-        pid = int(contact_cache.patch_ids[i])
-        if pid < 0:
-            continue
-        t = contact_cache.params[i]
-        _ls_xc[i] = patches[pid].Grg(t, deriv=0)
-        _ls_nor[i] = patches[pid].D3Grg(t)
-        _ls_valid[i] = True
+    # Dummy slave_pos (gaps are not used, we just need xc and nor)
+    dummy_pos = np.zeros((n_slave, 3))
+    _, _ls_nor, _ls_xc, _ = gb.batch_evaluate_contact(
+        ctrlpts_all, contact_cache.patch_ids.astype(np.int32),
+        contact_cache.params, dummy_pos, eps, False)
+    _ls_valid = contact_cache.patch_ids >= 0
 
 
 def _linesearch_energy(u_vec):
@@ -858,6 +891,7 @@ def newton_solve():
     contact_cache.tol_reuse = np.inf
 
     rnorm_prev = np.inf
+    rnorm_initial = np.inf
     stag_count = 0
     gn_out, normals_out, active_out = None, None, None
 
@@ -903,16 +937,23 @@ def newton_solve():
 
         # 4. Convergence check
         rnorm = np.linalg.norm(r_np[free_dofs])
+        if nit == 0:
+            rnorm_initial = rnorm
         if rnorm < newton_gtol:
             break
 
-        # 5. Stagnation detection (5% decrease over 5 iterations)
-        if rnorm > 0.95 * rnorm_prev:
-            stag_count += 1
-            if stag_count >= 5:
-                break
-        else:
-            stag_count = 0
+        # 5. Stagnation detection
+        #    Require at least 10 iterations AND significant residual reduction
+        #    before declaring stagnation.  In contact problems, Newton can have
+        #    slow initial convergence as the active set settles — premature
+        #    stagnation exit wastes the entire load step.
+        if nit >= 10 and rnorm < 1e-2 * rnorm_initial:
+            if rnorm > 0.95 * rnorm_prev:
+                stag_count += 1
+                if stag_count >= 5:
+                    break
+            else:
+                stag_count = 0
         rnorm_prev = rnorm
 
         # 6. Material tangent
@@ -921,25 +962,28 @@ def newton_solve():
         if perf: perf.record("assemble_lin", perf_counter() - _t0)
 
         # 7. Add contact Hessian: K_con = kn * (n⊗n + g·dn/dx_s)
+        #    Uses CSR direct write: position map built once, then numpy +=
         if perf: _t0 = perf_counter()
+        if _csr_pos_map is None:
+            _build_csr_pos_map()
         mat = a_form.mat
+        vals_np = np.array(mat.CSR()[0], copy=False)
         for idx, g, nor, K_con in pen_data:
-            v = int(slave_verts[idx])
-            dofs = [v, v + nv, v + 2*nv]
+            positions = _csr_pos_map[idx]  # (3, 3) array of CSR positions
             for a in range(3):
                 for b in range(3):
-                    mat[dofs[a], dofs[b]] = mat[dofs[a], dofs[b]] + K_con[a, b]
+                    vals_np[positions[a, b]] += K_con[a, b]
         if perf: perf.record("contact_hess_asm", perf_counter() - _t0)
 
-        # 8. Solve K·Δu = -r (reuse symbolic factorization via .Update())
+        # 8. Solve K·Δu = -r
         if perf: _t0 = perf_counter()
         global _cached_inv
         solve_ok = False
         try:
-            if _cached_inv is None:
-                _cached_inv = mat.Inverse(fes.FreeDofs(), inverse="umfpack")
-            else:
+            if _inv_supports_update and _cached_inv is not None:
                 _cached_inv.Update()
+            else:
+                _cached_inv = mat.Inverse(fes.FreeDofs(), inverse=linear_solver)
             _w_vec.data = _cached_inv * res_vec
             if np.isfinite(_w_vec.FV().NumPy()).all():
                 solve_ok = True
@@ -947,7 +991,7 @@ def newton_solve():
                 _cached_inv = None  # invalidate on NaN
         except Exception:
             _cached_inv = None  # invalidate on failure
-        if perf: perf.record("umfpack_solve", perf_counter() - _t0)
+        if perf: perf.record("linear_solve", perf_counter() - _t0)
 
         if not solve_ok:
             r_max = np.max(np.abs(r_np[free_dofs]))
@@ -989,6 +1033,14 @@ def newton_solve():
 
         if accepted:
             gfu.vec.data = _uh_vec
+        else:
+            # Linesearch failed — take a small gradient step to avoid
+            # stagnation from repeating the same solution.
+            r_max = np.max(np.abs(r_np[free_dofs]))
+            if r_max > 1e-30:
+                scale = 0.01 * h_contact / r_max
+                _uh_vec.FV().NumPy()[:] = gfu.vec.FV().NumPy() - scale * r_np
+                gfu.vec.data = _uh_vec
 
     # Restore cache tolerance
     contact_cache.tol_reuse = saved_tol
@@ -1059,7 +1111,7 @@ print(f"\n{'='*60}")
 print(f"  ContactPotato NGSolve — mesh {n}x{n}x{n}")
 print(f"  E={E_val}, nu={nu_val}, kn={kn:.4f}")
 if solver == "newton":
-    print(f"  {nsteps} steps, solver=newton, max_iter={max_iter}, gtol={gtol:.0e}")
+    print(f"  {nsteps} steps, solver=newton, max_iter={max_iter}, gtol={gtol:.0e}, linear={linear_solver}")
 elif solver in ("newton-cg", "trust-constr"):
     hess_type = "full (with curvature)" if full_hessian else "simple (n⊗n)"
     print(f"  {nsteps} steps, solver={solver}, max_iter={max_iter}, gtol={gtol:.0e}, hess={hess_type}")
