@@ -75,11 +75,13 @@ profile     = False        # built-in per-operation timing (prints breakdown per
 linear_solver = "pardiso"  # "umfpack" | "pardiso" | "mumps" — direct solver for Newton
 
 # Plasticity (J2 von Mises, multiplicative decomposition F = Fe·Fp)
-plastic       = False                  # enable elastoplastic constitutive model
+plastic       = True                 # enable elastoplastic constitutive model
 plastic_param = [0.01, 0.05, 1.0]     # [My0, H_hard, m_hard]
 # My0     = initial yield stress
 # H_hard  = hardening modulus
 # m_hard  = hardening exponent (1.0 = linear hardening)
+consistent_tangent = False   # FD-based algorithmic tangent correction for yielding GPs
+                              # Marginal benefit with contact; can destabilize at large steps
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Profiling instrumentation ────────────────────────────────────────────────
@@ -192,7 +194,7 @@ if plastic:
     _Fp_conv   = np.tile(np.eye(3).ravel(), n_ip)   # (n_ip*9,) flattened
     _epcum_conv = np.zeros(n_ip)                     # cumulative plastic strain per GP
 
-    # Working arrays (recomputed each Newton iteration by return mapping)
+    # Working arrays (recomputed by return mapping at each Newton iteration)
     _Fp_temp     = _Fp_conv.copy()
     _delta_epcum = np.zeros(n_ip)
 
@@ -207,6 +209,100 @@ if plastic:
 
     print(f"  Plasticity IRS: {n_ip} integration points "
           f"({n_ip // mesh.ne} per element)")
+
+    # --- Consistent tangent infrastructure (element-level data) --------
+    _gps_per_elem = n_ip // mesh.ne   # should be 8 for order=1 hex
+
+    # Element connectivity: vertex numbers for each element
+    _elem_verts = np.array(
+        [[v.nr for v in el.vertices] for el in mesh.Elements(VOL)],
+        dtype=np.int32)  # (n_elem, 8)
+
+    # Shape function gradients at all GPs (constant in total Lagrangian).
+    # For the uniform structured hex mesh, J = diag(h, h, h) for all elements,
+    # so dN/dX = dN/dξ / h and detJ = h^3.  We still compute per-element
+    # for generality (handles non-uniform meshes without code change).
+    #
+    # GP positions in [0,1]^3 reference element (2-point Gauss-Legendre per axis):
+    _gp_lo = 0.5 - 0.5 / np.sqrt(3.0)   # ≈ 0.211325
+    _gp_hi = 0.5 + 0.5 / np.sqrt(3.0)   # ≈ 0.788675
+    _gp_1d = np.array([_gp_lo, _gp_hi])
+    # All 8 GP positions: ordered as NGSolve IRS (verified: ξ fastest, then η, then ζ)
+    _gp_ref = np.array([[xi, eta, zeta]
+                         for zeta in _gp_1d for eta in _gp_1d for xi in _gp_1d])
+    _gp_weight = 0.125   # = 0.5^3 (product rule on [0,1]^3)
+
+    def _hex8_dNdxi(xi, eta, zeta):
+        """Parametric gradients of 8-node hex shape functions in [0,1]^3.
+
+        Vertex ordering matches NGSolve MakeStructured3DMesh(hexes=True):
+          0: (0,0,0)  1: (0,0,1)  2: (0,1,1)  3: (0,1,0)
+          4: (1,0,0)  5: (1,0,1)  6: (1,1,1)  7: (1,1,0)
+        Returns (8, 3) array: dN_I/dξ_j.
+        """
+        x, y, z = xi, eta, zeta
+        return np.array([
+            [-(1-y)*(1-z), -(1-x)*(1-z), -(1-x)*(1-y)],  # N0 = (1-x)(1-y)(1-z)
+            [-(1-y)*z,     -(1-x)*z,       (1-x)*(1-y)],  # N1 = (1-x)(1-y)(z)
+            [-(y)*z,        (1-x)*z,        (1-x)*(y)  ],  # N2 = (1-x)(y)(z)
+            [-(y)*(1-z),    (1-x)*(1-z),   -(1-x)*(y)  ],  # N3 = (1-x)(y)(1-z)
+            [ (1-y)*(1-z), -(x)*(1-z),     -(x)*(1-y)  ],  # N4 = (x)(1-y)(1-z)
+            [ (1-y)*z,     -(x)*z,          (x)*(1-y)  ],  # N5 = (x)(1-y)(z)
+            [ (y)*z,        (x)*z,          (x)*(y)    ],  # N6 = (x)(y)(z)
+            [ (y)*(1-z),    (x)*(1-z),     -(x)*(y)    ],  # N7 = (x)(y)(1-z)
+        ])
+
+    # Precompute dN/dX and detJ at all (element, GP) pairs
+    _all_dNdX = np.zeros((mesh.ne, _gps_per_elem, 8, 3))
+    _all_detJ = np.zeros((mesh.ne, _gps_per_elem))
+    _X_ref_local = np.array([list(mesh.vertices[i].point) for i in range(mesh.nv)])
+
+    for e in range(mesh.ne):
+        verts = _elem_verts[e]
+        X_el = _X_ref_local[verts]   # (8, 3) physical coords of element vertices
+        for ig in range(_gps_per_elem):
+            xi, eta, zeta = _gp_ref[ig]
+            dNdxi = _hex8_dNdxi(xi, eta, zeta)   # (8, 3)
+            Jac = dNdxi.T @ X_el                  # (3, 3) = dX/dξ
+            detJ = np.linalg.det(Jac)
+            invJT = np.linalg.inv(Jac).T
+            _all_dNdX[e, ig] = dNdxi @ invJT      # (8, 3) = dN/dX
+            _all_detJ[e, ig] = detJ
+
+    # Element CSR position map: built lazily after first AssembleLinearization
+    _elem_csr_pos_plastic = None
+
+    def _build_elem_csr_pos_plastic():
+        """Build element-level CSR position map for consistent tangent assembly.
+
+        Maps (element, local_dof_i, local_dof_j) → CSR value index.
+        Local DOFs are in block order: [v0..v7, v0+nv..v7+nv, v0+2nv..v7+2nv].
+        """
+        global _elem_csr_pos_plastic
+        mat = a_form.mat
+        _, cols_fv, firsti_fv = mat.CSR()
+        cols = np.array(cols_fv, copy=False)
+        firsti = np.array(firsti_fv, copy=False)
+        ne = mesh.ne
+        _elem_csr_pos_plastic = np.full((ne, 24, 24), -1, dtype=np.int64)
+        for e in range(ne):
+            verts = _elem_verts[e]
+            # 24 global DOFs in block order: [x-comp(8), y-comp(8), z-comp(8)]
+            global_dofs = np.concatenate([verts, verts + nv, verts + 2*nv])
+            for ii in range(24):
+                row = int(global_dofs[ii])
+                row_start = int(firsti[row])
+                row_end = int(firsti[row + 1])
+                row_cols = cols[row_start:row_end]
+                for jj in range(24):
+                    col = int(global_dofs[jj])
+                    pos = np.searchsorted(row_cols, col)
+                    if pos < len(row_cols) and row_cols[pos] == col:
+                        _elem_csr_pos_plastic[e, ii, jj] = row_start + pos
+
+    # Cache for F_flat during Newton iteration (set by return mapping, used by tangent)
+    _F_flat_cache = None
+
 else:
     J_sym  = Det(F_sym)
     I1_sym = Trace(F_sym.trans * F_sym)
@@ -940,6 +1036,169 @@ if plastic:
         return Fp_new.ravel(), delta_epcum, True
 
 
+    # ── Consistent tangent correction (FD-based, per yielding GP) ────────
+    _I3 = np.eye(3)
+
+    def _rm_single_gp(F, Fp_old, epcum, c10_, d1_, My0_, H_, m_):
+        """Single-GP return mapping. Returns (Fp_new, dlam).
+
+        Lightweight version of return_mapping() for FD tangent perturbations.
+        Same algorithm: trial predictor, J2 yield check, exponential map update.
+        """
+        I3 = _I3
+        Fp_inv = np.linalg.inv(Fp_old)
+        Fe = F @ Fp_inv
+        Ce = Fe.T @ Fe
+        Je = np.linalg.det(Fe)
+        if Je <= 1e-15:
+            return Fp_old.copy(), 0.0
+
+        M = 2*c10_*(Ce - I3) + 2*d1_*np.log(Je)*I3
+        M_dev = M - np.trace(M)/3.0 * I3
+        svm = np.sqrt(1.5 * np.sum(M_dev * M_dev))
+        sy = My0_ + (H_ * epcum**m_ if epcum > 1e-30 else 0.0)
+        if svm <= sy:
+            return Fp_old.copy(), 0.0
+
+        N_flow = 1.5 * M_dev / svm
+        eigvals_N, V_N = np.linalg.eigh(N_flow)
+
+        dlam = 1e-8
+        Fp_trial = Fp_old.copy()
+        for _ in range(50):
+            exp_diag = np.exp(dlam * eigvals_N)
+            Fp_trial = (V_N * exp_diag) @ V_N.T @ Fp_old
+            det_Fp = np.linalg.det(Fp_trial)
+            if abs(det_Fp) < 1e-15:
+                break
+            Fe_n = F @ np.linalg.inv(Fp_trial)
+            Ce_n = Fe_n.T @ Fe_n
+            Je_n = np.linalg.det(Fe_n)
+            if Je_n <= 1e-15 or not np.isfinite(Je_n):
+                break
+            M_n = 2*c10_*(Ce_n - I3) + 2*d1_*np.log(Je_n)*I3
+            M_dev_n = M_n - np.trace(M_n)/3.0 * I3
+            svm_n = np.sqrt(1.5 * np.sum(M_dev_n * M_dev_n))
+            ep_t = epcum + dlam
+            sy_n = My0_ + (H_ * ep_t**m_ if ep_t > 1e-30 else 0.0)
+            R = svm_n - sy_n
+            if abs(R) < 1e-12:
+                break
+            h_fd = max(1e-10, abs(dlam) * 1e-6)
+            exp_h = np.exp((dlam + h_fd) * eigvals_N)
+            Fp_h = (V_N * exp_h) @ V_N.T @ Fp_old
+            if abs(np.linalg.det(Fp_h)) < 1e-15:
+                break
+            Fe_h = F @ np.linalg.inv(Fp_h)
+            Je_h = np.linalg.det(Fe_h)
+            if Je_h <= 1e-15 or not np.isfinite(Je_h):
+                break
+            Ce_h = Fe_h.T @ Fe_h
+            M_h = 2*c10_*(Ce_h - I3) + 2*d1_*np.log(Je_h)*I3
+            M_dev_h = M_h - np.trace(M_h)/3.0 * I3
+            svm_h = np.sqrt(1.5 * np.sum(M_dev_h * M_dev_h))
+            ep_h = epcum + dlam + h_fd
+            R_h = svm_h - (My0_ + (H_ * ep_h**m_ if ep_h > 1e-30 else 0.0))
+            dR = (R_h - R) / h_fd
+            if abs(dR) < 1e-30:
+                break
+            dlam -= R / dR
+            dlam = max(dlam, 0.0)
+        return Fp_trial, max(dlam, 0.0)
+
+    def _compute_P_at_gp(F, Fp_new, c10_, d1_):
+        """First Piola-Kirchhoff stress P = Pe · Fp^{-T} at one GP."""
+        Fp_inv = np.linalg.inv(Fp_new)
+        Fe = F @ Fp_inv
+        Je = np.linalg.det(Fe)
+        if Je <= 1e-15:
+            return None
+        invFeT = np.linalg.inv(Fe).T
+        lnJe = np.log(Je)
+        Pe = 2*c10_*(Fe - invFeT) + 2*d1_*lnJe*invFeT
+        return Pe @ Fp_inv.T
+
+    def _add_plastic_tangent_correction():
+        """Add consistent tangent correction for all yielding GPs.
+
+        For each yielding GP, computes the correction ΔCxx = Cxx_full - Cxx_elastic
+        via finite differences, where:
+        - Cxx_full[i,A,j,B]:    (P(F+h*e_jB, Fp_new(F+h*e_jB)) - P0) / h
+        - Cxx_elastic[i,A,j,B]: (P(F+h*e_jB, Fp_new_frozen)    - P0) / h
+
+        Both are FD-based to avoid any analytical/symbolic mismatch with NGSolve's
+        AssembleLinearization. The elastic parts cancel exactly in the subtraction:
+            dCxx[:,:,j,B] = (P_full_pert - P_elastic_pert) / h
+
+        Cost: 9 return-mapping + 18 stress evaluations per yielding GP.
+        """
+        global _elem_csr_pos_plastic
+
+        if _elem_csr_pos_plastic is None:
+            _build_elem_csr_pos_plastic()
+
+        vals_np = np.array(a_form.mat.CSR()[0], copy=False)
+
+        F_all = _F_flat_cache.reshape(n_ip, 3, 3)
+        Fp_old_all = _Fp_conv.reshape(n_ip, 3, 3)
+        Fp_new_all = _Fp_temp.reshape(n_ip, 3, 3)
+
+        for ip in range(n_ip):
+            dlam = _delta_epcum[ip]
+            if dlam <= 0:
+                continue
+
+            e  = ip // _gps_per_elem
+            ig = ip %  _gps_per_elem
+
+            F      = F_all[ip]
+            Fp_old = Fp_old_all[ip]
+            Fp_new = Fp_new_all[ip]
+            epcum  = _epcum_conv[ip]
+
+            h = max(1e-7, np.linalg.norm(F) * 1e-7)
+            dCxx = np.zeros((3, 3, 3, 3))
+            skip = False
+
+            for j in range(3):
+                for B in range(3):
+                    F_pert = F.copy()
+                    F_pert[j, B] += h
+
+                    # Full tangent: run return mapping at perturbed F
+                    Fp_pert, _ = _rm_single_gp(
+                        F_pert, Fp_old, epcum, c10, d1, My0, H_hard, m_hard)
+                    P_full = _compute_P_at_gp(F_pert, Fp_pert, c10, d1)
+                    if P_full is None:
+                        skip = True; break
+
+                    # Elastic tangent: Fp frozen at current Fp_new
+                    P_elastic = _compute_P_at_gp(F_pert, Fp_new, c10, d1)
+                    if P_elastic is None:
+                        skip = True; break
+
+                    # Correction: the (P0 - P0) base terms cancel exactly
+                    dCxx[:, :, j, B] = (P_full - P_elastic) / h
+                if skip:
+                    break
+            if skip:
+                continue
+
+            # Assembly: ΔK[(I,a),(J,b)] = w*detJ * Σ_{k,l} dNdX[I,k] * dCxx[a,k,b,l] * dNdX[J,l]
+            dNdX = _all_dNdX[e, ig]
+            w_detJ = _gp_weight * _all_detJ[e, ig]
+
+            temp = np.einsum('Ik,akbl->Iabl', dNdX, dCxx)
+            dK_4d = np.einsum('Iabl,Jl->IaJb', temp, dNdX)
+
+            # Block DOF order: dK_4d[I,a,J,b] → dK[a*8+I, b*8+J]
+            dK = w_detJ * dK_4d.transpose(1, 0, 3, 2).reshape(24, 24)
+
+            pos_map = _elem_csr_pos_plastic[e]
+            mask = pos_map >= 0
+            vals_np[pos_map[mask]] += dK[mask]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 6b. NEWTON SOLVER WITH DYNAMIC CONTACT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1138,11 +1397,17 @@ def newton_solve():
     gn_out, normals_out, active_out = None, None, None
 
     for nit in range(max_iter):
-        # 0. Return mapping (plasticity only): update Fp at all Gauss points
+        # 0. Return mapping (plasticity only): recompute Fp at all Gauss points
+        #    from the committed Fp_conv, given the current displacement estimate.
+        #    This matches the paper: "every time u changes, the plastic variables
+        #    are recomputed exactly" (monolithic displacement-driven approach).
+        #    AssembleLinearization gives the elastic tangent (frozen Fp); the
+        #    plastic correction is added afterwards by _add_plastic_tangent_correction.
         if plastic:
             if perf: _t0 = perf_counter()
-            global _Fp_temp, _delta_epcum
+            global _Fp_temp, _delta_epcum, _F_flat_cache
             F_flat = _read_F_at_ips()
+            _F_flat_cache = F_flat  # cache for tangent correction
             _Fp_temp, _delta_epcum, rm_ok = return_mapping(
                 F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
             if not rm_ok:
@@ -1216,6 +1481,15 @@ def newton_solve():
         if perf: _t0 = perf_counter()
         a_form.AssembleLinearization(gfu.vec)
         if perf: perf.record("assemble_lin", perf_counter() - _t0)
+
+        # 6b. Plastic consistent tangent correction (yielding GPs only)
+        #     Adds the rank-1 correction ΔK[ia,jb] = B[ia]·D[jb] per GP
+        #     that accounts for dFp/dF.  B is analytical (exact), D is FD-based
+        #     (exact: captures full dN/dF chain via return-mapping perturbation).
+        if plastic and consistent_tangent and np.any(_delta_epcum > 0):
+            if perf: _t0 = perf_counter()
+            _add_plastic_tangent_correction()
+            if perf: perf.record("plastic_tangent", perf_counter() - _t0)
 
         # 7. Add contact Hessian: K_con = kn * (n⊗n + g·dn/dx_s)
         #    Uses CSR direct write: position map built once, then numpy +=
@@ -1356,9 +1630,17 @@ if vtk_fields == "full":
             _vtk_coefs.append(cf)
             _vtk_names.append(nm)
 
-# Plastic strain field for VTK export
+# Plastic strain field for VTK export — mass-matrix L2 projection from IRS to H1
+# (IRS GridFunctions are only defined at Gauss points, not at VTK nodes).
+# Pattern from NGSolve i-tutorial unit-6.3-plasticity/plasticity.ipynb:
+#   M_draw * u_draw = integral(gf_irs * v_draw * irs_dx)
 if plastic:
-    gf_epcum_vtk = GridFunction(fes_ir)
+    _fes_epcum_draw = H1(mesh, order=1)
+    _pd_ep, _qd_ep = _fes_epcum_draw.TnT()
+    _M_epcum = BilinearForm(_pd_ep * _qd_ep * irs_dx, symmetric=True).Assemble()
+    _M_epcum_inv = _M_epcum.mat.Inverse()
+    gf_epcum_irs = GridFunction(fes_ir)       # source (GP values)
+    gf_epcum_vtk = GridFunction(_fes_epcum_draw)  # target (vertex values)
     _vtk_coefs.append(gf_epcum_vtk)
     _vtk_names.append("epcum")
 
@@ -1392,7 +1674,8 @@ if taskmanager: perf_opts.append("TaskManager")
 if realcompile: perf_opts.append("realcompile")
 if profile:     perf_opts.append("profile")
 if plastic:
-    print(f"  Plasticity: J2 von Mises, My0={My0:.4f}, H={H_hard:.4f}, m={m_hard:.1f}")
+    ct_label = "FD full" if consistent_tangent else "off"
+    print(f"  Plasticity: J2 von Mises, My0={My0:.4f}, H={H_hard:.4f}, m={m_hard:.1f}, tangent={ct_label}")
 print(f"  VTK: every {plot} steps ({vtk_fields}), "
       f"perf: {', '.join(perf_opts) if perf_opts else 'none'}")
 print(f"{'='*60}\n")
@@ -1434,7 +1717,7 @@ with TaskManager() if taskmanager else nullcontext():
             return gn, normals, active, n_active, max_pen
 
         if solver == "newton":
-            # ── Newton solver (dynamic contact, no active-set loop) ──
+            # ── Newton solver (monolithic: return mapping at every iteration) ──
             n_newton, _, _, _ = newton_solve()
 
             # Commit plastic history on successful convergence
@@ -1445,13 +1728,8 @@ with TaskManager() if taskmanager else nullcontext():
             # Finalize contact state at converged solution
             gn, normals, active, n_active, max_pen = finalize_contact_state()
 
-            # Compute final residual norm for reporting
-            if plastic:
-                # Re-run return mapping to update gf_Fp for correct residual eval
-                F_flat = _read_F_at_ips()
-                Fp_tmp, _, _ = return_mapping(
-                    F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
-                _write_Fp_to_gf(Fp_tmp)
+            # Compute final residual norm for reporting (gf_Fp already has
+            # the latest Fp_temp from the last Newton iteration's return mapping)
             a_form.Apply(gfu.vec, res_vec)
             f_con = compute_contact_forces(gn, normals, active)
             res_vec.FV().NumPy()[:] += f_con
@@ -1521,7 +1799,11 @@ with TaskManager() if taskmanager else nullcontext():
         if plot > 0 and step % plot == 0:
             if perf: _t0 = perf_counter()
             if plastic:
-                gf_epcum_vtk.vec.FV().NumPy()[:] = _epcum_conv
+                # L2 projection: IRS → H1 (mass-matrix pattern from unit-6.3)
+                gf_epcum_irs.vec.FV().NumPy()[:] = _epcum_conv
+                _f_ep = LinearForm(gf_epcum_irs * _qd_ep * irs_dx)
+                _f_ep.Assemble()
+                gf_epcum_vtk.vec.data = _M_epcum_inv * _f_ep.vec
             vtk.Do(time=step * dt)
             if perf: perf.record("vtk_output", perf_counter() - _t0)
 
