@@ -336,10 +336,17 @@ if plot > 0:
     vm_cauchy = sqrt(1.5 * InnerProduct(s_dev_cauchy, s_dev_cauchy)).Compile()
 
     if vtk_fields == "full":
-        # 1st Piola-Kirchhoff, Mandel, vm_mandel (use total F, not Fe)
-        stress_1piola = (2*c10*(F_gfu - F_inv_T)
-                         + 2*d1*log(J_gfu)*F_inv_T).Compile()
-        stress_mandel = (F_gfu.trans * stress_1piola).Compile()
+        # 1st Piola-Kirchhoff: P = Pe · Fp^{-T}  (= Pe when Fp=I)
+        # Mandel: M = Fe^T · Pe  (symmetric for isotropic W)
+        if plastic:
+            Fe_inv_T = Inv(Fe_gfu).trans
+            Pe_gfu = 2*c10*(Fe_gfu - Fe_inv_T) + 2*d1*log(J_gfu)*Fe_inv_T
+            stress_1piola = (Pe_gfu * Inv(gf_Fp).trans).Compile()
+            stress_mandel = (Fe_gfu.trans * Pe_gfu).Compile()
+        else:
+            stress_1piola = (2*c10*(F_gfu - F_inv_T)
+                             + 2*d1*log(J_gfu)*F_inv_T).Compile()
+            stress_mandel = (F_gfu.trans * stress_1piola).Compile()
         s_dev_mandel = stress_mandel - (1.0/3.0) * Trace(stress_mandel) * Id(3)
         vm_mandel = sqrt(1.5 * InnerProduct(s_dev_mandel, s_dev_mandel)).Compile()
 
@@ -423,122 +430,6 @@ MIN_NCAND  = 5
 MAX_NCAND  = 96
 RADIUS_FACTOR = 1.5
 K_SURF = 15
-
-
-def _evaluate_projection(patch, t, xs, compute_hessian=False):
-    """Evaluate gap, normal, and optionally dndxs at a projection point.
-
-    This is the core computation shared by:
-    - _project_single (after TR finds the best patch)
-    - ContactCache.evaluate (when reusing cached patch/params)
-    - Newton inner loop (recomputing during iterations)
-
-    Parameters
-    ----------
-    patch : GregoryPatch
-        The patch containing the projection point
-    t : ndarray (2,)
-        Parametric coordinates on the patch
-    xs : ndarray (3,)
-        Slave node position
-    compute_hessian : bool
-        If True, compute dn/dx_s for contact Hessian
-
-    Returns
-    -------
-    gn : float
-        Gap value (negative = penetration)
-    nor : ndarray (3,)
-        Unit normal at projection point
-    dndxs : ndarray (3, 3) or None
-        dn/dx_s matrix (only if compute_hessian=True and successful)
-    """
-    if compute_hessian:
-        # Get surface point and derivatives for Hessian
-        xc, dxcdt, d2xcd2t = patch.Grg(t, deriv=2)
-        n_raw = patch.D3Grg(t)
-        nor = n_raw / np.linalg.norm(n_raw)
-
-        # Compute dn/dx_s via implicit function theorem
-        # Projection minimizes |xs - xc(t)|^2, so at minimum:
-        #   f(t) = -2*(xs - xc)·(dxc/dt) = 0
-        # Implicit diff: dt/dxs = -(df/dt)^{-1} @ (df/dxs)
-        delta = xs - xc
-        dfdt = -2 * np.tensordot(delta, d2xcd2t, axes=1) + 2 * (dxcdt.T @ dxcdt)
-        dfdxs = -2 * dxcdt.T
-        try:
-            dtdxs = np.linalg.solve(-dfdt, dfdxs)  # (2, 3)
-            dndt = patch.dndt(t)  # (3, 2)
-            dndxs = dndt @ dtdxs  # (3, 3)
-        except np.linalg.LinAlgError:
-            dndxs = None  # Singular — skip curvature term
-    else:
-        xc = patch.Grg(t, deriv=0)
-        n_raw = patch.D3Grg(t)
-        nor = n_raw / np.linalg.norm(n_raw)
-        dndxs = None
-
-    gn = (xs - xc) @ nor
-    return gn, nor, dndxs
-
-
-def _project_single(xsi, distances, sorted_idx, kd_pids, compute_hessian=False):
-    """TR projection for a single slave node.
-
-    Parameters
-    ----------
-    xsi : ndarray (3,)
-        Slave node position
-    distances : ndarray (npatches,)
-        Distance from slave to each patch bounding sphere center
-    sorted_idx : ndarray
-        Indices that sort patches by distance
-    kd_pids : ndarray
-        Candidate patch IDs from KD-tree
-    compute_hessian : bool
-        If True, compute dn/dx_s for contact Hessian
-
-    Returns
-    -------
-    gn : float
-        Gap value (negative = penetration)
-    nor : ndarray (3,)
-        Unit normal at projection point
-    patch_id : int
-        Patch ID (-1 if projection failed)
-    t : ndarray (2,) or None
-        Parametric coordinates
-    dndxs : ndarray (3,3) or None
-        dn/dx_s matrix (only if compute_hessian=True and projection succeeded)
-    """
-    radius_factor = RADIUS_FACTOR
-    for attempt in range(2):
-        base_idx = min(BASE_NCAND - 1, npatches - 1)
-        radius   = distances[sorted_idx[base_idx]] * radius_factor
-        cands_bs = np.nonzero(distances <= radius)[0]
-        if cands_bs.size < MIN_NCAND:
-            cands_bs = sorted_idx[:min(MIN_NCAND, npatches)]
-
-        merged = np.unique(np.concatenate(
-            [cands_bs.astype(np.int32), kd_pids.astype(np.int32)]
-        ))
-        if merged.size > MAX_NCAND:
-            merged = merged[np.argsort(distances[merged])[:MAX_NCAND]]
-
-        best_patch, t1, t2, _ = gb.find_projection_tr_multi(
-            ctrlpts_all, xsi, merged.astype(np.int32), radii, eps,
-            TR_INIT, TR_MIN, TR_MAX
-        )
-        if int(best_patch) >= 0:
-            pid = int(best_patch)
-            t   = np.array([t1, t2], dtype=np.float64)
-            gn, nor, dndxs = _evaluate_projection(
-                patches[pid], t, xsi, compute_hessian=compute_hessian
-            )
-            return gn, nor, pid, t, dndxs
-
-        radius_factor *= 2.0
-    return np.inf, np.zeros(3), -1, None, None
 
 
 # --- Contact cache for warm-starting within a load step -------------------
@@ -1694,6 +1585,7 @@ with TaskManager() if taskmanager else nullcontext():
 
         # Reset contact cache at each load step (force full re-projection once)
         contact_cache.reset()
+        _hessp_cache["x_free"] = None      # invalidate hessp tangent/contact cache
 
         # --- Incremental Dirichlet on "top" boundary ----------------------
         vec = gfu.vec.FV().NumPy()
@@ -1721,7 +1613,7 @@ with TaskManager() if taskmanager else nullcontext():
             n_newton, _, _, _ = newton_solve()
 
             # Commit plastic history on successful convergence
-            if plastic and n_newton < max_iter:
+            if plastic and n_newton <= max_iter:
                 _Fp_conv[:] = _Fp_temp
                 _epcum_conv += _delta_epcum
 
