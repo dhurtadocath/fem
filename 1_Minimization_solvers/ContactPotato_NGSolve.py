@@ -62,6 +62,7 @@ solver      = "newton"
 nsteps      = 100           # number of load steps
 max_iter    = 200            # max iterations per step
 gtol        = 1e-8          # gradient/residual tolerance
+max_cutback = 5             # max bisection levels on non-convergence (2^5 = 32x refinement)
 
 # Hessian
 full_hessian = True         # include curvature term dn/dx_s in contact Hessian
@@ -1580,8 +1581,8 @@ vtk = VTKOutput(
 # ══════════════════════════════════════════════════════════════════════════════
 # 8.  TIME-STEPPING LOOP
 # ══════════════════════════════════════════════════════════════════════════════
-dt = 1.0 / nsteps
-disp_increment = np.array([12.0, 0.0, 0.0]) * dt   # prescribed sliding
+dt_base = 1.0 / nsteps
+disp_per_unit = np.array([12.0, 0.0, 0.0])   # total prescribed displacement
 
 print(f"\n{'='*60}")
 print(f"  ContactPotato NGSolve — mesh {n}x{n}x{n}")
@@ -1600,11 +1601,31 @@ if profile:     perf_opts.append("profile")
 if plastic:
     ct_label = "FD full" if consistent_tangent else "off"
     print(f"  Plasticity: J2 von Mises, My0={My0:.4f}, H={H_hard:.4f}, m={m_hard:.1f}, tangent={ct_label}")
+print(f"  Cutback: max_level={max_cutback} (up to {2**max_cutback}x refinement)")
 print(f"  VTK: every {plot} steps ({vtk_fields}), "
       f"perf: {', '.join(perf_opts) if perf_opts else 'none'}")
 print(f"{'='*60}\n")
 
 t_wall_start = perf_counter()
+
+# --- Helper: compute contact forces and update fields ---
+def finalize_contact_state():
+    """Evaluate contact state and update output fields."""
+    slave_pos = compute_slave_pos()
+    gn, normals, active, _ = contact_cache.evaluate(slave_pos)
+    f_con = compute_contact_forces(gn, normals, active)
+    update_contact_fields(gn, normals, active, f_con)
+    n_active = int(np.sum(active))
+    max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
+    return gn, normals, active, n_active, max_pen
+
+# Adaptive stepping state
+load = 0.0              # accumulated load fraction [0, 1]
+dt = dt_base            # current sub-step size
+bisect_level = 0        # current bisection depth
+prev_base_step = 0      # last completed base step (for VTK/compare triggering)
+total_substeps = 0      # total sub-step count (for summary)
+total_cutbacks = 0      # total cutback count (for summary)
 
 # Enable multi-threaded NGSolve operations (assembly, integration, solve).
 # TaskManager activates parallel element-loop assembly, integration, and
@@ -1613,65 +1634,31 @@ t_wall_start = perf_counter()
 # NOTE: For small problems (<1000 elements), threading overhead may dominate.
 #       Benefit grows with mesh size (10k+ elements).
 with TaskManager() if taskmanager else nullcontext():
-    for step in range(1, nsteps + 1):
+    while load < 1.0 - 1e-12:
+        dt = min(dt, 1.0 - load)       # don't overshoot
+        total_substeps += 1
         t_step = perf_counter()
 
-        # Reset contact cache at each load step (force full re-projection once)
+        # Reset contact cache at each sub-step (force full re-projection once)
         contact_cache.reset()
-        _hessp_cache["x_free"] = None      # invalidate hessp tangent/contact cache
+        _hessp_cache["x_free"] = None   # invalidate hessp tangent/contact cache
+
+        # --- Save displacement state before Dirichlet increment -----------
+        vec = gfu.vec.FV().NumPy()
+        u_step_backup = vec.copy()
 
         # --- Incremental Dirichlet on "top" boundary ----------------------
-        vec = gfu.vec.FV().NumPy()
-        vec[top_dofs_x] += disp_increment[0]
-        vec[top_dofs_y] += disp_increment[1]
-        vec[top_dofs_z] += disp_increment[2]
+        disp_inc = disp_per_unit * dt
+        vec[top_dofs_x] += disp_inc[0]
+        vec[top_dofs_y] += disp_inc[1]
+        vec[top_dofs_z] += disp_inc[2]
 
         # ══════════════════════════════════════════════════════════════════
         # SOLVER DISPATCH
         # ══════════════════════════════════════════════════════════════════
 
-        # --- Helper: compute contact forces and update fields ---
-        def finalize_contact_state():
-            """Evaluate contact state and update output fields."""
-            slave_pos = compute_slave_pos()
-            gn, normals, active, _ = contact_cache.evaluate(slave_pos)
-            f_con = compute_contact_forces(gn, normals, active)
-            update_contact_fields(gn, normals, active, f_con)
-            n_active = int(np.sum(active))
-            max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
-            return gn, normals, active, n_active, max_pen
-
         if solver == "newton":
-            # ── Newton solver (monolithic: return mapping at every iteration) ──
-            n_newton, newton_converged, _, _, _ = newton_solve()
-
-            # Commit plastic history only on genuine convergence and finite Fp
-            if plastic and newton_converged and np.isfinite(_Fp_temp).all():
-                _Fp_conv[:] = _Fp_temp
-                _epcum_conv += _delta_epcum
-
-            # Finalize contact state at converged solution
-            gn, normals, active, n_active, max_pen = finalize_contact_state()
-
-            # Compute final residual norm for reporting (gf_Fp already has
-            # the latest Fp_temp from the last Newton iteration's return mapping)
-            a_form.Apply(gfu.vec, res_vec)
-            f_con = compute_contact_forces(gn, normals, active)
-            res_vec.FV().NumPy()[:] += f_con
-            rnorm = np.linalg.norm(res_vec.FV().NumPy()[free_dofs])
-
-            # Plastic strain info
-            ep_info = ""
-            if plastic:
-                max_epcum = np.max(_epcum_conv)
-                n_plastic = np.sum(_epcum_conv > 1e-12)
-                ep_info = f"  ep_max={max_epcum:.2e}  n_plast={n_plastic}"
-
-            dt_step  = perf_counter() - t_step
-            print(f"Step {step:3d}/{nsteps}  newton: nit={n_newton:3d}  "
-                  f"|r|={rnorm:.2e}  active={n_active:3d}  maxpen={max_pen:.2e}"
-                  f"{ep_info}  t={dt_step:.1f}s")
-
+            n_iters, step_converged, _, _, _ = newton_solve()
         else:
             # ── Scipy minimize solvers ──
             SCIPY_SOLVERS = {
@@ -1679,7 +1666,6 @@ with TaskManager() if taskmanager else nullcontext():
                 "trust-constr": ("trust-constr", True,  {"gtol": gtol, "xtol": 1e-30}),
                 "lbfgsb":       ("L-BFGS-B",     False, {"gtol": gtol, "maxls": 4000, "ftol": 0}),
             }
-
             method_name, uses_hessp, opts_override = SCIPY_SOLVERS[solver]
             options = {"maxiter": max_iter, **opts_override}
 
@@ -1691,28 +1677,82 @@ with TaskManager() if taskmanager else nullcontext():
                 result = minimize(objective, x0, method=method_name, jac=True,
                                   options=options)
             vec[free_dofs] = result.x
+            n_iters = result.nit
+            step_converged = result.success
 
-            # Commit plastic history at converged state
-            if plastic:
-                # Return mapping at the final solution (objective() already
-                # ran it for the last evaluation, but result.x may differ
-                # from the last objective() call due to trust-region internals)
+        # ══════════════════════════════════════════════════════════════════
+        # CUTBACK ON NON-CONVERGENCE
+        # ══════════════════════════════════════════════════════════════════
+
+        if not step_converged and bisect_level < max_cutback:
+            vec[:] = u_step_backup
+            dt /= 2
+            bisect_level += 1
+            total_cutbacks += 1
+            dt_step = perf_counter() - t_step
+            print(f"  >> Non-converged ({n_iters} iters), "
+                  f"cutback {bisect_level}/{max_cutback} "
+                  f"(dt = dt_base/{2**bisect_level})  t={dt_step:.1f}s")
+            continue
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP ACCEPTED (converged OR max cutback reached)
+        # ══════════════════════════════════════════════════════════════════
+
+        load += dt
+        forced_accept = not step_converged
+        if forced_accept:
+            print(f"  >> Max cutback {max_cutback} reached — "
+                  f"accepting step (load={load*100:.1f}%)")
+
+        # ── Plastic history commit (unified for Newton and scipy) ────────
+        if plastic:
+            if solver == "newton" and step_converged:
+                # Newton converged: _Fp_temp is consistent with gfu (RM ran
+                # at the start of the converging iteration, before the
+                # convergence check).  Direct commit is safe.
+                if np.isfinite(_Fp_temp).all():
+                    _Fp_conv[:] = _Fp_temp
+                    _epcum_conv += _delta_epcum
+            else:
+                # Scipy (converged or forced), or Newton forced-accept:
+                # Run final RM at current displacement to ensure Fp-
+                # consistency (after Newton's last linesearch update,
+                # _Fp_temp lags behind gfu.vec by one iteration).
                 F_flat = _read_F_at_ips()
                 _F_flat_cache = F_flat
                 _Fp_temp, _delta_epcum, rm_ok = return_mapping(
                     F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
                 if rm_ok and np.isfinite(_Fp_temp).all():
                     _write_Fp_to_gf(_Fp_temp)
-                    if result.success:
-                        _Fp_conv[:] = _Fp_temp
-                        _epcum_conv += _delta_epcum
+                    _Fp_conv[:] = _Fp_temp
+                    _epcum_conv += _delta_epcum
 
-            # Finalize contact state and get metrics
-            _, _, _, n_active, max_pen = finalize_contact_state()
-            dt_step   = perf_counter() - t_step
-            # trust-constr: result.jac is constraint Jacobians (empty for
-            # unconstrained); use result.optimality (||∇f||_∞) instead.
-            # Other methods: result.jac is the objective gradient.
+        # ── Finalize contact state ───────────────────────────────────────
+        gn, normals, active, n_active, max_pen = finalize_contact_state()
+
+        # ── Print step info ──────────────────────────────────────────────
+        cutback_tag = f"  *cutback" if bisect_level > 0 else ""
+        curr_base_step = int(load / dt_base + 1e-9)  # floor with eps (avoids banker's rounding)
+
+        if solver == "newton":
+            a_form.Apply(gfu.vec, res_vec)
+            f_con = compute_contact_forces(gn, normals, active)
+            res_vec.FV().NumPy()[:] += f_con
+            rnorm = np.linalg.norm(res_vec.FV().NumPy()[free_dofs])
+
+            ep_info = ""
+            if plastic:
+                max_epcum = np.max(_epcum_conv)
+                n_plastic = np.sum(_epcum_conv > 1e-12)
+                ep_info = f"  ep_max={max_epcum:.2e}  n_plast={n_plastic}"
+
+            dt_step = perf_counter() - t_step
+            print(f"Step {curr_base_step:3d}/{nsteps}  newton: nit={n_iters:3d}  "
+                  f"|r|={rnorm:.2e}  active={n_active:3d}  maxpen={max_pen:.2e}"
+                  f"{ep_info}  t={dt_step:.1f}s{cutback_tag}")
+        else:
+            dt_step = perf_counter() - t_step
             if hasattr(result, "optimality") and result.optimality is not None:
                 grad_norm = result.optimality
             elif result.jac is not None and np.size(result.jac) > 0:
@@ -1720,57 +1760,64 @@ with TaskManager() if taskmanager else nullcontext():
             else:
                 grad_norm = float("nan")
 
-            # Plastic strain info
             ep_info = ""
             if plastic:
                 max_epcum = np.max(_epcum_conv)
                 n_plastic = np.sum(_epcum_conv > 1e-12)
                 ep_info = f"  ep_max={max_epcum:.2e}  n_plast={n_plastic}"
 
-            # Print result
-            print(f"Step {step:3d}/{nsteps}  {solver}: nit={result.nit:2d}  "
+            print(f"Step {curr_base_step:3d}/{nsteps}  {solver}: nit={result.nit:2d}  "
                   f"nfev={result.nfev:3d}  |grad|={grad_norm:.2e}  "
                   f"active={n_active:3d}  maxpen={max_pen:.2e}"
-                  f"{ep_info}  t={dt_step:.1f}s")
+                  f"{ep_info}  t={dt_step:.1f}s{cutback_tag}")
             if not result.success:
                 print(f"  >> {result.message}")
 
-        # --- VTK snapshot --------------------------------------------------
-        if plot > 0 and step % plot == 0:
-            if perf: _t0 = perf_counter()
-            if plastic:
-                # L2 projection: IRS → H1 (mass-matrix pattern from unit-6.3)
-                gf_epcum_irs.vec.FV().NumPy()[:] = _epcum_conv
-                _f_ep = LinearForm(gf_epcum_irs * _qd_ep * irs_dx)
-                _f_ep.Assemble()
-                gf_epcum_vtk.vec.data = _M_epcum_inv * _f_ep.vec
-            vtk.Do(time=step * dt)
-            if perf: perf.record("vtk_output", perf_counter() - _t0)
+        # ── Step size recovery + VTK/compare at base-step boundaries ─────
+        if curr_base_step > prev_base_step:
+            # Crossed a base-step boundary → try to recover step size
+            if bisect_level > 0:
+                dt = min(dt * 2, dt_base)
+                bisect_level = max(bisect_level - 1, 0)
 
-        # --- Comparison output ---------------------------------------------
-        if compare:
-            np.save(os.path.join(out_dir, f"u_step{step:04d}.npy"),
-                    gfu.vec.FV().NumPy().copy())
-            # Reaction forces on top boundary (material internal forces only,
-            # contact forces are not included since top boundary is not in contact)
-            a_form.Apply(gfu.vec, res_vec)
-            f_top = res_vec.FV().NumPy()
-            rx = np.sum(f_top[top_dofs_x])
-            ry = np.sum(f_top[top_dofs_y])
-            rz = np.sum(f_top[top_dofs_z])
-            with open(os.path.join(out_dir, "reactions.csv"), "a") as fout:
-                if step == 1:
-                    fout.write("step,time,rx,ry,rz\n")
-                fout.write(f"{step},{step*dt:.6f},{rx:.10e},{ry:.10e},{rz:.10e}\n")
+            # VTK snapshot at base-step boundaries
+            if plot > 0 and curr_base_step % plot == 0:
+                if perf: _t0 = perf_counter()
+                if plastic:
+                    gf_epcum_irs.vec.FV().NumPy()[:] = _epcum_conv
+                    _f_ep = LinearForm(gf_epcum_irs * _qd_ep * irs_dx)
+                    _f_ep.Assemble()
+                    gf_epcum_vtk.vec.data = _M_epcum_inv * _f_ep.vec
+                vtk.Do(time=curr_base_step * dt_base)
+                if perf: perf.record("vtk_output", perf_counter() - _t0)
+
+            # Comparison output at base-step boundaries
+            if compare:
+                np.save(os.path.join(out_dir, f"u_step{curr_base_step:04d}.npy"),
+                        gfu.vec.FV().NumPy().copy())
+                a_form.Apply(gfu.vec, res_vec)
+                f_top = res_vec.FV().NumPy()
+                rx = np.sum(f_top[top_dofs_x])
+                ry = np.sum(f_top[top_dofs_y])
+                rz = np.sum(f_top[top_dofs_z])
+                with open(os.path.join(out_dir, "reactions.csv"), "a") as fout:
+                    if curr_base_step == 1:
+                        fout.write("step,time,rx,ry,rz\n")
+                    fout.write(f"{curr_base_step},{curr_base_step*dt_base:.6f},"
+                               f"{rx:.10e},{ry:.10e},{rz:.10e}\n")
+
+            prev_base_step = curr_base_step
 
         # --- Profiling step summary ----------------------------------------
         if perf:
             perf.record("step_total", perf_counter() - t_step)
-            print(perf.step_summary(step))
+            print(perf.step_summary(total_substeps))
             perf.reset_step()
 
 t_total = perf_counter() - t_wall_start
-print(f"\nTotal wall time: {t_total:.1f} s")
+cutback_info = f", {total_cutbacks} cutbacks" if total_cutbacks > 0 else ""
+print(f"\nTotal wall time: {t_total:.1f} s "
+      f"({total_substeps} sub-steps{cutback_info})")
 print(f"Output directory: {out_dir}")
 if perf:
     print(perf.final_summary())
