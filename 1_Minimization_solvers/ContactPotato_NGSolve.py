@@ -54,8 +54,8 @@ nu_val      = 0.3           # Poisson ratio
 # Contact
 kn_factor   = 20.0          # kn = kn_factor * E / h  (Wriggers 2006)
 contact_tol_reuse = 1e-5 #np.inf #0.05 #np.inf  # per-node displacement threshold for projection reuse
-                            # inf  = lock projections during solve (default, most robust)
-                            # finite (e.g. 0.05) = re-project nodes that move beyond this
+                            # inf  = lock projections during solve (most robust)
+                            # finite (e.g. 1e-5) = re-project nodes that move beyond this
 
 # Solver: "newton", "newton-cg", "trust-constr", "lbfgsb"
 solver      = "newton"
@@ -705,6 +705,10 @@ def hessp(x_free, p):
             global _Fp_temp, _delta_epcum, _F_flat_cache
             F_flat = _read_F_at_ips()
             _F_flat_cache = F_flat
+            # rm_ok intentionally discarded: hessp is a tangent operator, not a
+            # state update.  On local RM failure _Fp_temp = _Fp_conv (elastic
+            # tangent), which is an acceptable approximation — same as the
+            # frozen-Fp tangent used when consistent_tangent=False.
             _Fp_temp, _delta_epcum, _ = return_mapping(
                 F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
             _write_Fp_to_gf(_Fp_temp)
@@ -840,6 +844,7 @@ if plastic:
         Fp_new = Fp_old.copy()
         delta_epcum = np.zeros(n)
         I3 = np.eye(3)
+        n_local_fail = 0   # count of GPs where local Newton did not converge
 
         for ip in range(n):
             F  = F_all[ip]
@@ -947,17 +952,17 @@ if plastic:
                 dlam = max(dlam, 0.0)
 
             if not converged_rm and abs(R_val) > 1e-6:
-                # Local Newton failed at this GP.
-                # Use last accepted Fp_trial (partial convergence) rather than
-                # aborting the entire return mapping.  The global Newton will
-                # handle the residual inconsistency.
-                pass
+                n_local_fail += 1
 
             Fp_new[ip]     = Fp_trial
             delta_epcum[ip] = max(dlam, 0.0)
 
         # Check for NaN/Inf in output
         if not np.isfinite(Fp_new).all():
+            return Fp_conv_flat.copy(), np.zeros(n), False
+
+        if n_local_fail > 0:
+            print(f"    return_mapping: {n_local_fail}/{n} GPs failed local Newton")
             return Fp_conv_flat.copy(), np.zeros(n), False
 
         return Fp_new.ravel(), delta_epcum, True
@@ -1228,7 +1233,7 @@ def _build_csr_pos_map():
 
 # Precomputed surface data for vectorized linesearch energy evaluation.
 # Populated once per Newton iteration in newton_solve(); used by _linesearch_energy().
-# When contact_tol_reuse=inf (default), projections are locked and surface points/
+# When contact_tol_reuse=inf, projections are locked and surface points/
 # normals don't change between linesearch evaluations — only slave_pos changes.
 _ls_xc    = np.zeros((0, 3))     # surface projection points
 _ls_nor   = np.zeros((0, 3))     # unit normals at projection points
@@ -1394,6 +1399,15 @@ def newton_solve():
         #    before declaring stagnation.  In contact problems, Newton can have
         #    slow initial convergence as the active set settles — premature
         #    stagnation exit wastes the entire load step.
+        #
+        #    NOTE (plasticity): stagnation sets converged=True, which commits
+        #    _Fp_conv/_epcum_conv even though rnorm may be above gtol.  This
+        #    is acceptable because: (1) Fp is consistent with u (RM ran at
+        #    this displacement), (2) 100× reduction ensures we are in the
+        #    basin of attraction, (3) the active-set oscillation that causes
+        #    stagnation is a contact phenomenon unrelated to plastic state,
+        #    (4) the cutback mechanism catches any downstream issues.  The
+        #    printed |r| makes non-strict convergence visible to the user.
         if nit >= 10 and rnorm < 1e-2 * rnorm_initial:
             if rnorm > 0.95 * rnorm_prev:
                 stag_count += 1
@@ -1463,6 +1477,14 @@ def newton_solve():
                 break
 
         # 9. Armijo linesearch
+        #    NOTE: _linesearch_energy uses frozen gf_Fp (from the RM at the
+        #    start of this iteration).  The energy evaluated at trial points
+        #    u_k - τ·w is therefore W(u_trial; Fp*(u_k)), not the fully
+        #    plastic-consistent W(u_trial; Fp*(u_trial)).  This is standard
+        #    practice (Simo & Hughes 1998, de Souza Neto 2008): the envelope
+        #    theorem guarantees that the slope φ'(0) = -r·w is exact at τ=0,
+        #    so the Armijo condition remains valid.  Running RM at each trial
+        #    τ would cost up to 30× RM per iteration for marginal benefit.
         if perf: _t0 = perf_counter()
         w_free = _w_vec.FV().NumPy()[free_dofs]
         slope = -np.dot(r_np[free_dofs], w_free)  # φ'(0) = -∇E·w
