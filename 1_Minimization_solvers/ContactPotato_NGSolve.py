@@ -45,7 +45,7 @@ from PyClasses._contact_tr_multi_helpers import project_points_tr_multi_batch
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 15                # mesh density (n x n x n hex elements)
+n           = 10                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -53,6 +53,9 @@ nu_val      = 0.3           # Poisson ratio
 
 # Contact
 kn_factor   = 20.0          # kn = kn_factor * E / h  (Wriggers 2006)
+contact_tol_reuse = 1e-5 #np.inf #0.05 #np.inf  # per-node displacement threshold for projection reuse
+                            # inf  = lock projections during solve (default, most robust)
+                            # finite (e.g. 0.05) = re-project nodes that move beyond this
 
 # Solver: "newton", "newton-cg", "trust-constr", "lbfgsb"
 solver      = "newton"
@@ -227,9 +230,9 @@ if plastic:
     _gp_lo = 0.5 - 0.5 / np.sqrt(3.0)   # ≈ 0.211325
     _gp_hi = 0.5 + 0.5 / np.sqrt(3.0)   # ≈ 0.788675
     _gp_1d = np.array([_gp_lo, _gp_hi])
-    # All 8 GP positions: ordered as NGSolve IRS (verified: ξ fastest, then η, then ζ)
+    # All 8 GP positions: ordered as NGSolve IRS (ζ fastest, then η, then ξ — per intrule.cpp:3088)
     _gp_ref = np.array([[xi, eta, zeta]
-                         for zeta in _gp_1d for eta in _gp_1d for xi in _gp_1d])
+                         for xi in _gp_1d for eta in _gp_1d for zeta in _gp_1d])
     _gp_weight = 0.125   # = 0.5^3 (product rule on [0,1]^3)
 
     def _hex8_dNdxi(xi, eta, zeta):
@@ -445,7 +448,7 @@ class ContactCache:
         self.prev_pos    = None      # (n_slave, 3)
         self.patch_ids   = None      # (n_slave,) int
         self.params      = None      # (n_slave, 2) parametric coords
-        self.tol_reuse   = 0.05      # reuse if ||Δx|| < tol per node
+        self.tol_reuse   = contact_tol_reuse
 
     def reset(self):
         """Call at the start of each load step."""
@@ -580,6 +583,23 @@ def objective(x_free):
     vec = gfu.vec.FV().NumPy()
     vec[free_dofs] = x_free
 
+    # --- Plasticity: run return mapping at current u to update gf_Fp -------
+    # Without this, Energy() and Apply() use stale Fp from previous step.
+    # The envelope theorem guarantees that the gradient of W(Fe(u; Fp*(u)))
+    # w.r.t. u equals dW/du|_{Fp*}, so Apply() gives the correct gradient
+    # after updating Fp via return mapping.
+    if plastic:
+        global _Fp_temp, _delta_epcum, _F_flat_cache
+        F_flat = _read_F_at_ips()
+        _F_flat_cache = F_flat
+        _Fp_temp, _delta_epcum, rm_ok = return_mapping(
+            F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
+        if not rm_ok:
+            E_penalty = 1e4 * (1.0 + np.dot(x_free, x_free))
+            g_penalty = 2e4 * x_free
+            return E_penalty, g_penalty
+        _write_Fp_to_gf(_Fp_temp)
+
     # --- Material energy + forces (NGSolve) --------------------------------
     E_mat = a_form.Energy(gfu.vec)
 
@@ -677,8 +697,23 @@ def hessp(x_free, p):
     if need_reassemble:
         vec[free_dofs] = x_free
 
-        # Assemble material tangent at new state
+        # Plasticity: ensure gf_Fp is current (objective() may have been
+        # called at this x_free already, but if hessp is called directly
+        # we need to update Fp first for correct tangent).
+        if plastic:
+            global _Fp_temp, _delta_epcum, _F_flat_cache
+            F_flat = _read_F_at_ips()
+            _F_flat_cache = F_flat
+            _Fp_temp, _delta_epcum, _ = return_mapping(
+                F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
+            _write_Fp_to_gf(_Fp_temp)
+
+        # Assemble material tangent at new state (uses current gf_Fp)
         a_form.AssembleLinearization(gfu.vec)
+
+        # Plastic consistent tangent correction (yielding GPs only)
+        if plastic and consistent_tangent and np.any(_delta_epcum > 0):
+            _add_plastic_tangent_correction()
 
         # Evaluate contact state at new state
         slave_pos = np.column_stack([
@@ -877,7 +912,7 @@ if plastic:
 
                 R_val = svm_new - sy_new
 
-                if abs(R_val) < 1e-12:
+                if abs(R_val) < 1e-15:
                     converged_rm = True
                     break
 
@@ -973,7 +1008,7 @@ if plastic:
             ep_t = epcum + dlam
             sy_n = My0_ + (H_ * ep_t**m_ if ep_t > 1e-30 else 0.0)
             R = svm_n - sy_n
-            if abs(R) < 1e-12:
+            if abs(R) < 1e-15:
                 break
             h_fd = max(1e-10, abs(dlam) * 1e-6)
             exp_h = np.exp((dlam + h_fd) * eigvals_N)
@@ -1192,8 +1227,8 @@ def _build_csr_pos_map():
 
 # Precomputed surface data for vectorized linesearch energy evaluation.
 # Populated once per Newton iteration in newton_solve(); used by _linesearch_energy().
-# Since projections are locked during Newton (tol_reuse=inf), the surface points
-# and normals don't change between linesearch evaluations — only slave_pos changes.
+# When contact_tol_reuse=inf (default), projections are locked and surface points/
+# normals don't change between linesearch evaluations — only slave_pos changes.
 _ls_xc    = np.zeros((0, 3))     # surface projection points
 _ls_nor   = np.zeros((0, 3))     # unit normals at projection points
 _ls_valid = np.zeros(0, dtype=bool)  # mask: True if projection exists
@@ -1271,20 +1306,18 @@ def newton_solve():
     -------
     n_iter : int
         Number of Newton iterations
+    converged : bool
+        True if residual met tolerance or stagnation after significant reduction
     gn, normals, active : arrays
         Final contact state (from last iteration)
     """
     newton_gtol = max(gtol, 1e-10)
     _u_backup = gfu.vec.FV().NumPy().copy()
 
-    # Lock projections during Newton (same as scipy paths).
-    # Prevents energy discontinuities from projection switching.
-    saved_tol = contact_cache.tol_reuse
-    contact_cache.tol_reuse = np.inf
-
     rnorm_prev = np.inf
     rnorm_initial = np.inf
     stag_count = 0
+    converged = False
     gn_out, normals_out, active_out = None, None, None
 
     for nit in range(max_iter):
@@ -1352,6 +1385,7 @@ def newton_solve():
         if nit == 0:
             rnorm_initial = rnorm
         if rnorm < newton_gtol:
+            converged = True
             break
 
         # 5. Stagnation detection
@@ -1363,6 +1397,7 @@ def newton_solve():
             if rnorm > 0.95 * rnorm_prev:
                 stag_count += 1
                 if stag_count >= 5:
+                    converged = True  # stagnated after significant reduction
                     break
             else:
                 stag_count = 0
@@ -1471,13 +1506,11 @@ def newton_solve():
                 uh_np[free_dofs] -= scale * r_np[free_dofs]
                 gfu.vec.data = _uh_vec
 
-    # Restore cache tolerance
-    contact_cache.tol_reuse = saved_tol
-
     if not np.isfinite(gfu.vec.FV().NumPy()).all():
         gfu.vec.FV().NumPy()[:] = _u_backup
+        converged = False
 
-    return nit + 1, gn_out, normals_out, active_out
+    return nit + 1, converged, gn_out, normals_out, active_out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1610,10 +1643,10 @@ with TaskManager() if taskmanager else nullcontext():
 
         if solver == "newton":
             # ── Newton solver (monolithic: return mapping at every iteration) ──
-            n_newton, _, _, _ = newton_solve()
+            n_newton, newton_converged, _, _, _ = newton_solve()
 
-            # Commit plastic history on successful convergence
-            if plastic and n_newton <= max_iter:
+            # Commit plastic history only on genuine convergence and finite Fp
+            if plastic and newton_converged and np.isfinite(_Fp_temp).all():
                 _Fp_conv[:] = _Fp_temp
                 _epcum_conv += _delta_epcum
 
@@ -1651,21 +1684,28 @@ with TaskManager() if taskmanager else nullcontext():
             options = {"maxiter": max_iter, **opts_override}
 
             x0 = vec[free_dofs].copy()
-            # Lock contact projections during optimization: always reuse the
-            # projection points found on the first objective() call after
-            # reset().  Prevents energy discontinuities from cache-switching
-            # mid-linesearch (full re-projection can find a different patch,
-            # violating Wolfe conditions).
-            saved_tol_reuse = contact_cache.tol_reuse
-            contact_cache.tol_reuse = np.inf
             if uses_hessp:
                 result = minimize(objective, x0, method=method_name, jac=True,
                                   hessp=hessp, options=options)
             else:
                 result = minimize(objective, x0, method=method_name, jac=True,
                                   options=options)
-            contact_cache.tol_reuse = saved_tol_reuse
             vec[free_dofs] = result.x
+
+            # Commit plastic history at converged state
+            if plastic:
+                # Return mapping at the final solution (objective() already
+                # ran it for the last evaluation, but result.x may differ
+                # from the last objective() call due to trust-region internals)
+                F_flat = _read_F_at_ips()
+                _F_flat_cache = F_flat
+                _Fp_temp, _delta_epcum, rm_ok = return_mapping(
+                    F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
+                if rm_ok and np.isfinite(_Fp_temp).all():
+                    _write_Fp_to_gf(_Fp_temp)
+                    if result.success:
+                        _Fp_conv[:] = _Fp_temp
+                        _epcum_conv += _delta_epcum
 
             # Finalize contact state and get metrics
             _, _, _, n_active, max_pen = finalize_contact_state()
@@ -1680,10 +1720,18 @@ with TaskManager() if taskmanager else nullcontext():
             else:
                 grad_norm = float("nan")
 
+            # Plastic strain info
+            ep_info = ""
+            if plastic:
+                max_epcum = np.max(_epcum_conv)
+                n_plastic = np.sum(_epcum_conv > 1e-12)
+                ep_info = f"  ep_max={max_epcum:.2e}  n_plast={n_plastic}"
+
             # Print result
             print(f"Step {step:3d}/{nsteps}  {solver}: nit={result.nit:2d}  "
                   f"nfev={result.nfev:3d}  |grad|={grad_norm:.2e}  "
-                  f"active={n_active:3d}  maxpen={max_pen:.2e}  t={dt_step:.1f}s")
+                  f"active={n_active:3d}  maxpen={max_pen:.2e}"
+                  f"{ep_info}  t={dt_step:.1f}s")
             if not result.success:
                 print(f"  >> {result.message}")
 
