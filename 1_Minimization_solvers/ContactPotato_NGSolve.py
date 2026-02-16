@@ -13,8 +13,8 @@ Solvers
 - **newton**: Full Newton with direct UMFPACK solve and Armijo linesearch.
   Uses the material tangent from NGSolve plus contact Hessian
   kn * (n ⊗ n + g * dn/dx_s) when full_hessian=True.  Contact is
-  evaluated dynamically at each iteration with locked projections for
-  energy consistency.
+  evaluated dynamically at each iteration with cached projections
+  (reuse threshold = contact_tol_reuse) for energy consistency.
 - **newton-cg**: Newton-CG via scipy.optimize.minimize with Hessian-vector
   product (hessp).  Uses CG to approximately solve each Newton system.
   Supports full_hessian for curvature term without matrix singularity risk.
@@ -61,7 +61,7 @@ contact_tol_reuse = 1e-5 #np.inf #0.05 #np.inf  # per-node displacement threshol
 solver      = "newton"
 nsteps      = 100           # number of load steps
 max_iter    = 200            # max iterations per step
-gtol        = 1e-8          # gradient/residual tolerance
+gtol        = 1e-12          # gradient/residual tolerance
 max_cutback = 5             # max bisection levels on non-convergence (2^5 = 32x refinement)
 
 # Hessian
@@ -84,7 +84,7 @@ plastic_param = [0.01, 0.05, 1.0]     # [My0, H_hard, m_hard]
 # My0     = initial yield stress
 # H_hard  = hardening modulus
 # m_hard  = hardening exponent (1.0 = linear hardening)
-consistent_tangent = False   # FD-based algorithmic tangent correction for yielding GPs
+consistent_tangent = True   # FD-based algorithmic tangent correction for yielding GPs
                               # Marginal benefit with contact; can destabilize at large steps
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -705,12 +705,13 @@ def hessp(x_free, p):
             global _Fp_temp, _delta_epcum, _F_flat_cache
             F_flat = _read_F_at_ips()
             _F_flat_cache = F_flat
-            # rm_ok intentionally discarded: hessp is a tangent operator, not a
-            # state update.  On local RM failure _Fp_temp = _Fp_conv (elastic
-            # tangent), which is an acceptable approximation — same as the
-            # frozen-Fp tangent used when consistent_tangent=False.
-            _Fp_temp, _delta_epcum, _ = return_mapping(
+            _Fp_temp, _delta_epcum, rm_ok = return_mapping(
                 F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
+            if not rm_ok:
+                # Consistency with objective(): when RM fails, objective returns
+                # penalty E = 1e4*(1 + x·x), grad = 2e4*x.  The Hessian of
+                # that penalty is 2e4*I, so Hp = 2e4*p.
+                return 2e4 * p
             _write_Fp_to_gf(_Fp_temp)
 
         # Assemble material tangent at new state (uses current gf_Fp)
@@ -1581,13 +1582,16 @@ if vtk_fields == "full":
 # (IRS GridFunctions are only defined at Gauss points, not at VTK nodes).
 # Pattern from NGSolve i-tutorial unit-6.3-plasticity/plasticity.ipynb:
 #   M_draw * u_draw = integral(gf_irs * v_draw * irs_dx)
+# IMPORTANT: use L2 (not H1) for the target space.  H1 enforces inter-element
+# continuity, which causes Gibbs oscillations (negative values) when projecting
+# a sharp-edged field like epcum.  L2 gives element-local projection.
 if plastic:
-    _fes_epcum_draw = H1(mesh, order=1)
+    _fes_epcum_draw = L2(mesh, order=0)
     _pd_ep, _qd_ep = _fes_epcum_draw.TnT()
     _M_epcum = BilinearForm(_pd_ep * _qd_ep * irs_dx, symmetric=True).Assemble()
     _M_epcum_inv = _M_epcum.mat.Inverse()
     gf_epcum_irs = GridFunction(fes_ir)       # source (GP values)
-    gf_epcum_vtk = GridFunction(_fes_epcum_draw)  # target (vertex values)
+    gf_epcum_vtk = GridFunction(_fes_epcum_draw)  # target (element values)
     _vtk_coefs.append(gf_epcum_vtk)
     _vtk_names.append("epcum")
 
@@ -1647,7 +1651,8 @@ dt = dt_base            # current sub-step size
 bisect_level = 0        # current bisection depth
 prev_base_step = 0      # last completed base step (for VTK/compare triggering)
 total_substeps = 0      # total sub-step count (for summary)
-total_cutbacks = 0      # total cutback count (for summary)
+total_cutbacks = 0      # total bisection count (for summary)
+total_forced   = 0      # steps force-accepted at max cutback
 
 # Enable multi-threaded NGSolve operations (assembly, integration, solve).
 # TaskManager activates parallel element-loop assembly, integration, and
@@ -1724,6 +1729,7 @@ with TaskManager() if taskmanager else nullcontext():
         load += dt
         forced_accept = not step_converged
         if forced_accept:
+            total_forced += 1
             print(f"  >> Max cutback {max_cutback} reached — "
                   f"accepting step (load={load*100:.1f}%)")
 
@@ -1838,8 +1844,9 @@ with TaskManager() if taskmanager else nullcontext():
 
 t_total = perf_counter() - t_wall_start
 cutback_info = f", {total_cutbacks} cutbacks" if total_cutbacks > 0 else ""
+forced_info = f", {total_forced} forced" if total_forced > 0 else ""
 print(f"\nTotal wall time: {t_total:.1f} s "
-      f"({total_substeps} sub-steps{cutback_info})")
+      f"({total_substeps} sub-steps{cutback_info}{forced_info})")
 print(f"Output directory: {out_dir}")
 if perf:
     print(perf.final_summary())
