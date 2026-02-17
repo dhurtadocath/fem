@@ -2,7 +2,9 @@
 
 Usage:
     python -m nn_contact.scripts.evaluate_multitask --checkpoint nn_contact/checkpoints/multitask_v1
-
+    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_multitask.py --variant v1
+    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_multitask.py --variant v3 --resume
+    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_multitask.py --variant v2b
 Produces:
   - Per-task accuracy/error metrics (matching paper Tables/Figures)
   - Error distributions (histograms)
