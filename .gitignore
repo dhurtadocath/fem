@@ -34,3 +34,5 @@ ContactData*
 *.ini
 *.tex
 *.vtu
+*.pt
+*.bib
