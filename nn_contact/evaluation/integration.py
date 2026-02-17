@@ -35,7 +35,7 @@ class HybridCDA:
         normalizer: CoordinateNormalizer,
         gn_threshold: float = 0.5,
         confidence_threshold: float = 0.5,
-        topk: int = 1,
+        topk: int = 3,
         device: str = "cuda",
     ):
         self.device = device
@@ -55,39 +55,79 @@ class HybridCDA:
         self.model.load_state_dict(checkpoint["model_state"])
         self.model.eval()
 
+    @classmethod
+    def from_variant(
+        cls,
+        variant: str = "v1",
+        device: str = "cuda",
+        gn_threshold: float = 0.5,
+        confidence_threshold: float = 0.5,
+    ) -> "HybridCDA":
+        """Load a trained model by variant name (v1, v2, v2b, v3).
+
+        Expects checkpoints at nn_contact/checkpoints/multitask_{variant}/
+        with best_model.pt and config.pt files.
+        """
+        ckpt_dir = Path(f"nn_contact/checkpoints/multitask_{variant}")
+        model_path = ckpt_dir / "best_model.pt"
+        config_path = ckpt_dir / "config.pt"
+
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"No checkpoint for variant '{variant}' at {model_path}. "
+                f"Train with: python3 nn_contact/scripts/train_multitask.py --variant {variant}"
+            )
+
+        # Load normalizer from config.pt
+        normalizer = CoordinateNormalizer()
+        if config_path.exists():
+            config_data = torch.load(config_path, map_location="cpu", weights_only=False)
+            if "normalizer" in config_data:
+                normalizer.load_state_dict(config_data["normalizer"])
+
+        return cls(
+            model_path=model_path,
+            normalizer=normalizer,
+            gn_threshold=gn_threshold,
+            confidence_threshold=confidence_threshold,
+            device=device,
+        )
+
     @torch.no_grad()
     def predict(self, xyz: np.ndarray) -> dict[str, np.ndarray]:
-        """Predict contact quantities for slave node positions.
+        """Predict contact quantities with top-K candidates per node.
 
         Parameters
         ----------
-        xyz : (N, 3) — current slave node positions.
+        xyz : (N, 3) — current slave node positions (unnormalized).
 
         Returns
         -------
         dict with:
-            active_mask : (N,) bool — True if |g| < threshold
-            patch_ids   : (N,) int  — predicted closest patch (-1 if inactive)
-            xi_init     : (N, 2)    — initial guess for parametric coords
-            gn_approx   : (N,)      — approximate signed distance
+            active_mask : (N,) bool        — True if |g| < threshold and confident
+            patch_ids   : (N, K) int32     — top-K patch candidates (-1 if inactive)
+            xi_init     : (N, K, 2) float64 — parametric coords per candidate
+            gn_approx   : (N,) float64     — approximate signed distance (from NN)
+            patch_probs : (N, K) float64   — softmax probabilities per candidate
         """
         N = xyz.shape[0]
+        K = self.topk
         xyz_norm = self.normalizer.transform(xyz).astype(np.float32)
         xyz_t = torch.from_numpy(xyz_norm).to(self.device)
 
-        out = self.model.predict(xyz_t, topk=self.topk)
+        out = self.model.predict(xyz_t, topk=K)
 
         gn = out["gn"].cpu().numpy()
-        patch_ids = out["patch_ids"][:, 0].cpu().numpy()  # top-1
-        xi = out["xi"][:, 0, :].cpu().numpy()             # top-1 xi
-        probs = out["patch_probs"][:, 0].cpu().numpy()    # top-1 confidence
+        patch_ids = out["patch_ids"].cpu().numpy()       # (N, K)
+        xi = out["xi"].cpu().numpy()                     # (N, K, 2)
+        probs = out["patch_probs"].cpu().numpy()         # (N, K)
 
-        # Active mask: close to surface AND confident
-        active = (np.abs(gn) < self.gn_threshold) & (probs > self.confidence_threshold)
+        # Active mask: close to surface AND top-1 confident
+        active = (np.abs(gn) < self.gn_threshold) & (probs[:, 0] > self.confidence_threshold)
 
         # Inactive nodes: set to -1
-        result_patch = np.full(N, -1, dtype=np.int32)
-        result_xi = np.zeros((N, 2), dtype=np.float64)
+        result_patch = np.full((N, K), -1, dtype=np.int32)
+        result_xi = np.zeros((N, K, 2), dtype=np.float64)
         result_patch[active] = patch_ids[active]
         result_xi[active] = xi[active]
 
@@ -96,6 +136,7 @@ class HybridCDA:
             "patch_ids": result_patch,
             "xi_init": result_xi,
             "gn_approx": gn,
+            "patch_probs": probs,
         }
 
 
