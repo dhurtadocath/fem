@@ -133,10 +133,10 @@ class NeuralPullConfig:
         hidden_dims=[512, 512, 512, 512], activation="silu"
     ))
 
-    # Loss weights
+    # Loss weights (calibrated: grad/hess too aggressive destabilizes training)
     lambda_sdf: float = 1.0
-    lambda_grad: float = 10.0    # gradient (normal) supervision
-    lambda_hess: float = 1.0     # Hessian (dn/dx_s) supervision
+    lambda_grad: float = 1.0     # gradient (normal) supervision
+    lambda_hess: float = 0.1     # Hessian (dn/dx_s) supervision
     lambda_eikonal: float = 0.1  # |nabla g| = 1 regularization
 
     # Whether to use autodiff for gradient/Hessian (True) or direct output (False)

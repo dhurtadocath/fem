@@ -118,23 +118,23 @@ class HybridCDA:
         out = self.model.predict(xyz_t, topk=K)
 
         gn = out["gn"].cpu().numpy()
-        patch_ids = out["patch_ids"].cpu().numpy()       # (N, K)
-        xi = out["xi"].cpu().numpy()                     # (N, K, 2)
-        probs = out["patch_probs"].cpu().numpy()         # (N, K)
+        patch_ids = out["patch_ids"].cpu().numpy().astype(np.int32)  # (N, K)
+        xi = out["xi"].cpu().numpy().astype(np.float64)              # (N, K, 2)
+        probs = out["patch_probs"].cpu().numpy()                     # (N, K)
 
         # Active mask: close to surface AND top-1 confident
         active = (np.abs(gn) < self.gn_threshold) & (probs[:, 0] > self.confidence_threshold)
 
-        # Inactive nodes: set to -1
-        result_patch = np.full((N, K), -1, dtype=np.int32)
-        result_xi = np.zeros((N, K, 2), dtype=np.float64)
-        result_patch[active] = patch_ids[active]
-        result_xi[active] = xi[active]
+        # Zero out inactive nodes in-place (avoid extra allocation)
+        inactive = ~active
+        if inactive.any():
+            patch_ids[inactive] = -1
+            xi[inactive] = 0.0
 
         return {
             "active_mask": active,
-            "patch_ids": result_patch,
-            "xi_init": result_xi,
+            "patch_ids": patch_ids,
+            "xi_init": xi,
             "gn_approx": gn,
             "patch_probs": probs,
         }
@@ -144,17 +144,22 @@ class NeuralPullCDA:
     """Full CDA replacement using Neural-Pull SDF network.
 
     Replaces the entire projection pipeline with NN(x,y,z) -> (g, n, dn/dx_s).
-    Only viable if derivative accuracy is simulation-grade.
+
+    The network operates in normalized coordinates:
+      g_nn = g_phys / L,  ∇g_nn = n,  ∇²g_nn = L * dn/dx_raw
+    This class handles the denormalization back to physical units.
     """
 
     def __init__(
         self,
         model_path: str | Path,
         normalizer: CoordinateNormalizer,
+        char_length: float = 8.0,
         device: str = "cuda",
     ):
         self.device = device
         self.normalizer = normalizer
+        self.char_length = char_length
 
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         from nn_contact.models.neural_pull import NeuralPullNet
@@ -165,6 +170,40 @@ class NeuralPullCDA:
         self.model.load_state_dict(checkpoint["model_state"])
         self.model.eval()
 
+        # Use char_length from checkpoint if available
+        if "char_length" in checkpoint:
+            self.char_length = checkpoint["char_length"]
+
+    @classmethod
+    def from_checkpoint(
+        cls, checkpoint_dir: str | Path = "nn_contact/checkpoints/neural_pull",
+        device: str = "cuda",
+    ) -> "NeuralPullCDA":
+        """Load from checkpoint directory."""
+        ckpt_dir = Path(checkpoint_dir)
+        model_path = ckpt_dir / "best_model.pt"
+        config_path = ckpt_dir / "config.pt"
+
+        if not model_path.exists():
+            raise FileNotFoundError(f"No Neural-Pull checkpoint at {model_path}")
+
+        # Load normalizer
+        normalizer = CoordinateNormalizer()
+        char_length = 8.0
+        if config_path.exists():
+            config_data = torch.load(config_path, map_location="cpu", weights_only=False)
+            if "normalizer" in config_data:
+                normalizer = CoordinateNormalizer.from_state_dict(config_data["normalizer"])
+            if "data_config" in config_data:
+                char_length = config_data["data_config"].char_length
+
+        return cls(
+            model_path=model_path,
+            normalizer=normalizer,
+            char_length=char_length,
+            device=device,
+        )
+
     def evaluate(
         self, xyz: np.ndarray, compute_hessian: bool = True
     ) -> dict[str, np.ndarray]:
@@ -172,27 +211,45 @@ class NeuralPullCDA:
 
         Parameters
         ----------
-        xyz : (N, 3)
+        xyz : (N, 3) — slave positions in physical coordinates.
 
         Returns
         -------
         dict with:
-            gn      : (N,)     — signed distance
-            normals : (N, 3)   — surface normal
-            dndxs   : (N, 3, 3) — dn/dx_s (if compute_hessian)
+            gn      : (N,)      — signed distance (physical units)
+            normals : (N, 3)    — unit surface normal
+            xc_surf : (N, 3)    — approximate surface point: xs - gn * n
+            dndxs   : (N, 3, 3) — dn/dx_s in physical coords (if compute_hessian)
         """
+        L = self.char_length
         xyz_norm = self.normalizer.transform(xyz).astype(np.float32)
         xyz_t = torch.from_numpy(xyz_norm).to(self.device).requires_grad_(True)
 
         with torch.enable_grad():
             out = self.model.predict(xyz_t, compute_hessian=compute_hessian)
 
+        # Denormalize: g_phys = g_nn * L, normals = ∇g_nn (already unit)
+        gn = out["gn"].cpu().numpy() * L
+        normals = out["normal"].cpu().numpy()
+
+        # Normalize normals to unit length (eikonal is near-perfect but not exact)
+        norms = np.linalg.norm(normals, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        normals = normals / norms
+
+        # Surface point approximation: xc ≈ xs - g * n
+        xc_surf = xyz - gn[:, None] * normals
+
         result = {
-            "gn": out["gn"].cpu().numpy(),
-            "normals": out["normal"].cpu().numpy(),
+            "gn": gn,
+            "normals": normals,
+            "xc_surf": xc_surf,
         }
+
         if compute_hessian and "dndxs" in out:
-            result["dndxs"] = out["dndxs"].cpu().numpy()
+            # Denormalize: ∇²g_nn = L * dn/dx_raw → dn/dx_raw = hess / L
+            result["dndxs"] = out["dndxs"].cpu().numpy() / L
+
         return result
 
 

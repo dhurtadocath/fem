@@ -65,7 +65,7 @@ gtol        = 1e-12          # gradient/residual tolerance
 max_cutback = 5             # max bisection levels on non-convergence (2^5 = 32x refinement)
 
 # Hessian
-full_hessian = True         # include curvature term dn/dx_s in contact Hessian
+full_hessian = False         # include curvature term dn/dx_s in contact Hessian
 
 # Output
 compare     = False         # write comparison outputs (u arrays, reactions CSV)
@@ -87,10 +87,12 @@ plastic_param = [0.01, 0.05, 1.0]     # [My0, H_hard, m_hard]
 consistent_tangent = True   # FD-based algorithmic tangent correction for yielding GPs
                               # Marginal benefit with contact; can destabilize at large steps
 
-# AI-enhanced contact (Phase 1c: hybrid CDA with multi-task NN)
-nn_contact       = True     # enable NN broad phase for contact detection
-nn_contact_model = "v1"     # which trained variant to load: "v1", "v2", "v3"
-nn_contact_device = "cuda"  # "cuda" or "cpu" — GPU is faster for batch inference
+# AI-enhanced contact
+nn_contact       = True    # enable NN for contact detection
+nn_contact_mode  = "neural_pull"  # "multitask" (Phase 1: NN broad + C++ refine) or "neural_pull" (Phase 2: pure NN)
+nn_contact_model = "v1"     # multitask variant: "v1", "v2", "v3"
+nn_contact_device = "cuda"  # "cuda" or "cpu"
+nn_contact_topk  = 1        # multitask only: K candidates per node
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Profiling instrumentation ────────────────────────────────────────────────
@@ -381,34 +383,61 @@ radii       = np.array([p.BS.r for p in patches], dtype=np.float64)
 eps         = patches[0].eps
 npatches    = len(patches)
 
-# Dense surface sampling for KD-tree candidate selection
-sample_t  = np.linspace(0, 1, 50)
-surf_pts, surf_pids = [], []
-for pid, patch in enumerate(patches):
-    for u_s in sample_t:
-        for v_s in sample_t:
-            surf_pts.append(patch.Grg0(np.array([u_s, v_s], dtype=np.float64)))
-            surf_pids.append(pid)
-surf_pts  = np.asarray(surf_pts,  dtype=np.float64)
-surf_pids = np.asarray(surf_pids, dtype=np.int32)
-surf_kdtree = cKDTree(surf_pts)
+# --- NN contact initialization ------------------------------------------------
+hybrid_cda = None       # Phase 1: multitask NN broad phase + C++ refinement
+neural_pull_cda = None  # Phase 2: pure NN SDF (g, ∇g, ∇²g directly)
 
-print(f"Potato: {npatches} patches, {len(surf_pts)} surface samples for KD-tree")
-
-# --- NN broad phase (optional, Phase 1c) -----------------------------------
-hybrid_cda = None
 if nn_contact:
     try:
-        from nn_contact.evaluation.integration import HybridCDA
-        hybrid_cda = HybridCDA.from_variant(
-            nn_contact_model, device=nn_contact_device
-        )
-        print(f"NN contact enabled: model={nn_contact_model}, "
-              f"device={nn_contact_device}, "
-              f"gn_threshold={hybrid_cda.gn_threshold}")
+        if nn_contact_mode == "neural_pull":
+            from nn_contact.evaluation.integration import NeuralPullCDA
+            neural_pull_cda = NeuralPullCDA.from_checkpoint(device=nn_contact_device)
+            print(f"NN contact enabled: mode=neural_pull, device={nn_contact_device}, "
+                  f"char_length={neural_pull_cda.char_length}")
+        elif nn_contact_mode == "multitask":
+            from nn_contact.evaluation.integration import HybridCDA
+            hybrid_cda = HybridCDA.from_variant(
+                nn_contact_model, device=nn_contact_device,
+            )
+            hybrid_cda.topk = nn_contact_topk
+            print(f"NN contact enabled: mode=multitask, model={nn_contact_model}, "
+                  f"device={nn_contact_device}, topk={nn_contact_topk}")
+        else:
+            raise ValueError(f"Unknown nn_contact_mode: {nn_contact_mode}")
     except Exception as e:
         print(f"WARNING: NN contact disabled — {e}")
         hybrid_cda = None
+        neural_pull_cda = None
+
+# Dense surface sampling for KD-tree candidate selection
+# Skip when NN is active (only needed for classical path / multitask fallback)
+surf_kdtree = None
+surf_pts = None
+surf_pids = None
+
+def _ensure_kdtree():
+    """Lazy KD-tree construction — only built on first use."""
+    global surf_kdtree, surf_pts, surf_pids
+    if surf_kdtree is not None:
+        return
+    sample_t = np.linspace(0, 1, 50)
+    pts, pids = [], []
+    for pid, patch in enumerate(patches):
+        for u_s in sample_t:
+            for v_s in sample_t:
+                pts.append(patch.Grg0(np.array([u_s, v_s], dtype=np.float64)))
+                pids.append(pid)
+    surf_pts  = np.asarray(pts,  dtype=np.float64)
+    surf_pids = np.asarray(pids, dtype=np.int32)
+    surf_kdtree = cKDTree(surf_pts)
+    print(f"  KD-tree built: {len(surf_pts)} surface samples")
+
+_nn_active = (hybrid_cda is not None) or (neural_pull_cda is not None)
+if not _nn_active:
+    _ensure_kdtree()
+    print(f"Potato: {npatches} patches, {len(surf_pts)} surface samples for KD-tree")
+else:
+    print(f"Potato: {npatches} patches (KD-tree deferred, NN active)")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4.  IDENTIFY SLAVE (BOTTOM) AND DIRICHLET (TOP) VERTICES
@@ -470,22 +499,48 @@ class ContactCache:
         self.patch_ids   = None      # (n_slave,) int
         self.params      = None      # (n_slave, 2) parametric coords
         self.tol_reuse   = contact_tol_reuse
+        self.xc_surf     = None      # (n_slave, 3) surface points for linesearch
+        self.last_normals = None     # (n_slave, 3) normals for linesearch
 
     def reset(self):
         """Call at the start of each load step."""
         self.prev_pos = None
 
+    def _neural_pull_evaluate(self, slave_pos, compute_hessian):
+        """Pure NN evaluation: g, ∇g, ∇²g directly from Neural-Pull SDF.
+
+        No C++ calls, no patch/param caching — the NN is the sole source.
+        Returns (gn, normals, active, xc_surf, dndxs_all).
+        """
+        n_slave = slave_pos.shape[0]
+        if perf: _t0 = perf_counter()
+
+        out = neural_pull_cda.evaluate(slave_pos, compute_hessian=compute_hessian)
+
+        gn = out["gn"]
+        normals = out["normals"]
+        xc_surf = out["xc_surf"]
+        dndxs_all = out.get("dndxs", None)
+
+        if perf: perf.record("contact_neural_pull", perf_counter() - _t0)
+
+        # Store for linesearch
+        self.xc_surf = xc_surf
+        self.last_normals = normals
+        # patch_ids not meaningful for neural_pull, but set valid for _precompute_ls_data
+        self.patch_ids = np.zeros(n_slave, dtype=np.int32)
+        self.prev_pos = slave_pos.copy()
+
+        active = gn < 0
+        return gn, normals, active, dndxs_all
+
     def _nn_project(self, pos_full, compute_hessian):
-        """NN broad phase (top-K) → C++ refinement → pick best candidate.
+        """NN broad phase → C++ refinement.
 
-        1. NN predicts top-K (patch_id, xi_init) candidates per node
-        2. Evaluate ALL K candidates with batch_evaluate_contact
-        3. Pick the candidate with smallest |gap| per node
-        4. Low-confidence nodes fall back to classical TR
+        K=1: direct single-candidate evaluation (fastest, 99.79% accurate)
+        K>1: evaluate K candidates, pick smallest |gap| (safest)
 
-        Top-3 accuracy is 100%, so the correct patch is always among candidates.
-
-        Returns: (pids, params, gn, normals, dndxs) matching classical API.
+        Returns: (pids, params, gn, normals, xc_surf, dndxs).
         """
         n = pos_full.shape[0]
         nn_out = hybrid_cda.predict(pos_full)
@@ -500,47 +555,56 @@ class ContactCache:
         params = np.zeros((n, 2), dtype=np.float64)
         gn_out = np.full(n, np.inf)
         nor_out = np.zeros((n, 3))
+        xc_out  = np.zeros((n, 3))
         dndxs_out = np.zeros((n, 3, 3)) if compute_hessian else None
 
-        # ── NN path: evaluate top-K candidates, pick best ──
+        # ── NN path ──
         if idx_nn.size > 0:
             n_nn = idx_nn.size
-            K = nn_out["patch_ids"].shape[1]  # number of candidates (e.g. 3)
-            nn_pos = pos_full[idx_nn]         # (n_nn, 3)
+            K = nn_out["patch_ids"].shape[1]
 
-            # Expand to evaluate all K candidates per node in one batch call:
-            # pos_exp:  (n_nn*K, 3) — each node repeated K times
-            # pids_exp: (n_nn*K,)   — K patch candidates per node
-            # xi_exp:   (n_nn*K, 2) — K xi candidates per node
-            pos_exp  = np.repeat(nn_pos, K, axis=0)                          # (n_nn*K, 3)
-            pids_exp = nn_out["patch_ids"][idx_nn].ravel().astype(np.int32)  # (n_nn*K,)
-            xi_exp   = nn_out["xi_init"][idx_nn].reshape(-1, 2)              # (n_nn*K, 2)
+            if K == 1:
+                # Fast path: single candidate per node, no expansion needed
+                pids_k = nn_out["patch_ids"][idx_nn, 0].astype(np.int32)
+                xi_k   = nn_out["xi_init"][idx_nn, 0]
+                g_k, n_k, xc_k, dndxs_k = gb.batch_evaluate_contact(
+                    ctrlpts_all, pids_k, xi_k, pos_full[idx_nn], eps, compute_hessian)
+                pids[idx_nn]   = pids_k
+                params[idx_nn] = xi_k
+                gn_out[idx_nn] = g_k
+                nor_out[idx_nn] = n_k
+                xc_out[idx_nn]  = xc_k
+                if compute_hessian and dndxs_k.size > 0:
+                    dndxs_out[idx_nn] = dndxs_k
+            else:
+                # Multi-candidate path: expand K candidates, pick best
+                nn_pos = pos_full[idx_nn]
+                pos_exp  = np.repeat(nn_pos, K, axis=0)
+                pids_exp = nn_out["patch_ids"][idx_nn].ravel().astype(np.int32)
+                xi_exp   = nn_out["xi_init"][idx_nn].reshape(-1, 2)
 
-            # Single batch C++ call for all n_nn*K evaluations
-            g_all, n_all, _, dndxs_all_k = gb.batch_evaluate_contact(
-                ctrlpts_all, pids_exp, xi_exp, pos_exp, eps, compute_hessian)
+                g_all, n_all, xc_all, dndxs_all_k = gb.batch_evaluate_contact(
+                    ctrlpts_all, pids_exp, xi_exp, pos_exp, eps, compute_hessian)
 
-            # Reshape to (n_nn, K) and pick candidate with smallest |gap|
-            g_k = g_all.reshape(n_nn, K)             # (n_nn, K)
-            best_k = np.abs(g_k).argmin(axis=1)      # (n_nn,) index of best candidate
+                g_k = g_all.reshape(n_nn, K)
+                best_k = np.abs(g_k).argmin(axis=1)
+                flat_idx = np.arange(n_nn) * K + best_k
 
-            # Gather best results per node
-            row_idx = np.arange(n_nn)
-            flat_idx = row_idx * K + best_k           # index into expanded arrays
-
-            pids[idx_nn]   = pids_exp[flat_idx]
-            params[idx_nn] = xi_exp[flat_idx]
-            gn_out[idx_nn] = g_all[flat_idx]
-            nor_out[idx_nn] = n_all[flat_idx]
-            if compute_hessian and dndxs_all_k.size > 0:
-                dndxs_out[idx_nn] = dndxs_all_k[flat_idx]
+                pids[idx_nn]   = pids_exp[flat_idx]
+                params[idx_nn] = xi_exp[flat_idx]
+                gn_out[idx_nn] = g_all[flat_idx]
+                nor_out[idx_nn] = n_all[flat_idx]
+                xc_out[idx_nn]  = xc_all[flat_idx]
+                if compute_hessian and dndxs_all_k.size > 0:
+                    dndxs_out[idx_nn] = dndxs_all_k[flat_idx]
 
         # ── Fallback path: classical TR for low-confidence nodes ──
         if idx_fb.size > 0:
             print(f"  [NN contact] fallback to TR for {idx_fb.size}/{n} nodes "
                   f"({idx_fb.size/n*100:.1f}%)", flush=True)
+            _ensure_kdtree()  # lazy build on first fallback
             pos_fb = pos_full[idx_fb]
-            pids_fb, t1_fb, t2_fb, gn_fb, nor_fb, _ = project_points_tr_multi_batch(
+            pids_fb, t1_fb, t2_fb, gn_fb, nor_fb, xc_fb = project_points_tr_multi_batch(
                 pos_fb, xm_matrix, ctrlpts_all, radii, eps,
                 TR_INIT, TR_MIN, TR_MAX,
                 surf_kdtree, surf_pids, BASE_NCAND, MIN_NCAND,
@@ -551,6 +615,7 @@ class ContactCache:
             params[idx_fb, 1] = t2_fb
             gn_out[idx_fb]    = gn_fb
             nor_out[idx_fb]   = nor_fb
+            xc_out[idx_fb]    = xc_fb
 
             if compute_hessian:
                 params_fb = np.column_stack([t1_fb, t2_fb])
@@ -560,7 +625,7 @@ class ContactCache:
                 if dndxs_fb.size > 0:
                     dndxs_out[idx_fb] = dndxs_fb
 
-        return pids, params, gn_out, nor_out, dndxs_out
+        return pids, params, gn_out, nor_out, xc_out, dndxs_out
 
     def evaluate(self, slave_pos, compute_hessian=False):
         """Return (gn, normals, active, dndxs_all) using cache when possible.
@@ -583,9 +648,14 @@ class ContactCache:
         dndxs_all : (n_slave, 3, 3) array or None
             dn/dx_s matrices (only if compute_hessian=True)
         """
+        # ── Neural-Pull: pure NN path, no C++ at all ──
+        if neural_pull_cda is not None:
+            return self._neural_pull_evaluate(slave_pos, compute_hessian)
+
         n_slave = slave_pos.shape[0]
         gn      = np.full(n_slave, np.inf)
         normals = np.zeros((n_slave, 3))
+        xc_surf = np.zeros((n_slave, 3))
         dndxs_all = np.zeros((n_slave, 3, 3)) if compute_hessian else None
 
         # Decide per-node: reuse cache or full re-project
@@ -598,12 +668,13 @@ class ContactCache:
             idx_reuse = np.where(can_reuse)[0]
             if idx_reuse.size > 0:
                 if perf: _t0 = perf_counter()
-                g_r, n_r, _, dndxs_r = gb.batch_evaluate_contact(
+                g_r, n_r, xc_r, dndxs_r = gb.batch_evaluate_contact(
                     ctrlpts_all, self.patch_ids[idx_reuse].astype(np.int32),
                     self.params[idx_reuse], slave_pos[idx_reuse],
                     eps, compute_hessian)
                 gn[idx_reuse] = g_r
                 normals[idx_reuse] = n_r
+                xc_surf[idx_reuse] = xc_r
                 if compute_hessian and dndxs_r.size > 0:
                     dndxs_all[idx_reuse] = dndxs_r
                 need_full[idx_reuse] = False
@@ -621,13 +692,13 @@ class ContactCache:
 
             if hybrid_cda is not None:
                 # ── NN broad phase + C++ refinement (Phase 1c) ──
-                pids_b, params_b, gn_b, nor_b, dndxs_b = self._nn_project(
+                pids_b, params_b, gn_b, nor_b, xc_b, dndxs_b = self._nn_project(
                     pos_full, compute_hessian)
                 t1_b, t2_b = params_b[:, 0], params_b[:, 1]
                 if perf: perf.record("contact_nn_project", perf_counter() - _t0)
             else:
                 # ── Classical: KD-tree broad phase + TR projection ──
-                pids_b, t1_b, t2_b, gn_b, nor_b, _ = project_points_tr_multi_batch(
+                pids_b, t1_b, t2_b, gn_b, nor_b, xc_b = project_points_tr_multi_batch(
                     pos_full, xm_matrix, ctrlpts_all, radii, eps,
                     TR_INIT, TR_MIN, TR_MAX,
                     surf_kdtree, surf_pids, BASE_NCAND, MIN_NCAND,
@@ -645,6 +716,7 @@ class ContactCache:
             # Scatter batch results back (vectorized where possible)
             gn[idx_full] = gn_b
             normals[idx_full] = nor_b
+            xc_surf[idx_full] = xc_b
             self.patch_ids[idx_full] = pids_b.astype(np.int32)
             valid = pids_b >= 0
             if np.any(valid):
@@ -655,6 +727,8 @@ class ContactCache:
                 dndxs_all[idx_full] = dndxs_b
 
         self.prev_pos = slave_pos.copy()
+        self.xc_surf = xc_surf
+        self.last_normals = normals
         active = gn < 0
         return gn, normals, active, dndxs_all
 
@@ -1361,21 +1435,17 @@ def _precompute_ls_data():
     """Precompute surface points and normals for vectorized linesearch energy.
 
     Called once per Newton iteration after contact_cache.evaluate().
-    Uses batch C++ call (gb.batch_evaluate_contact) to evaluate all nodes
-    in a single pybind11 dispatch, eliminating per-node Python→C++ overhead.
+    Reuses xc_surf and normals already computed by evaluate() — no extra C++ call.
     """
     global _ls_xc, _ls_nor, _ls_valid
     n_slave = len(slave_verts)
-    if contact_cache.patch_ids is None:
+    if contact_cache.patch_ids is None or contact_cache.xc_surf is None:
         _ls_xc    = np.zeros((n_slave, 3))
         _ls_nor   = np.zeros((n_slave, 3))
         _ls_valid = np.zeros(n_slave, dtype=bool)
         return
-    # Dummy slave_pos (gaps are not used, we just need xc and nor)
-    dummy_pos = np.zeros((n_slave, 3))
-    _, _ls_nor, _ls_xc, _ = gb.batch_evaluate_contact(
-        ctrlpts_all, contact_cache.patch_ids.astype(np.int32),
-        contact_cache.params, dummy_pos, eps, False)
+    _ls_xc  = contact_cache.xc_surf
+    _ls_nor = contact_cache.last_normals
     _ls_valid = contact_cache.patch_ids >= 0
 
 
