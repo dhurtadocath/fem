@@ -45,7 +45,7 @@ from PyClasses._contact_tr_multi_helpers import project_points_tr_multi_batch
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 10                # mesh density (n x n x n hex elements)
+n           = 15                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -84,11 +84,11 @@ plastic_param = [0.01, 0.05, 1.0]     # [My0, H_hard, m_hard]
 # My0     = initial yield stress
 # H_hard  = hardening modulus
 # m_hard  = hardening exponent (1.0 = linear hardening)
-consistent_tangent = True   # FD-based algorithmic tangent correction for yielding GPs
+consistent_tangent = False   # FD-based algorithmic tangent correction for yielding GPs
                               # Marginal benefit with contact; can destabilize at large steps
 
 # AI-enhanced contact
-nn_contact       = True    # enable NN for contact detection
+nn_contact       = True   # enable NN for contact detection
 nn_contact_mode  = "multitask"  # "multitask" (Phase 1: NN broad + C++ refine) or "neural_pull" (Phase 2: pure NN)
 nn_contact_model = "v1"     # multitask variant: "v1", "v2", "v3"
 nn_contact_device = "cuda"  # "cuda" or "cpu"

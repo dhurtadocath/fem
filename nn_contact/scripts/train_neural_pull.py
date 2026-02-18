@@ -14,14 +14,21 @@ COORDINATE NORMALIZATION MATH:
 Uses SIREN architecture (sin activations) with curriculum training:
   Phase A (warmup):     L_sdf + L_eikonal only
   Phase B (gradients):  + L_grad (normal supervision)
-  Phase C (Hessians):   + L_hess (dn/dx_s supervision)
+  Phase C (Hessians):   + L_hess (dn/dx_s supervision) [optional, off by default]
 
 IMPORTANT: autodiff with create_graph=True requires float32 — no AMP autocast.
 
+Gradient-focused training (v2):
+  - Checkpoints on combined val_sdf + val_grad_weight * val_grad metric
+  - Gradient validation every epoch (not just every 10)
+  - Higher λ_grad (10.0) to prioritize normal accuracy
+  - No Hessian by default (λ_hess=0) — Hessian is optional in simulation
+
 Usage:
     PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py
-    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py --omega0 10 --lr 5e-4
+    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py --omega0 10 --lr 1e-4
     PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py --resume
+    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py --gn_min -0.2 --gn_max 0.5
 """
 
 from __future__ import annotations
@@ -54,9 +61,9 @@ def train(args):
     torch.backends.cudnn.benchmark = True
 
     # ── Config ──
-    # Override SIREN omega if specified
     from nn_contact.config import SIRENConfig
-    siren_cfg = SIRENConfig(omega_0=args.omega0, omega_hidden=args.omega0)
+    hidden_dims = [int(x) for x in args.hidden_dims.split(",")] if args.hidden_dims else [512, 512, 512, 512]
+    siren_cfg = SIRENConfig(omega_0=args.omega0, omega_hidden=args.omega0, hidden_dims=hidden_dims)
 
     model_cfg = NeuralPullConfig(
         architecture=args.arch,
@@ -71,8 +78,10 @@ def train(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Data ──
-    # Smaller batch for Hessian (create_graph=True is memory-hungry)
-    data_cfg = DataConfig(batch_size=args.batch_size, num_workers=4, pin_memory=True)
+    data_cfg = DataConfig(
+        batch_size=args.batch_size, num_workers=4, pin_memory=True,
+        gn_min=args.gn_min, gn_max=args.gn_max,
+    )
     loaders = make_dataloaders(data_cfg, seed=42, verbose=True)
     char_length = data_cfg.char_length  # 8.0
 
@@ -215,38 +224,35 @@ def train(args):
         val_sdf_sum = 0.0
         val_grad_sum = 0.0
         nv = 0
-        do_grad_val = (epoch % 10 == 0) or (epoch == grad_start) or (epoch == hess_start)
+        # Always validate gradient — it's the primary metric for contact quality
         for batch in loaders.val:
             xyz, patch_id, xi, gn, normal, dndxs = [t.to(device, non_blocking=True) for t in batch]
             gn_norm = gn / char_length
 
-            if do_grad_val:
-                # Every 10 epochs: also check gradient accuracy
-                g_pred, grad_pred = model.forward_with_grad(xyz)
-                val_sdf_sum += F.mse_loss(g_pred.squeeze(-1), gn_norm).item()
-                val_grad_sum += F.mse_loss(grad_pred, normal).item()
-            else:
-                with torch.no_grad():
-                    g_pred = model(xyz)
-                    val_sdf_sum += F.mse_loss(g_pred.squeeze(-1), gn_norm).item()
+            g_pred, grad_pred = model.forward_with_grad(xyz)
+            val_sdf_sum += F.mse_loss(g_pred.squeeze(-1), gn_norm).item()
+            val_grad_sum += F.mse_loss(grad_pred, normal).item()
 
             nv += 1
         val_sdf = val_sdf_sum / nv if nv > 0 else float("inf")
-        val_grad = val_grad_sum / nv if nv > 0 and do_grad_val else None
+        val_grad = val_grad_sum / nv if nv > 0 else float("inf")
 
         scheduler.step()
         lr = optimizer.param_groups[0]["lr"]
 
-        # Checkpoint
-        is_best = val_sdf < best_val
+        # Checkpoint on combined metric: val_sdf + weight * val_grad
+        val_combined = val_sdf + args.val_grad_weight * val_grad
+        is_best = val_combined < best_val
         if is_best:
-            best_val = val_sdf
+            best_val = val_combined
             patience_counter = 0
             state = {
                 "epoch": epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "best_val_loss": best_val,
+                "best_val_sdf": val_sdf,
+                "best_val_grad": val_grad,
                 "config": model_cfg,
                 "char_length": char_length,
             }
@@ -262,12 +268,12 @@ def train(args):
         if epoch % 10 == 0 or is_best or epoch < start_epoch + 5 or epoch in (grad_start, hess_start):
             hess_info = f" hess={train_bd.get('loss_hess', 0):.3e}" if use_hess else ""
             grad_info = f" grad={train_bd.get('loss_grad', 0):.3e}" if use_grad else ""
-            vg_info = f" val_grad={val_grad:.4e}" if val_grad is not None else ""
             print(
                 f"[{epoch:3d}/{epochs}] [{phase}] "
                 f"train={train_total:.4e} (sdf={train_bd.get('loss_sdf', 0):.3e} "
                 f"eik={train_bd.get('loss_eikonal', 0):.3e}{grad_info}{hess_info}) "
-                f"val_sdf={val_sdf:.4e}{vg_info} lr={lr:.2e} dt={dt:.0f}s{star}",
+                f"val_sdf={val_sdf:.4e} val_grad={val_grad:.4e} "
+                f"lr={lr:.2e} dt={dt:.0f}s{star}",
                 flush=True,
             )
 
@@ -280,24 +286,41 @@ def train(args):
         {"config": model_cfg, "data_config": data_cfg, "normalizer": loaders.normalizer.state_dict()},
         ckpt_dir / "config.pt",
     )
-    print(f"\nDone ({args.arch}). Best val SDF loss: {best_val:.6e}", flush=True)
+    print(f"\nDone ({args.arch}). Best val combined: {best_val:.6e}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train Neural-Pull SDF network (Phase 2)")
+    # Architecture
     parser.add_argument("--arch", default="siren", choices=["siren", "fourier_mlp", "mlp"])
-    parser.add_argument("--omega0", type=float, default=30.0,
-                        help="SIREN omega_0 frequency (default 30, try 5-10 for smooth SDF)")
-    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--omega0", type=float, default=10.0,
+                        help="SIREN omega_0 frequency (default 10; 30 is unstable)")
+    parser.add_argument("--hidden_dims", type=str, default=None,
+                        help="Comma-separated hidden dims (e.g. '1024,512,512,512')")
+    # Training
+    parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--lambda_grad", type=float, default=1.0)
-    parser.add_argument("--lambda_hess", type=float, default=0.1)
-    parser.add_argument("--lambda_eikonal", type=float, default=0.1)
-    parser.add_argument("--grad_start", type=int, default=20,
+    parser.add_argument("--lr", type=float, default=1e-4)
+    # Loss weights — gradient-focused defaults
+    parser.add_argument("--lambda_grad", type=float, default=10.0,
+                        help="Gradient supervision weight (high to prioritize normals)")
+    parser.add_argument("--lambda_hess", type=float, default=0.0,
+                        help="Hessian supervision weight (0 = disabled)")
+    parser.add_argument("--lambda_eikonal", type=float, default=0.01,
+                        help="Eikonal regularization weight")
+    # Curriculum
+    parser.add_argument("--grad_start", type=int, default=5,
                         help="Epoch to start gradient supervision")
-    parser.add_argument("--hess_start", type=int, default=60,
-                        help="Epoch to start Hessian supervision")
+    parser.add_argument("--hess_start", type=int, default=9999,
+                        help="Epoch to start Hessian supervision (9999 = disabled)")
+    # Data filtering
+    parser.add_argument("--gn_min", type=float, default=-0.5,
+                        help="Min gap for data filtering")
+    parser.add_argument("--gn_max", type=float, default=1.5,
+                        help="Max gap for data filtering")
+    # Validation / checkpointing
+    parser.add_argument("--val_grad_weight", type=float, default=1.0,
+                        help="Weight for val_grad in combined checkpoint metric")
     parser.add_argument("--patience", type=int, default=50)
     parser.add_argument("--checkpoint_dir", default="nn_contact/checkpoints/neural_pull")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
