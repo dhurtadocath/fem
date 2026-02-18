@@ -37,12 +37,14 @@ class HybridCDA:
         confidence_threshold: float = 0.5,
         topk: int = 3,
         device: str = "cuda",
+        coord_offset: np.ndarray | None = None,
     ):
         self.device = device
         self.normalizer = normalizer
         self.gn_threshold = gn_threshold
         self.confidence_threshold = confidence_threshold
         self.topk = topk
+        self.coord_offset = np.asarray(coord_offset, dtype=np.float64) if coord_offset is not None else None
 
         # Load model
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
@@ -62,13 +64,16 @@ class HybridCDA:
         device: str = "cuda",
         gn_threshold: float = 0.5,
         confidence_threshold: float = 0.5,
+        checkpoint_base: str | Path | None = None,
     ) -> "HybridCDA":
         """Load a trained model by variant name (v1, v2, v2b, v3).
 
-        Expects checkpoints at nn_contact/checkpoints/multitask_{variant}/
+        Expects checkpoints at {checkpoint_base}/multitask_{variant}/
         with best_model.pt and config.pt files.
         """
-        ckpt_dir = Path(f"nn_contact/checkpoints/multitask_{variant}")
+        if checkpoint_base is None:
+            checkpoint_base = Path(__file__).resolve().parents[1] / "checkpoints"
+        ckpt_dir = Path(checkpoint_base) / f"multitask_{variant}"
         model_path = ckpt_dir / "best_model.pt"
         config_path = ckpt_dir / "config.pt"
 
@@ -83,7 +88,7 @@ class HybridCDA:
         if config_path.exists():
             config_data = torch.load(config_path, map_location="cpu", weights_only=False)
             if "normalizer" in config_data:
-                normalizer.load_state_dict(config_data["normalizer"])
+                normalizer = CoordinateNormalizer.from_state_dict(config_data["normalizer"])
 
         return cls(
             model_path=model_path,
@@ -112,7 +117,8 @@ class HybridCDA:
         """
         N = xyz.shape[0]
         K = self.topk
-        xyz_norm = self.normalizer.transform(xyz).astype(np.float32)
+        xyz_shifted = xyz + self.coord_offset if self.coord_offset is not None else xyz
+        xyz_norm = self.normalizer.transform(xyz_shifted).astype(np.float32)
         xyz_t = torch.from_numpy(xyz_norm).to(self.device)
 
         out = self.model.predict(xyz_t, topk=K)
@@ -122,10 +128,17 @@ class HybridCDA:
         xi = out["xi"].cpu().numpy().astype(np.float64)              # (N, K, 2)
         probs = out["patch_probs"].cpu().numpy()                     # (N, K)
 
-        # Active mask: close to surface AND top-1 confident
-        active = (np.abs(gn) < self.gn_threshold) & (probs[:, 0] > self.confidence_threshold)
+        confident = probs[:, 0] > self.confidence_threshold
+        near_surface = np.abs(gn) < self.gn_threshold
 
-        # Zero out inactive nodes in-place (avoid extra allocation)
+        # NN-active: confident AND near surface → use NN patch + C++ refinement
+        active = confident & near_surface
+
+        # Low-confidence: not confident → need classical TR fallback
+        # Far-field: confident but far → skip entirely (gn >> 0, no contact)
+        needs_fallback = ~confident
+
+        # Zero out inactive nodes in-place
         inactive = ~active
         if inactive.any():
             patch_ids[inactive] = -1
@@ -133,6 +146,7 @@ class HybridCDA:
 
         return {
             "active_mask": active,
+            "needs_fallback": needs_fallback,
             "patch_ids": patch_ids,
             "xi_init": xi,
             "gn_approx": gn,
@@ -156,10 +170,12 @@ class NeuralPullCDA:
         normalizer: CoordinateNormalizer,
         char_length: float = 8.0,
         device: str = "cuda",
+        coord_offset: np.ndarray | None = None,
     ):
         self.device = device
         self.normalizer = normalizer
         self.char_length = char_length
+        self.coord_offset = np.asarray(coord_offset, dtype=np.float64) if coord_offset is not None else None
 
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         from nn_contact.models.neural_pull import NeuralPullNet
@@ -176,10 +192,12 @@ class NeuralPullCDA:
 
     @classmethod
     def from_checkpoint(
-        cls, checkpoint_dir: str | Path = "nn_contact/checkpoints/neural_pull",
+        cls, checkpoint_dir: str | Path | None = None,
         device: str = "cuda",
     ) -> "NeuralPullCDA":
         """Load from checkpoint directory."""
+        if checkpoint_dir is None:
+            checkpoint_dir = Path(__file__).resolve().parents[1] / "checkpoints" / "neural_pull"
         ckpt_dir = Path(checkpoint_dir)
         model_path = ckpt_dir / "best_model.pt"
         config_path = ckpt_dir / "config.pt"
@@ -222,7 +240,8 @@ class NeuralPullCDA:
             dndxs   : (N, 3, 3) — dn/dx_s in physical coords (if compute_hessian)
         """
         L = self.char_length
-        xyz_norm = self.normalizer.transform(xyz).astype(np.float32)
+        xyz_shifted = xyz + self.coord_offset if self.coord_offset is not None else xyz
+        xyz_norm = self.normalizer.transform(xyz_shifted).astype(np.float32)
         xyz_t = torch.from_numpy(xyz_norm).to(self.device).requires_grad_(True)
 
         with torch.enable_grad():

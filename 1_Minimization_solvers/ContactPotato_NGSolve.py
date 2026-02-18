@@ -45,7 +45,7 @@ from PyClasses._contact_tr_multi_helpers import project_points_tr_multi_batch
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 5                # mesh density (n x n x n hex elements)
+n           = 10                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -79,7 +79,7 @@ profile     = False        # built-in per-operation timing (prints breakdown per
 linear_solver = "pardiso"  # "umfpack" | "pardiso" | "mumps" — direct solver for Newton
 
 # Plasticity (J2 von Mises, multiplicative decomposition F = Fe·Fp)
-plastic       = True                 # enable elastoplastic constitutive model
+plastic       = True                  # enable elastoplastic constitutive model
 plastic_param = [0.01, 0.05, 1.0]     # [My0, H_hard, m_hard]
 # My0     = initial yield stress
 # H_hard  = hardening modulus
@@ -89,10 +89,10 @@ consistent_tangent = True   # FD-based algorithmic tangent correction for yieldi
 
 # AI-enhanced contact
 nn_contact       = True    # enable NN for contact detection
-nn_contact_mode  = "neural_pull"  # "multitask" (Phase 1: NN broad + C++ refine) or "neural_pull" (Phase 2: pure NN)
+nn_contact_mode  = "multitask"  # "multitask" (Phase 1: NN broad + C++ refine) or "neural_pull" (Phase 2: pure NN)
 nn_contact_model = "v1"     # multitask variant: "v1", "v2", "v3"
 nn_contact_device = "cuda"  # "cuda" or "cpu"
-nn_contact_topk  = 1        # multitask only: K candidates per node
+nn_contact_topk  = 3        # multitask only: K candidates per node
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Profiling instrumentation ────────────────────────────────────────────────
@@ -387,11 +387,21 @@ npatches    = len(patches)
 hybrid_cda = None       # Phase 1: multitask NN broad phase + C++ refinement
 neural_pull_cda = None  # Phase 2: pure NN SDF (g, ∇g, ∇²g directly)
 
+# Training data was generated with potato shifted to origin (x -= 6).
+# The NN expects coordinates in that shifted frame.
+_ptt_center = np.array(ptt.X).mean(axis=0)
+_nn_coord_offset = -_ptt_center  # [-6, 0, 0] approximately
+# Bounding-sphere pre-filter: nodes beyond this distance can't be in contact.
+# Training data covers gap in [-0.5, 1.5], so max distance from center is R + gn_max.
+_ptt_bounding_r = np.linalg.norm(np.array(ptt.X) - _ptt_center, axis=1).max()
+_nn_cutoff_r = _ptt_bounding_r + 1.5  # conservative: beyond training data range
+
 if nn_contact:
     try:
         if nn_contact_mode == "neural_pull":
             from nn_contact.evaluation.integration import NeuralPullCDA
             neural_pull_cda = NeuralPullCDA.from_checkpoint(device=nn_contact_device)
+            neural_pull_cda.coord_offset = _nn_coord_offset
             print(f"NN contact enabled: mode=neural_pull, device={nn_contact_device}, "
                   f"char_length={neural_pull_cda.char_length}")
         elif nn_contact_mode == "multitask":
@@ -400,6 +410,7 @@ if nn_contact:
                 nn_contact_model, device=nn_contact_device,
             )
             hybrid_cda.topk = nn_contact_topk
+            hybrid_cda.coord_offset = _nn_coord_offset
             print(f"NN contact enabled: mode=multitask, model={nn_contact_model}, "
                   f"device={nn_contact_device}, topk={nn_contact_topk}")
         else:
@@ -510,24 +521,35 @@ class ContactCache:
         """Pure NN evaluation: g, ∇g, ∇²g directly from Neural-Pull SDF.
 
         No C++ calls, no patch/param caching — the NN is the sole source.
-        Returns (gn, normals, active, xc_surf, dndxs_all).
+        Returns (gn, normals, active, dndxs_all).
         """
         n_slave = slave_pos.shape[0]
         if perf: _t0 = perf_counter()
 
-        out = neural_pull_cda.evaluate(slave_pos, compute_hessian=compute_hessian)
+        # Bounding-sphere pre-filter: skip nodes far from the potato
+        dist_to_center = np.linalg.norm(slave_pos - _ptt_center, axis=1)
+        near_mask = dist_to_center < _nn_cutoff_r
 
-        gn = out["gn"]
-        normals = out["normals"]
-        xc_surf = out["xc_surf"]
-        dndxs_all = out.get("dndxs", None)
+        gn = np.full(n_slave, np.inf)
+        normals = np.zeros((n_slave, 3))
+        xc_surf = np.zeros((n_slave, 3))
+        dndxs_all = np.zeros((n_slave, 3, 3)) if compute_hessian else None
+
+        idx_near = np.where(near_mask)[0]
+        if idx_near.size > 0:
+            out = neural_pull_cda.evaluate(
+                slave_pos[idx_near], compute_hessian=compute_hessian)
+            gn[idx_near] = out["gn"]
+            normals[idx_near] = out["normals"]
+            xc_surf[idx_near] = out["xc_surf"]
+            if compute_hessian and "dndxs" in out:
+                dndxs_all[idx_near] = out["dndxs"]
 
         if perf: perf.record("contact_neural_pull", perf_counter() - _t0)
 
         # Store for linesearch
         self.xc_surf = xc_surf
         self.last_normals = normals
-        # patch_ids not meaningful for neural_pull, but set valid for _precompute_ls_data
         self.patch_ids = np.zeros(n_slave, dtype=np.int32)
         self.prev_pos = slave_pos.copy()
 
@@ -535,22 +557,26 @@ class ContactCache:
         return gn, normals, active, dndxs_all
 
     def _nn_project(self, pos_full, compute_hessian):
-        """NN broad phase → C++ refinement.
+        """NN broad phase → C++ TR projection (paper's approach).
 
-        K=1: direct single-candidate evaluation (fastest, 99.79% accurate)
-        K>1: evaluate K candidates, pick smallest |gap| (safest)
+        The NN replaces the KD-tree broad phase: it predicts top-K candidate
+        patches per node.  Then C++ trust-region projection runs on those
+        candidates to find the EXACT closest point (geometrically precise gap).
+
+        Three categories:
+        - NN-active (confident + near surface): NN candidates → C++ TR → exact gap
+        - Far-field (confident + far): skip, gn=+inf (no contact)
+        - Low-confidence (rare): classical TR fallback with KD-tree
 
         Returns: (pids, params, gn, normals, xc_surf, dndxs).
         """
         n = pos_full.shape[0]
-        nn_out = hybrid_cda.predict(pos_full)
 
-        # Separate into NN-confident vs fallback-to-TR
-        nn_active = nn_out["active_mask"]
-        idx_nn = np.where(nn_active)[0]
-        idx_fb = np.where(~nn_active)[0]
+        # Bounding-sphere pre-filter: only query NN for nodes near the potato
+        dist_to_center = np.linalg.norm(pos_full - _ptt_center, axis=1)
+        near_mask = dist_to_center < _nn_cutoff_r
 
-        # Allocate output arrays
+        # Allocate output arrays (far nodes keep gn=+inf → no contact)
         pids   = np.full(n, -1, dtype=np.int32)
         params = np.zeros((n, 2), dtype=np.float64)
         gn_out = np.full(n, np.inf)
@@ -558,51 +584,59 @@ class ContactCache:
         xc_out  = np.zeros((n, 3))
         dndxs_out = np.zeros((n, 3, 3)) if compute_hessian else None
 
-        # ── NN path ──
+        idx_near = np.where(near_mask)[0]
+        if idx_near.size == 0:
+            return pids, params, gn_out, nor_out, xc_out, dndxs_out
+
+        nn_out = hybrid_cda.predict(pos_full[idx_near])
+
+        # Map NN indices back to full arrays
+        idx_nn_local = np.where(nn_out["active_mask"])[0]
+        idx_fb_local = np.where(nn_out["needs_fallback"])[0]
+        idx_nn = idx_near[idx_nn_local]
+        idx_fb = idx_near[idx_fb_local]
+
+        # ── NN path: use same batch C++ as classical, NN candidates as seeds ──
         if idx_nn.size > 0:
-            n_nn = idx_nn.size
-            K = nn_out["patch_ids"].shape[1]
+            nn_pids = nn_out["patch_ids"][idx_nn_local]  # (n_nn, K)
+            pos_nn = pos_full[idx_nn]
 
-            if K == 1:
-                # Fast path: single candidate per node, no expansion needed
-                pids_k = nn_out["patch_ids"][idx_nn, 0].astype(np.int32)
-                xi_k   = nn_out["xi_init"][idx_nn, 0]
-                g_k, n_k, xc_k, dndxs_k = gb.batch_evaluate_contact(
-                    ctrlpts_all, pids_k, xi_k, pos_full[idx_nn], eps, compute_hessian)
-                pids[idx_nn]   = pids_k
-                params[idx_nn] = xi_k
-                gn_out[idx_nn] = g_k
-                nor_out[idx_nn] = n_k
-                xc_out[idx_nn]  = xc_k
-                if compute_hessian and dndxs_k.size > 0:
-                    dndxs_out[idx_nn] = dndxs_k
-            else:
-                # Multi-candidate path: expand K candidates, pick best
-                nn_pos = pos_full[idx_nn]
-                pos_exp  = np.repeat(nn_pos, K, axis=0)
-                pids_exp = nn_out["patch_ids"][idx_nn].ravel().astype(np.int32)
-                xi_exp   = nn_out["xi_init"][idx_nn].reshape(-1, 2)
+            # Use find_signed_distance_multi_points with NN candidates
+            # replacing KD-tree candidates.  The C++ function internally
+            # merges these with BS-distance candidates (safety net).
+            tr_pids_nn, t1_nn, t2_nn, gn_nn, nor_nn, xc_nn = \
+                gb.find_signed_distance_multi_points(
+                    ctrlpts_all, pos_nn, xm_matrix,
+                    nn_pids.astype(np.int32),
+                    radii, eps, TR_INIT, TR_MIN, TR_MAX,
+                    BASE_NCAND, MIN_NCAND, MAX_NCAND, RADIUS_FACTOR,
+                )
+            tr_pids_nn = np.asarray(tr_pids_nn, dtype=np.int32)
 
-                g_all, n_all, xc_all, dndxs_all_k = gb.batch_evaluate_contact(
-                    ctrlpts_all, pids_exp, xi_exp, pos_exp, eps, compute_hessian)
-
-                g_k = g_all.reshape(n_nn, K)
-                best_k = np.abs(g_k).argmin(axis=1)
-                flat_idx = np.arange(n_nn) * K + best_k
-
-                pids[idx_nn]   = pids_exp[flat_idx]
-                params[idx_nn] = xi_exp[flat_idx]
-                gn_out[idx_nn] = g_all[flat_idx]
-                nor_out[idx_nn] = n_all[flat_idx]
-                xc_out[idx_nn]  = xc_all[flat_idx]
-                if compute_hessian and dndxs_all_k.size > 0:
-                    dndxs_out[idx_nn] = dndxs_all_k[flat_idx]
+            valid = tr_pids_nn >= 0
+            idx_valid = idx_nn[valid]
+            if idx_valid.size > 0:
+                pids[idx_valid]      = tr_pids_nn[valid]
+                params[idx_valid, 0] = np.asarray(t1_nn)[valid]
+                params[idx_valid, 1] = np.asarray(t2_nn)[valid]
+                gn_out[idx_valid]    = np.asarray(gn_nn)[valid]
+                nor_out[idx_valid]   = np.asarray(nor_nn)[valid]
+                xc_out[idx_valid]    = np.asarray(xc_nn)[valid]
+                if compute_hessian:
+                    params_v = np.column_stack([
+                        np.asarray(t1_nn)[valid],
+                        np.asarray(t2_nn)[valid]])
+                    _, _, _, dndxs_v = gb.batch_evaluate_contact(
+                        ctrlpts_all, tr_pids_nn[valid], params_v,
+                        pos_nn[valid], eps, True)
+                    if dndxs_v.size > 0:
+                        dndxs_out[idx_valid] = dndxs_v
 
         # ── Fallback path: classical TR for low-confidence nodes ──
         if idx_fb.size > 0:
             print(f"  [NN contact] fallback to TR for {idx_fb.size}/{n} nodes "
                   f"({idx_fb.size/n*100:.1f}%)", flush=True)
-            _ensure_kdtree()  # lazy build on first fallback
+            _ensure_kdtree()
             pos_fb = pos_full[idx_fb]
             pids_fb, t1_fb, t2_fb, gn_fb, nor_fb, xc_fb = project_points_tr_multi_batch(
                 pos_fb, xm_matrix, ctrlpts_all, radii, eps,
@@ -1504,7 +1538,12 @@ def newton_solve():
     gn, normals, active : arrays
         Final contact state (from last iteration)
     """
-    newton_gtol = max(gtol, 1e-10)
+    # Neural-Pull bypasses C++ entirely → irreducible gap error ~0.01 →
+    # residual floor ~kn * 0.01.  Multitask uses C++ TR refinement → exact gaps.
+    if neural_pull_cda is not None:
+        newton_gtol = max(gtol, 1e-3)
+    else:
+        newton_gtol = gtol
     _u_backup = gfu.vec.FV().NumPy().copy()
 
     rnorm_prev = np.inf
