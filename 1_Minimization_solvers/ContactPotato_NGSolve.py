@@ -75,11 +75,11 @@ vtk_fields  = "minimal"    # "minimal" | "standard" | "full" (see Section 7)
 # Performance
 taskmanager = "auto"       # True/False/"auto" — auto enables for n >= 30 (27k+ elements)
 realcompile = "auto"       # True/False/"auto" — auto enables for nsteps >= 20
-profile     = False        # built-in per-operation timing (prints breakdown per step)
+profile     = True        # built-in per-operation timing (prints breakdown per step)
 linear_solver = "pardiso"  # "umfpack" | "pardiso" | "mumps" — direct solver for Newton
 
 # Plasticity (J2 von Mises, multiplicative decomposition F = Fe·Fp)
-plastic       = True                  # enable elastoplastic constitutive model
+plastic       = False                  # enable elastoplastic constitutive model
 plastic_param = [0.01, 0.05, 1.0]     # [My0, H_hard, m_hard]
 # My0     = initial yield stress
 # H_hard  = hardening modulus
@@ -557,14 +557,15 @@ class ContactCache:
         return gn, normals, active, dndxs_all
 
     def _nn_project(self, pos_full, compute_hessian):
-        """NN broad phase → C++ TR projection (paper's approach).
+        """NN broad phase → warm-started Newton refinement.
 
-        The NN replaces the KD-tree broad phase: it predicts top-K candidate
-        patches per node.  Then C++ trust-region projection runs on those
-        candidates to find the EXACT closest point (geometrically precise gap).
+        Two-phase approach for NN-active nodes:
+        1. Fast path: Newton refinement from NN's (patch, xi) prediction
+           using batch_refine_from_init — converges in 1-3 iterations.
+        2. Slow path: full TR projection for the ~1% that don't converge.
 
         Three categories:
-        - NN-active (confident + near surface): NN candidates → C++ TR → exact gap
+        - NN-active (confident + near surface): Newton warm-start → exact gap
         - Far-field (confident + far): skip, gn=+inf (no contact)
         - Low-confidence (rare): classical TR fallback with KD-tree
 
@@ -596,45 +597,78 @@ class ContactCache:
         idx_nn = idx_near[idx_nn_local]
         idx_fb = idx_near[idx_fb_local]
 
-        # ── NN path: use same batch C++ as classical, NN candidates as seeds ──
+        # ── NN path: Newton refinement from NN initial guess (fast path) ──
         if idx_nn.size > 0:
-            nn_pids = nn_out["patch_ids"][idx_nn_local]  # (n_nn, K)
-            pos_nn = pos_full[idx_nn]
+            nn_pids = nn_out["patch_ids"][idx_nn_local, 0]   # top-1 patch
+            nn_xi   = nn_out["xi_init"][idx_nn_local, 0]     # top-1 xi (N, 2)
+            pos_nn  = pos_full[idx_nn]
 
-            # Use find_signed_distance_multi_points with NN candidates
-            # replacing KD-tree candidates.  The C++ function internally
-            # merges these with BS-distance candidates (safety net).
-            tr_pids_nn, t1_nn, t2_nn, gn_nn, nor_nn, xc_nn = \
-                gb.find_signed_distance_multi_points(
-                    ctrlpts_all, pos_nn, xm_matrix,
+            # Fast path: Newton refinement from NN's (patch, xi) guess
+            conv_mask, ref_pids, ref_t1, ref_t2, ref_gn, ref_nor, ref_xc = \
+                gb.batch_refine_from_init(
+                    ctrlpts_all,
                     nn_pids.astype(np.int32),
-                    radii, eps, TR_INIT, TR_MIN, TR_MAX,
-                    BASE_NCAND, MIN_NCAND, MAX_NCAND, RADIUS_FACTOR,
-                )
-            tr_pids_nn = np.asarray(tr_pids_nn, dtype=np.int32)
+                    nn_xi.astype(np.float64),
+                    pos_nn, radii, eps)
 
-            valid = tr_pids_nn >= 0
-            idx_valid = idx_nn[valid]
-            if idx_valid.size > 0:
-                pids[idx_valid]      = tr_pids_nn[valid]
-                params[idx_valid, 0] = np.asarray(t1_nn)[valid]
-                params[idx_valid, 1] = np.asarray(t2_nn)[valid]
-                gn_out[idx_valid]    = np.asarray(gn_nn)[valid]
-                nor_out[idx_valid]   = np.asarray(nor_nn)[valid]
-                xc_out[idx_valid]    = np.asarray(xc_nn)[valid]
+            conv = np.asarray(conv_mask, dtype=bool)
+            idx_conv = idx_nn[conv]
+            if idx_conv.size > 0:
+                pids[idx_conv]      = np.asarray(ref_pids)[conv]
+                params[idx_conv, 0] = np.asarray(ref_t1)[conv]
+                params[idx_conv, 1] = np.asarray(ref_t2)[conv]
+                gn_out[idx_conv]    = np.asarray(ref_gn)[conv]
+                nor_out[idx_conv]   = np.asarray(ref_nor)[conv]
+                xc_out[idx_conv]    = np.asarray(ref_xc)[conv]
                 if compute_hessian:
-                    params_v = np.column_stack([
-                        np.asarray(t1_nn)[valid],
-                        np.asarray(t2_nn)[valid]])
-                    _, _, _, dndxs_v = gb.batch_evaluate_contact(
-                        ctrlpts_all, tr_pids_nn[valid], params_v,
-                        pos_nn[valid], eps, True)
-                    if dndxs_v.size > 0:
-                        dndxs_out[idx_valid] = dndxs_v
+                    params_c = np.column_stack([
+                        np.asarray(ref_t1)[conv],
+                        np.asarray(ref_t2)[conv]])
+                    _, _, _, dndxs_c = gb.batch_evaluate_contact(
+                        ctrlpts_all, np.asarray(ref_pids)[conv].astype(np.int32),
+                        params_c, pos_nn[conv], eps, True)
+                    if dndxs_c.size > 0:
+                        dndxs_out[idx_conv] = dndxs_c
+
+            # Slow path: full TR for non-converged nodes (~1% expected)
+            idx_nonconv = idx_nn[~conv]
+            if idx_nonconv.size > 0:
+                n_nc = idx_nonconv.size
+                print(f"  [NN contact] Newton non-conv: {n_nc}/{idx_nn.size} "
+                      f"({n_nc/idx_nn.size*100:.1f}%) → full TR", flush=True)
+                # Use NN top-K as candidate seeds for full TR
+                nn_pids_k = nn_out["patch_ids"][idx_nn_local[~conv]]  # (n_nc, K)
+                pos_nc = pos_full[idx_nonconv]
+                fb_pids, fb_t1, fb_t2, fb_gn, fb_nor, fb_xc = \
+                    gb.find_signed_distance_multi_points(
+                        ctrlpts_all, pos_nc, xm_matrix,
+                        nn_pids_k.astype(np.int32),
+                        radii, eps, TR_INIT, TR_MIN, TR_MAX,
+                        BASE_NCAND, MIN_NCAND, MAX_NCAND, RADIUS_FACTOR,
+                    )
+                fb_pids = np.asarray(fb_pids, dtype=np.int32)
+                valid_fb = fb_pids >= 0
+                idx_vfb = idx_nonconv[valid_fb]
+                if idx_vfb.size > 0:
+                    pids[idx_vfb]      = fb_pids[valid_fb]
+                    params[idx_vfb, 0] = np.asarray(fb_t1)[valid_fb]
+                    params[idx_vfb, 1] = np.asarray(fb_t2)[valid_fb]
+                    gn_out[idx_vfb]    = np.asarray(fb_gn)[valid_fb]
+                    nor_out[idx_vfb]   = np.asarray(fb_nor)[valid_fb]
+                    xc_out[idx_vfb]    = np.asarray(fb_xc)[valid_fb]
+                    if compute_hessian:
+                        params_fb = np.column_stack([
+                            np.asarray(fb_t1)[valid_fb],
+                            np.asarray(fb_t2)[valid_fb]])
+                        _, _, _, dndxs_fb = gb.batch_evaluate_contact(
+                            ctrlpts_all, fb_pids[valid_fb], params_fb,
+                            pos_nc[valid_fb], eps, True)
+                        if dndxs_fb.size > 0:
+                            dndxs_out[idx_vfb] = dndxs_fb
 
         # ── Fallback path: classical TR for low-confidence nodes ──
         if idx_fb.size > 0:
-            print(f"  [NN contact] fallback to TR for {idx_fb.size}/{n} nodes "
+            print(f"  [NN contact] low-conf fallback to TR for {idx_fb.size}/{n} nodes "
                   f"({idx_fb.size/n*100:.1f}%)", flush=True)
             _ensure_kdtree()
             pos_fb = pos_full[idx_fb]

@@ -1707,6 +1707,138 @@ py::tuple batch_evaluate_contact(
 }
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Batch Newton refinement from NN initial guess.
+// For each slave node, takes NN-predicted (patch_id, t1, t2) and runs
+// newton_refine_t_core from that starting point.  Validates convergence
+// with a geometric final check.  Non-converged nodes are flagged so the
+// caller can fall back to full TR projection.
+// ═══════════════════════════════════════════════════════════════════════════
+
+py::tuple batch_refine_from_init(
+    const Eigen::MatrixXd &CtrlPtsAll,   // (npatches*20, 3)
+    py::array_t<int> patch_ids_arr,      // (N,) NN-predicted patch IDs
+    py::array_t<double> t_init_arr,      // (N, 2) NN-predicted (t1, t2)
+    const Eigen::MatrixXd &slave_pos,    // (N, 3) slave positions
+    py::array_t<double> radii_arr,       // (npatches,) BS radii for geom check
+    double eps)
+{
+    const int rows_per_patch = 20;
+    int nPatches = static_cast<int>(CtrlPtsAll.rows() / rows_per_patch);
+    int nPoints = static_cast<int>(slave_pos.rows());
+
+    // Access input arrays
+    auto pid_buf = patch_ids_arr.request();
+    int *pid_ptr = static_cast<int*>(pid_buf.ptr);
+
+    auto ti_buf = t_init_arr.request();
+    double *ti_ptr = static_cast<double*>(ti_buf.ptr);
+
+    auto rad_buf = radii_arr.request();
+    double *rad_ptr = static_cast<double*>(rad_buf.ptr);
+
+    // Allocate output arrays
+    py::array_t<bool>   conv_out({nPoints});
+    py::array_t<int>    pids_out({nPoints});
+    py::array_t<double> t1_out({nPoints});
+    py::array_t<double> t2_out({nPoints});
+    py::array_t<double> gn_out({nPoints});
+    py::array_t<double> nor_out({nPoints, 3});
+    py::array_t<double> xc_out({nPoints, 3});
+
+    auto conv_buf = conv_out.request();
+    auto po_buf   = pids_out.request();
+    auto t1_buf   = t1_out.request();
+    auto t2_buf   = t2_out.request();
+    auto gn_buf   = gn_out.request();
+    auto no_buf   = nor_out.request();
+    auto xo_buf   = xc_out.request();
+
+    bool   *conv_ptr = static_cast<bool*>(conv_buf.ptr);
+    int    *po_ptr   = static_cast<int*>(po_buf.ptr);
+    double *t1_ptr   = static_cast<double*>(t1_buf.ptr);
+    double *t2_ptr   = static_cast<double*>(t2_buf.ptr);
+    double *gn_ptr   = static_cast<double*>(gn_buf.ptr);
+    double *no_ptr   = static_cast<double*>(no_buf.ptr);
+    double *xo_ptr   = static_cast<double*>(xo_buf.ptr);
+
+    // Initialize outputs (not converged, invalid)
+    for (int i = 0; i < nPoints; ++i) {
+        conv_ptr[i] = false;
+        po_ptr[i]   = -1;
+        t1_ptr[i]   = 0.0;
+        t2_ptr[i]   = 0.0;
+        gn_ptr[i]   = std::numeric_limits<double>::infinity();
+        no_ptr[3*i] = 0.0; no_ptr[3*i+1] = 0.0; no_ptr[3*i+2] = 0.0;
+        xo_ptr[3*i] = 0.0; xo_ptr[3*i+1] = 0.0; xo_ptr[3*i+2] = 0.0;
+    }
+
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < nPoints; ++i) {
+        int pid = pid_ptr[i];
+        if (pid < 0 || pid >= nPatches) continue;
+
+        Eigen::Vector3d xs = slave_pos.row(i);
+
+        // Extract control points for this patch (20×3 block)
+        Eigen::Matrix<double, 20, 3> CP = CtrlPtsAll.block(
+            pid * rows_per_patch, 0, rows_per_patch, 3);
+
+        // Starting point from NN prediction
+        Eigen::Vector2d t(ti_ptr[2*i], ti_ptr[2*i + 1]);
+
+        // Compute initial objective: m = ||Grg(t) - xs||²
+        Eigen::Vector3d xc_init = Grg_impl(CP, t.x(), t.y(), eps);
+        double m = (xc_init - xs).squaredNorm();
+
+        // Newton refinement from NN's initial guess
+        newton_refine_t_core(CP, xs, eps, t, m);
+
+        double u = t.x();
+        double v = t.y();
+
+        // Geometric final check (same as find_projection_tr_multi_internal)
+        double r = rad_ptr[pid];
+        bool inside = (u > 0.0 && u < 1.0 && v > 0.0 && v < 1.0);
+        if (!inside) {
+            double uc = std::min(1.0, std::max(0.0, u));
+            double vc = std::min(1.0, std::max(0.0, v));
+            Eigen::Vector3d xc0, nor0;
+            point_and_normal_internal(CP, uc, vc, eps, xc0, nor0);
+            Eigen::Vector3d diff0 = xs - xc0;
+            Eigen::Vector3d x_tang = diff0 - diff0.dot(nor0) * nor0;
+            if (x_tang.norm() > 2.0 * r / 100.0) {
+                // Outside patch boundary — mark as not converged
+                continue;
+            }
+            // Use clamped parameters
+            u = uc;
+            v = vc;
+        }
+
+        // Compute signed distance and normal at refined (u, v)
+        Eigen::Vector3d xc, nor;
+        point_and_normal_internal(CP, u, v, eps, xc, nor);
+
+        // Check for degenerate normal
+        if (nor.squaredNorm() < 1e-30) continue;
+
+        double gn = (xs - xc).dot(nor);
+
+        // Store results
+        conv_ptr[i] = true;
+        po_ptr[i]   = pid;
+        t1_ptr[i]   = u;
+        t2_ptr[i]   = v;
+        gn_ptr[i]   = gn;
+        no_ptr[3*i] = nor(0); no_ptr[3*i+1] = nor(1); no_ptr[3*i+2] = nor(2);
+        xo_ptr[3*i] = xc(0);  xo_ptr[3*i+1] = xc(1);  xo_ptr[3*i+2] = xc(2);
+    }
+
+    return py::make_tuple(conv_out, pids_out, t1_out, t2_out, gn_out, nor_out, xc_out);
+}
+
+
 PYBIND11_MODULE(gregory_patch_backend, m) {
     m.doc() = "C++ backend for Gregory patch calculations and BoundingSphere operations";
     m.def("Grg", &Grg, "A function that calculates a point on a Gregory patch");
@@ -1731,4 +1863,8 @@ PYBIND11_MODULE(gregory_patch_backend, m) {
           "Batch evaluate contact gap, normal, surface point (and optionally dn/dxs) for multiple slave nodes",
           py::arg("CtrlPtsAll"), py::arg("patch_ids"), py::arg("t_params"),
           py::arg("slave_pos"), py::arg("eps"), py::arg("compute_hessian") = false);
+    m.def("batch_refine_from_init", &batch_refine_from_init,
+          "Newton-refine contact projection from NN initial guess (batch, OpenMP)",
+          py::arg("CtrlPtsAll"), py::arg("patch_ids"), py::arg("t_init"),
+          py::arg("slave_pos"), py::arg("radii"), py::arg("eps"));
 }
