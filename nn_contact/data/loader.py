@@ -110,12 +110,46 @@ class ContactDataLoaders(NamedTuple):
     n_val: int
 
 
-def make_dataloaders(cfg: DataConfig, seed: int = 42, verbose: bool = True) -> ContactDataLoaders:
+def make_dataloaders(
+    cfg: DataConfig, seed: int = 42, verbose: bool = True,
+    data_fraction: float = 1.0,
+) -> ContactDataLoaders:
     """End-to-end: Feather -> train/val DataLoaders.
 
     Each batch yields ``(xyz, patch_id, xi, gn, normal, dndxs)``.
+
+    Parameters
+    ----------
+    data_fraction : float in (0, 1]
+        Subsample fraction for fast iteration. Stratified by patch to preserve
+        distribution. Applied before train/val split.
     """
     data = load_feather(cfg, verbose=verbose)
+
+    # --- optional subsampling for fast iteration ---
+    if data_fraction < 1.0:
+        rng = np.random.RandomState(seed + 999)
+        n_total = len(data.xyz)
+        # Stratified subsample to keep patch distribution
+        keep_idx = []
+        for pid in np.unique(data.patch_id):
+            pidx = np.where(data.patch_id == pid)[0]
+            n_keep = max(1, int(len(pidx) * data_fraction))
+            rng.shuffle(pidx)
+            keep_idx.append(pidx[:n_keep])
+        keep_idx = np.concatenate(keep_idx)
+        keep_idx.sort()
+        data = ContactDataArrays(
+            xyz=data.xyz[keep_idx],
+            patch_id=data.patch_id[keep_idx],
+            xi=data.xi[keep_idx],
+            gn=data.gn[keep_idx],
+            normal=data.normal[keep_idx],
+            dndxs=data.dndxs[keep_idx],
+            normalizer=data.normalizer,
+        )
+        if verbose:
+            print(f"  subsampled {data_fraction:.0%}: {n_total:,} -> {len(keep_idx):,} points")
 
     # --- stratified split ---
     if cfg.stratify_by_patch:

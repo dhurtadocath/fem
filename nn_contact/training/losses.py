@@ -98,19 +98,57 @@ def multitask_loss(
 
 # ── Phase 2: Neural-Pull losses ──────────────────────────────────────────
 
+def steik_loss(grad_pred: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
+    """StEik regularizer: penalize curvature in the normal direction.
+
+    Computes nᵀ∇²g n where n = ∇g/|∇g| (detached). For a true SDF,
+    the second directional derivative along the gradient direction should
+    be zero (distance increases linearly along normals).
+
+    Uses only ONE extra backward pass (not the full 3x3 Hessian).
+
+    Ref: Yang et al., "StEik: Stabilizing the Optimization of Neural
+    Signed Distance Functions", NeurIPS 2023.
+
+    Parameters
+    ----------
+    grad_pred : (B, 3) — ∂g/∂x with create_graph=True
+    xyz       : (B, 3) — input coords with requires_grad=True
+    """
+    # Detach n to avoid differentiating through normalization
+    n = (grad_pred / grad_pred.norm(dim=-1, keepdim=True).clamp(min=1e-8)).detach()
+
+    # Directional derivative of g in direction n: d = ∇g · n (scalar per sample)
+    dir_deriv = (grad_pred * n).sum(dim=-1)  # (B,)
+
+    # Second directional derivative via autograd: Hn = ∂(∇g·n)/∂x
+    Hn = torch.autograd.grad(
+        dir_deriv.sum(), xyz, create_graph=True, retain_graph=True,
+    )[0]  # (B, 3)
+
+    # nᵀHn = n · Hn
+    nHn = (n * Hn).sum(dim=-1)  # (B,)
+
+    return (nHn ** 2).mean()
+
+
 def neural_pull_loss(
     g_pred: torch.Tensor,
     grad_pred: torch.Tensor,
     g_target: torch.Tensor,
     normal_target: torch.Tensor,
+    xyz: torch.Tensor | None = None,
+    grad_direct: torch.Tensor | None = None,
     hess_pred: torch.Tensor | None = None,
     dndxs_target: torch.Tensor | None = None,
     lambda_sdf: float = 1.0,
     lambda_grad: float = 10.0,
     lambda_hess: float = 1.0,
     lambda_eikonal: float = 0.1,
+    lambda_steik: float = 0.0,
+    lambda_consistency: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Neural-Pull loss with gradient/Hessian supervision + eikonal.
+    """Neural-Pull loss with gradient/Hessian supervision + eikonal + StEik.
 
     Parameters
     ----------
@@ -118,8 +156,12 @@ def neural_pull_loss(
     grad_pred     : (B, 3)    — ∂g/∂x via autodiff
     g_target      : (B,)      — true signed distance
     normal_target : (B, 3)    — true normal direction
+    xyz           : (B, 3)    — input coords (needed for StEik, requires_grad)
+    grad_direct   : (B, 3)    — direct gradient head output (optional, dual-head)
     hess_pred     : (B, 3, 3) — ∂²g/∂x² via autodiff (optional)
     dndxs_target  : (B, 9)    — true dn/dx_s flattened (optional)
+    lambda_steik  : float     — StEik normal-curvature regularizer weight
+    lambda_consistency : float — dual-head consistency loss weight
     """
     # SDF reconstruction
     loss_sdf = F.mse_loss(g_pred.squeeze(-1), g_target)
@@ -144,6 +186,23 @@ def neural_pull_loss(
         loss_hess = F.mse_loss(hess_flat, dndxs_target)
         total = total + lambda_hess * loss_hess
         breakdown["loss_hess"] = loss_hess.item()
+
+    # StEik: penalize nᵀ∇²gn (curvature in normal direction)
+    if lambda_steik > 0 and xyz is not None:
+        loss_st = steik_loss(grad_pred, xyz)
+        total = total + lambda_steik * loss_st
+        breakdown["loss_steik"] = loss_st.item()
+
+    # Dual-head: direct gradient supervision + consistency
+    if grad_direct is not None:
+        loss_grad_direct = F.mse_loss(grad_direct, normal_target)
+        total = total + lambda_grad * loss_grad_direct
+        breakdown["loss_grad_direct"] = loss_grad_direct.item()
+
+        if lambda_consistency > 0:
+            loss_cons = F.mse_loss(grad_pred.detach(), grad_direct)
+            total = total + lambda_consistency * loss_cons
+            breakdown["loss_consistency"] = loss_cons.item()
 
     breakdown["loss_total"] = total.item()
     return total, breakdown

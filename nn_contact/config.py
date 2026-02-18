@@ -133,14 +133,19 @@ class NeuralPullConfig:
         hidden_dims=[512, 512, 512, 512], activation="silu"
     ))
 
-    # Loss weights (calibrated: grad/hess too aggressive destabilizes training)
+    # Loss weights
     lambda_sdf: float = 1.0
-    lambda_grad: float = 1.0     # gradient (normal) supervision
-    lambda_hess: float = 0.1     # Hessian (dn/dx_s) supervision
-    lambda_eikonal: float = 0.1  # |nabla g| = 1 regularization
+    lambda_grad: float = 10.0    # gradient (normal) supervision
+    lambda_hess: float = 0.0     # Hessian (dn/dx_s) supervision (0 = disabled)
+    lambda_eikonal: float = 0.01 # |nabla g| = 1 regularization
+    lambda_steik: float = 0.0    # StEik: nᵀ∇²gn curvature penalty (NeurIPS 2023)
+    lambda_consistency: float = 0.0  # dual-head consistency loss
 
     # Whether to use autodiff for gradient/Hessian (True) or direct output (False)
     autodiff_derivatives: bool = True
+
+    # Dual-head: add explicit gradient output head alongside SDF head
+    dual_head: bool = False
 
 
 # ---------------------------------------------------------------------------
