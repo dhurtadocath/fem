@@ -34,7 +34,7 @@ if str(project_root) not in sys.path:
 from nn_contact.config import DataConfig, NeuralPullConfig, SIRENConfig
 from nn_contact.data.loader import make_dataloaders
 from nn_contact.models.neural_pull import NeuralPullNet
-from nn_contact.training.losses import neural_pull_loss, GradNormBalancer, steik_loss
+from nn_contact.training.losses import neural_pull_loss, GradNormBalancer, steik_loss, gh_alignment_loss
 
 
 @dataclass
@@ -45,13 +45,16 @@ class SweepConfig:
     hidden_dims: list[int] = field(default_factory=lambda: [512, 512, 512, 512])
     lr: float = 1e-4
     lambda_grad: float = 10.0
+    lambda_grad_final: float | None = None  # if set, use scheduling: grad decays to this
     lambda_eikonal: float = 0.01
     lambda_steik: float = 0.0
+    lambda_gh_align: float = 0.0
     lambda_consistency: float = 0.0
     dual_head: bool = False
     gradnorm: bool = False
     lbfgs_epochs: int = 0
     grad_start: int = 5
+    h_siren: bool = False
 
 
 # ── Define sweep configurations ──
@@ -92,6 +95,30 @@ SWEEP_CONFIGS = [
     # === Architecture sweep ===
     SweepConfig(name="wide1024",     lambda_grad=10.0, hidden_dims=[1024, 512, 512, 512]),
     SweepConfig(name="deep6",        lambda_grad=10.0, hidden_dims=[512, 512, 512, 512, 512, 512]),
+
+    # === H-SIREN: sin(sinh(2ωx)) first layer ===
+    SweepConfig(name="hsiren",       lambda_grad=10.0, h_siren=True),
+    SweepConfig(name="hsiren_dual",  lambda_grad=10.0, h_siren=True, dual_head=True),
+
+    # === GH-Alignment: ‖Hn‖²=0 (stronger than StEik) ===
+    SweepConfig(name="gh0.01",       lambda_grad=10.0, lambda_gh_align=0.01),
+    SweepConfig(name="gh0.1",        lambda_grad=10.0, lambda_gh_align=0.1),
+    SweepConfig(name="gh1.0",        lambda_grad=10.0, lambda_gh_align=1.0),
+
+    # === Loss weight scheduling: high→low gradient weight ===
+    SweepConfig(name="sched_20to5",  lambda_grad=20.0, lambda_grad_final=5.0),
+    SweepConfig(name="sched_50to10", lambda_grad=50.0, lambda_grad_final=10.0),
+
+    # === Combined best ideas ===
+    SweepConfig(name="dual_gh",      lambda_grad=10.0, dual_head=True, lambda_gh_align=0.1),
+    SweepConfig(name="hsiren_gh",    lambda_grad=10.0, h_siren=True, lambda_gh_align=0.1),
+    SweepConfig(name="combo",        lambda_grad=10.0, h_siren=True, dual_head=True, lambda_gh_align=0.1),
+
+    # === Round 3: combine top performers ===
+    SweepConfig(name="dual_sched",   lambda_grad=20.0, lambda_grad_final=5.0, dual_head=True),
+    SweepConfig(name="dual_sched50", lambda_grad=50.0, lambda_grad_final=10.0, dual_head=True),
+    SweepConfig(name="dual_lbfgs",   lambda_grad=10.0, dual_head=True, lbfgs_epochs=10),
+    SweepConfig(name="sched_lbfgs",  lambda_grad=20.0, lambda_grad_final=5.0, lbfgs_epochs=10),
 ]
 
 
@@ -100,6 +127,7 @@ def train_one(cfg: SweepConfig, data_cfg: DataConfig, loaders, char_length: floa
     """Train one configuration and return metrics."""
     siren_cfg = SIRENConfig(
         omega_0=cfg.omega0, omega_hidden=cfg.omega0, hidden_dims=cfg.hidden_dims,
+        h_siren=cfg.h_siren,
     )
     model_cfg = NeuralPullConfig(
         architecture="siren",
@@ -109,6 +137,7 @@ def train_one(cfg: SweepConfig, data_cfg: DataConfig, loaders, char_length: floa
         lambda_hess=0.0,
         lambda_eikonal=cfg.lambda_eikonal,
         lambda_steik=cfg.lambda_steik,
+        lambda_gh_align=cfg.lambda_gh_align,
         lambda_consistency=cfg.lambda_consistency,
         dual_head=cfg.dual_head,
     )
@@ -134,6 +163,8 @@ def train_one(cfg: SweepConfig, data_cfg: DataConfig, loaders, char_length: floa
         n_tasks = 3  # sdf, grad, eikonal
         if cfg.lambda_steik > 0:
             n_tasks += 1
+        if cfg.lambda_gh_align > 0:
+            n_tasks += 1
         gn_balancer = GradNormBalancer(n_tasks=n_tasks, alpha=1.5, lr=0.025)
         gn_balancer.log_weights = gn_balancer.log_weights.to(device)
 
@@ -148,8 +179,18 @@ def train_one(cfg: SweepConfig, data_cfg: DataConfig, loaders, char_length: floa
 
     for epoch in range(epochs):
         use_grad = (epoch >= cfg.grad_start)
-        lam_grad = cfg.lambda_grad if use_grad else 0.0
+
+        # Loss scheduling: decay lambda_grad from initial to final
+        if cfg.lambda_grad_final is not None and use_grad:
+            t = (epoch - cfg.grad_start) / max(1, epochs - 1 - cfg.grad_start)
+            t = min(1.0, max(0.0, t))
+            s = 6*t**5 - 15*t**4 + 10*t**3  # smooth quintic interpolation
+            lam_grad = cfg.lambda_grad * (1 - s) + cfg.lambda_grad_final * s
+        else:
+            lam_grad = cfg.lambda_grad if use_grad else 0.0
+
         lam_steik = cfg.lambda_steik if use_grad else 0.0
+        lam_gh_align = cfg.lambda_gh_align if use_grad else 0.0
 
         # ── Train ──
         model.train()
@@ -171,6 +212,8 @@ def train_one(cfg: SweepConfig, data_cfg: DataConfig, loaders, char_length: floa
                 task_losses = [loss_sdf, loss_grad_val, loss_eik]
                 if lam_steik > 0:
                     task_losses.append(steik_loss(grad_pred, xyz))
+                if lam_gh_align > 0:
+                    task_losses.append(gh_alignment_loss(grad_pred, xyz))
                 shared_params = [p for p in model.parameters() if p.requires_grad]
                 gn_weights = gn_balancer.step(task_losses, shared_params)
                 loss = sum(w * l for w, l in zip(gn_weights, task_losses))
@@ -183,6 +226,7 @@ def train_one(cfg: SweepConfig, data_cfg: DataConfig, loaders, char_length: floa
                     lambda_sdf=1.0, lambda_grad=lam_grad,
                     lambda_eikonal=cfg.lambda_eikonal,
                     lambda_steik=lam_steik,
+                    lambda_gh_align=lam_gh_align,
                     lambda_consistency=cfg.lambda_consistency,
                 )
 
@@ -276,6 +320,7 @@ def train_one(cfg: SweepConfig, data_cfg: DataConfig, loaders, char_length: floa
                     lambda_sdf=1.0, lambda_grad=cfg.lambda_grad,
                     lambda_eikonal=cfg.lambda_eikonal,
                     lambda_steik=cfg.lambda_steik,
+                    lambda_gh_align=cfg.lambda_gh_align,
                     lambda_consistency=cfg.lambda_consistency,
                 )
                 loss.backward()
@@ -376,10 +421,16 @@ def main():
         features = []
         if cfg.dual_head:
             features.append("dual")
+        if cfg.h_siren:
+            features.append("H-SIREN")
         if cfg.gradnorm:
             features.append("GN")
         if cfg.lambda_steik > 0:
             features.append(f"steik={cfg.lambda_steik}")
+        if cfg.lambda_gh_align > 0:
+            features.append(f"gh={cfg.lambda_gh_align}")
+        if cfg.lambda_grad_final is not None:
+            features.append(f"sched→{cfg.lambda_grad_final}")
         if cfg.lbfgs_epochs > 0:
             features.append(f"lbfgs={cfg.lbfgs_epochs}")
         feat_str = f" [{', '.join(features)}]" if features else ""

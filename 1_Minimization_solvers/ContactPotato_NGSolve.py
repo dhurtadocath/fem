@@ -97,7 +97,41 @@ nn_contact_topk  = 3        # multitask only: K candidates per node
 
 # ── Profiling instrumentation ────────────────────────────────────────────────
 class PerfCounters:
-    """Lightweight per-operation timing accumulator."""
+    """Lightweight per-operation timing accumulator with tree display.
+
+    Timer nesting hierarchy (children are timed inside their parent):
+      step_total
+      ├── apply
+      ├── contact_eval
+      │   ├── contact_nn_project
+      │   ├── contact_full_tr
+      │   └── contact_cached
+      ├── contact_force_asm
+      ├── assemble_lin
+      ├── plastic_tangent
+      ├── contact_hess_asm
+      ├── linear_solve
+      ├── return_mapping
+      ├── linesearch
+      │   ├── ls_energy_mat
+      │   └── ls_energy_contact
+      └── vtk_output
+    """
+
+    # Nesting: parent → list of children whose time is included in parent
+    _CHILDREN = {
+        "step_total": [
+            "apply", "contact_eval", "contact_force_asm", "assemble_lin",
+            "plastic_tangent", "contact_hess_asm", "linear_solve",
+            "return_mapping", "linesearch", "vtk_output",
+        ],
+        "contact_eval": ["contact_nn_project", "contact_full_tr",
+                         "contact_cached", "contact_neural_pull"],
+        "linesearch": ["ls_energy_mat", "ls_energy_contact"],
+    }
+    # All children (flattened) — these are nested, not top-level
+    _NESTED = {c for children in _CHILDREN.values() for c in children}
+
     def __init__(self):
         self.data = {}
         self.step_data = {}
@@ -109,30 +143,80 @@ class PerfCounters:
         self.data.setdefault(name, []).append(duration)
         self.step_data.setdefault(name, []).append(duration)
 
+    def _get_totals(self, source):
+        """Return {name: (total_time, call_count)} from source dict."""
+        return {name: (sum(times), len(times)) for name, times in source.items()}
+
+    def _format_tree(self, totals, wall_time, indent="  "):
+        """Format timers as a tree, using wall_time for percentages."""
+        lines = []
+
+        def _fmt_line(prefix, name, total, count, is_other=False):
+            avg_ms = total / count * 1000 if count > 0 else 0
+            pct = 100.0 * total / wall_time if wall_time > 0 else 0
+            label = f"{prefix}{name}"
+            if is_other:
+                lines.append(f"{label:<40s}  {total:8.2f}s  ({pct:5.1f}%)")
+            else:
+                lines.append(
+                    f"{label:<40s}  {total:8.2f}s  ({pct:5.1f}%)  "
+                    f"[{count} calls, avg {avg_ms:.2f}ms]"
+                )
+
+        def _format_node(name, prefix, connector, child_prefix):
+            if name not in totals:
+                return
+            total, count = totals[name]
+            _fmt_line(prefix + connector, name, total, count)
+
+            children = self._CHILDREN.get(name, [])
+            present = [c for c in children if c in totals]
+            if present:
+                child_sum = sum(totals[c][0] for c in present)
+                has_other = (total - child_sum) > 0.005
+                for i, child in enumerate(present):
+                    is_final = (i == len(present) - 1) and not has_other
+                    conn = "└── " if is_final else "├── "
+                    ext = "    " if is_final else "│   "
+                    _format_node(child, child_prefix, conn, child_prefix + ext)
+                if has_other:
+                    _fmt_line(child_prefix + "└── ", "(other)",
+                              total - child_sum, 0, is_other=True)
+
+        # Start with step_total if present, then any top-level extras
+        if "step_total" in totals:
+            _format_node("step_total", indent, "", indent)
+        # Show any timers not in the tree (shouldn't happen, but safety net)
+        all_in_tree = {"step_total"} | self._NESTED
+        extras = {k for k in totals if k not in all_in_tree}
+        for name in sorted(extras, key=lambda k: -totals[k][0]):
+            total, count = totals[name]
+            _fmt_line(indent, name, total, count)
+
+        return lines
+
     def step_summary(self, step):
         if not self.step_data:
             return ""
-        lines = [f"  [PROFILE] Step {step} breakdown:"]
-        for name, times in sorted(self.step_data.items(), key=lambda x: -sum(x[1])):
-            total = sum(times)
-            count = len(times)
-            lines.append(f"    {name:30s}  {total:8.3f}s  ({count:4d} calls, "
-                         f"avg {total/count*1000:7.2f}ms)")
-        lines.append(f"    {'STEP TOTAL':30s}  {sum(sum(v) for v in self.step_data.values()):8.3f}s")
+        totals = self._get_totals(self.step_data)
+        wall = totals.get("step_total", (0, 0))[0]
+        lines = [f"  [PROFILE] Step {step}:"]
+        lines.extend(self._format_tree(totals, wall))
         return "\n".join(lines)
 
     def final_summary(self):
         if not self.data:
             return ""
-        total_all = sum(sum(v) for v in self.data.values())
-        lines = ["\n" + "=" * 70, "  PROFILING SUMMARY (all steps)", "=" * 70]
-        for name, times in sorted(self.data.items(), key=lambda x: -sum(x[1])):
-            total = sum(times)
-            count = len(times)
-            pct = 100.0 * total / total_all if total_all > 0 else 0
-            lines.append(f"  {name:30s}  {total:8.2f}s  ({pct:5.1f}%)  "
-                         f"[{count} calls, avg {total/count*1000:.2f}ms]")
-        lines.append(f"  {'TOTAL':30s}  {total_all:8.2f}s")
+        totals = self._get_totals(self.data)
+        wall = totals.get("step_total", (0, 0))[0]
+        lines = [
+            "\n" + "=" * 80,
+            "  PROFILING SUMMARY (all steps)",
+            "=" * 80,
+        ]
+        lines.extend(self._format_tree(totals, wall, indent="  "))
+        lines.append("  " + "-" * 78)
+        lines.append(f"  {'WALL TIME':40s}  {wall:8.2f}s")
         return "\n".join(lines)
 
 perf = PerfCounters() if profile else None

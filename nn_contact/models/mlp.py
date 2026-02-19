@@ -143,6 +143,28 @@ class SineLayer(nn.Module):
         return torch.sin(self.omega * self.linear(x))
 
 
+class HSineLayer(nn.Module):
+    """H-SIREN first layer: sin(sinh(2·ω·Wx+b)).
+
+    Broadens frequency support via hyperbolic composition: sinh provides
+    unbounded growth enabling capture of both low and high frequencies.
+    Used only for the first layer; hidden layers remain standard SineLayer.
+
+    Ref: Gao & Jaiman, "H-SIREN: Improving Implicit Neural Representations
+    with Hyperbolic Periodic Functions", arXiv 2410.04716, 2024.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, omega: float = 10.0):
+        super().__init__()
+        self.omega = omega
+        self.linear = nn.Linear(in_dim, out_dim)
+        with torch.no_grad():
+            self.linear.weight.uniform_(-1.0 / in_dim, 1.0 / in_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(torch.sinh(2.0 * self.omega * self.linear(x)))
+
+
 class SIREN(nn.Module):
     """Sinusoidal Representation Network.
 
@@ -172,6 +194,7 @@ class SIREN(nn.Module):
         hidden_dims: list[int],
         omega_0: float = 30.0,
         omega_hidden: float = 30.0,
+        h_siren: bool = False,
     ):
         super().__init__()
         self.in_dim = in_dim
@@ -180,8 +203,11 @@ class SIREN(nn.Module):
         layers: list[nn.Module] = []
         dims = [in_dim] + hidden_dims
 
-        # First layer with omega_0
-        layers.append(SineLayer(dims[0], dims[1], omega=omega_0, is_first=True))
+        # First layer: H-SIREN (sin(sinh(2ωx))) or standard SIREN (sin(ωx))
+        if h_siren:
+            layers.append(HSineLayer(dims[0], dims[1], omega=omega_0))
+        else:
+            layers.append(SineLayer(dims[0], dims[1], omega=omega_0, is_first=True))
 
         # Hidden layers with omega_hidden
         for i in range(1, len(dims) - 1):
@@ -210,6 +236,7 @@ class SIREN(nn.Module):
             hidden_dims=cfg.hidden_dims,
             omega_0=cfg.omega_0,
             omega_hidden=cfg.omega_hidden,
+            h_siren=cfg.h_siren,
         )
 
 

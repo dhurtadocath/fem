@@ -90,7 +90,10 @@ def train(args):
     # ── Config ──
     from nn_contact.config import SIRENConfig
     hidden_dims = [int(x) for x in args.hidden_dims.split(",")] if args.hidden_dims else [512, 512, 512, 512]
-    siren_cfg = SIRENConfig(omega_0=args.omega0, omega_hidden=args.omega0, hidden_dims=hidden_dims)
+    siren_cfg = SIRENConfig(
+        omega_0=args.omega0, omega_hidden=args.omega0,
+        hidden_dims=hidden_dims, h_siren=args.h_siren,
+    )
 
     model_cfg = NeuralPullConfig(
         architecture=args.arch,
@@ -100,6 +103,7 @@ def train(args):
         lambda_hess=args.lambda_hess,
         lambda_eikonal=args.lambda_eikonal,
         lambda_steik=args.steik,
+        lambda_gh_align=args.gh_align,
         lambda_consistency=args.consistency,
         dual_head=args.dual_head,
     )
@@ -145,15 +149,20 @@ def train(args):
     grad_start = args.grad_start
     hess_start = args.hess_start
     print(f"Curriculum: grad at epoch {grad_start}, hess at epoch {hess_start}", flush=True)
-    print(f"Weights: sdf={model_cfg.lambda_sdf}, grad={model_cfg.lambda_grad}, "
+    sched_str = f" → {args.lambda_grad_final}" if args.lambda_grad_final is not None else ""
+    print(f"Weights: sdf={model_cfg.lambda_sdf}, grad={model_cfg.lambda_grad}{sched_str}, "
           f"hess={model_cfg.lambda_hess}, eik={model_cfg.lambda_eikonal}, "
-          f"steik={model_cfg.lambda_steik}", flush=True)
+          f"steik={model_cfg.lambda_steik}, gh_align={model_cfg.lambda_gh_align}", flush=True)
+    if args.h_siren:
+        print("H-SIREN: sin(sinh(2ωx)) first layer enabled", flush=True)
 
     # ── GradNorm adaptive balancing ──
     gradnorm = None
     if args.gradnorm:
         n_tasks = 3  # sdf, grad, eikonal
         if model_cfg.lambda_steik > 0:
+            n_tasks += 1
+        if model_cfg.lambda_gh_align > 0:
             n_tasks += 1
         gradnorm = GradNormBalancer(n_tasks=n_tasks, alpha=1.5, lr=0.025)
         gradnorm.log_weights = gradnorm.log_weights.to(device)
@@ -183,9 +192,18 @@ def train(args):
         use_grad = (epoch >= grad_start)
         use_hess = (epoch >= hess_start) and (model_cfg.lambda_hess > 0)
 
-        lam_grad = model_cfg.lambda_grad if use_grad else 0.0
+        # Loss scheduling: decay lambda_grad from initial to final
+        if args.lambda_grad_final is not None and use_grad:
+            t = (epoch - grad_start) / max(1, epochs - 1 - grad_start)
+            t = min(1.0, max(0.0, t))
+            s = 6*t**5 - 15*t**4 + 10*t**3  # smooth quintic interpolation
+            lam_grad = model_cfg.lambda_grad * (1 - s) + args.lambda_grad_final * s
+        else:
+            lam_grad = model_cfg.lambda_grad if use_grad else 0.0
+
         lam_hess = model_cfg.lambda_hess if use_hess else 0.0
         lam_steik = model_cfg.lambda_steik if use_grad else 0.0
+        lam_gh_align = model_cfg.lambda_gh_align if use_grad else 0.0
 
         # ── Train ──
         model.train()
@@ -220,6 +238,9 @@ def train(args):
                 if lam_steik > 0 and xyz is not None:
                     from nn_contact.training.losses import steik_loss as _steik
                     task_losses.append(_steik(grad_pred, xyz))
+                if lam_gh_align > 0 and xyz is not None:
+                    from nn_contact.training.losses import gh_alignment_loss as _gh
+                    task_losses.append(_gh(grad_pred, xyz))
 
                 shared_params = [p for p in model.parameters() if p.requires_grad]
                 gn_weights = gradnorm.step(task_losses, shared_params)
@@ -250,6 +271,7 @@ def train(args):
                     lambda_hess=lam_hess,
                     lambda_eikonal=model_cfg.lambda_eikonal,
                     lambda_steik=lam_steik,
+                    lambda_gh_align=lam_gh_align,
                     lambda_consistency=model_cfg.lambda_consistency,
                 )
 
@@ -314,6 +336,8 @@ def train(args):
                 extras.append(f"hess={train_bd.get('loss_hess', 0):.3e}")
             if lam_steik > 0:
                 extras.append(f"steik={train_bd.get('loss_steik', 0):.3e}")
+            if lam_gh_align > 0:
+                extras.append(f"gh={train_bd.get('loss_gh_align', 0):.3e}")
             if "loss_grad_direct" in train_bd:
                 extras.append(f"gdir={train_bd['loss_grad_direct']:.3e}")
             if "gn_w_sdf" in train_bd:
@@ -387,6 +411,7 @@ def train(args):
                     lambda_grad=model_cfg.lambda_grad,
                     lambda_eikonal=model_cfg.lambda_eikonal,
                     lambda_steik=model_cfg.lambda_steik,
+                    lambda_gh_align=model_cfg.lambda_gh_align,
                     lambda_consistency=model_cfg.lambda_consistency,
                 )
                 loss.backward()
@@ -441,6 +466,8 @@ def main():
                         help="Comma-separated hidden dims (e.g. '1024,512,512,512')")
     parser.add_argument("--dual_head", action="store_true",
                         help="Enable dual-head: explicit gradient output alongside SDF")
+    parser.add_argument("--h_siren", action="store_true",
+                        help="Use H-SIREN: sin(sinh(2ωx)) first layer for broader frequency support")
     # Training
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=512)
@@ -448,12 +475,16 @@ def main():
     # Loss weights — gradient-focused defaults
     parser.add_argument("--lambda_grad", type=float, default=10.0,
                         help="Gradient supervision weight (high to prioritize normals)")
+    parser.add_argument("--lambda_grad_final", type=float, default=None,
+                        help="If set, schedule lambda_grad from initial to this value (e.g. 10)")
     parser.add_argument("--lambda_hess", type=float, default=0.0,
                         help="Hessian supervision weight (0 = disabled)")
     parser.add_argument("--lambda_eikonal", type=float, default=0.01,
                         help="Eikonal regularization weight")
     parser.add_argument("--steik", type=float, default=0.0,
                         help="StEik curvature regularizer weight (e.g. 0.1)")
+    parser.add_argument("--gh_align", type=float, default=0.0,
+                        help="GH-alignment ‖Hn‖²=0 regularizer weight (e.g. 0.1)")
     parser.add_argument("--consistency", type=float, default=0.0,
                         help="Dual-head consistency loss weight (e.g. 0.1)")
     # GradNorm

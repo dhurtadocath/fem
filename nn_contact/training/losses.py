@@ -132,6 +132,32 @@ def steik_loss(grad_pred: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
     return (nHn ** 2).mean()
 
 
+def gh_alignment_loss(grad_pred: torch.Tensor, xyz: torch.Tensor) -> torch.Tensor:
+    """Gradient-Hessian alignment: ‖Hn‖² = 0.
+
+    For a true SDF, the gradient is an eigenvector of the Hessian with
+    eigenvalue zero: H·n = 0. This constrains gradient DIRECTION (3 components)
+    while StEik only constrains the scalar nᵀHn.
+
+    Ref: Wang et al., "Aligning Gradient and Hessian for Neural SDF
+    Optimization", NeurIPS 2023.
+
+    Parameters
+    ----------
+    grad_pred : (B, 3) — ∂g/∂x with create_graph=True
+    xyz       : (B, 3) — input coords with requires_grad=True
+    """
+    n = (grad_pred / grad_pred.norm(dim=-1, keepdim=True).clamp(min=1e-8)).detach()
+
+    # Hn = ∂(∇g·n)/∂x = H·n (one backward pass, not full 3x3 Hessian)
+    dir_deriv = (grad_pred * n).sum(dim=-1)  # (B,)
+    Hn = torch.autograd.grad(
+        dir_deriv.sum(), xyz, create_graph=True, retain_graph=True,
+    )[0]  # (B, 3)
+
+    return (Hn ** 2).sum(dim=-1).mean()
+
+
 def neural_pull_loss(
     g_pred: torch.Tensor,
     grad_pred: torch.Tensor,
@@ -146,9 +172,10 @@ def neural_pull_loss(
     lambda_hess: float = 1.0,
     lambda_eikonal: float = 0.1,
     lambda_steik: float = 0.0,
+    lambda_gh_align: float = 0.0,
     lambda_consistency: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Neural-Pull loss with gradient/Hessian supervision + eikonal + StEik.
+    """Neural-Pull loss with gradient/Hessian supervision + eikonal + StEik + GH-align.
 
     Parameters
     ----------
@@ -156,11 +183,12 @@ def neural_pull_loss(
     grad_pred     : (B, 3)    — ∂g/∂x via autodiff
     g_target      : (B,)      — true signed distance
     normal_target : (B, 3)    — true normal direction
-    xyz           : (B, 3)    — input coords (needed for StEik, requires_grad)
+    xyz           : (B, 3)    — input coords (needed for StEik/GH-align, requires_grad)
     grad_direct   : (B, 3)    — direct gradient head output (optional, dual-head)
     hess_pred     : (B, 3, 3) — ∂²g/∂x² via autodiff (optional)
     dndxs_target  : (B, 9)    — true dn/dx_s flattened (optional)
     lambda_steik  : float     — StEik normal-curvature regularizer weight
+    lambda_gh_align : float   — GH-alignment ‖Hn‖²=0 regularizer weight
     lambda_consistency : float — dual-head consistency loss weight
     """
     # SDF reconstruction
@@ -192,6 +220,12 @@ def neural_pull_loss(
         loss_st = steik_loss(grad_pred, xyz)
         total = total + lambda_steik * loss_st
         breakdown["loss_steik"] = loss_st.item()
+
+    # GH-Alignment: ‖Hn‖² = 0 (gradient is zero-eigenvector of Hessian)
+    if lambda_gh_align > 0 and xyz is not None:
+        loss_gh = gh_alignment_loss(grad_pred, xyz)
+        total = total + lambda_gh_align * loss_gh
+        breakdown["loss_gh_align"] = loss_gh.item()
 
     # Dual-head: direct gradient supervision + consistency
     if grad_direct is not None:
@@ -280,35 +314,45 @@ class GradNormBalancer:
 
     def step(self, losses: list[torch.Tensor], shared_params: list[nn.Parameter]):
         """Update weights based on gradient norms."""
+        # Ensure log_weights on same device as losses
+        dev = losses[0].device
+        if self.log_weights.device != dev:
+            self.log_weights = self.log_weights.to(dev).requires_grad_(True)
+            if self._initial_losses is not None:
+                self._initial_losses = self._initial_losses.to(dev)
         weights = self.weights
 
         # Compute gradient norms for each task
+        # create_graph=True so grad_norms are differentiable w.r.t. log_weights
         grad_norms = []
         for i, loss in enumerate(losses):
             grads = torch.autograd.grad(
                 weights[i] * loss, shared_params,
                 retain_graph=True, allow_unused=True,
+                create_graph=True,
             )
             total_norm = sum(g.norm() for g in grads if g is not None)
             grad_norms.append(total_norm)
 
         grad_norms = torch.stack(grad_norms)
-        mean_norm = grad_norms.mean()
 
-        # Relative training rates
+        # Detach mean_norm: target is a fixed reference, not a moving target
+        mean_norm = grad_norms.mean().detach()
+
+        # Relative training rates (keep everything on same device)
         if self._initial_losses is None:
-            self._initial_losses = torch.tensor([l.item() for l in losses])
+            self._initial_losses = torch.tensor([l.item() for l in losses], device=dev)
 
-        loss_ratios = torch.tensor([l.item() for l in losses]) / self._initial_losses
+        loss_ratios = torch.tensor([l.item() for l in losses], device=dev) / self._initial_losses
         relative_rates = loss_ratios / loss_ratios.mean()
 
-        # Target gradient norms
-        target_norms = mean_norm * relative_rates.pow(self.alpha)
+        # Target gradient norms (detached — no gradient through targets)
+        target_norms = (mean_norm * relative_rates.pow(self.alpha)).detach()
 
-        # GradNorm loss
-        gn_loss = (grad_norms - target_norms.to(grad_norms.device)).abs().sum()
+        # GradNorm loss: how far each task's grad norm is from its target
+        gn_loss = (grad_norms - target_norms).abs().sum()
 
-        # Update log_weights
+        # Update log_weights via manual gradient step
         self.log_weights.grad = torch.autograd.grad(gn_loss, self.log_weights)[0]
         with torch.no_grad():
             self.log_weights -= self.lr * self.log_weights.grad

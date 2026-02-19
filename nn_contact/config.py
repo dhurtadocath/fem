@@ -67,6 +67,7 @@ class SIRENConfig:
     hidden_dims: list[int] = field(default_factory=lambda: [512, 512, 512, 512])
     omega_0: float = 30.0
     omega_hidden: float = 30.0
+    h_siren: bool = False  # H-SIREN: sin(sinh(2ωx)) first layer (arXiv 2410.04716)
 
 
 @dataclass
@@ -139,6 +140,7 @@ class NeuralPullConfig:
     lambda_hess: float = 0.0     # Hessian (dn/dx_s) supervision (0 = disabled)
     lambda_eikonal: float = 0.01 # |nabla g| = 1 regularization
     lambda_steik: float = 0.0    # StEik: nᵀ∇²gn curvature penalty (NeurIPS 2023)
+    lambda_gh_align: float = 0.0 # GH-alignment: ‖Hn‖²=0 (NeurIPS 2023)
     lambda_consistency: float = 0.0  # dual-head consistency loss
 
     # Whether to use autodiff for gradient/Hessian (True) or direct output (False)
