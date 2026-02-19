@@ -6,27 +6,45 @@ Variants:
   v2b — Bigger heads + more frequencies (256) + hand-tuned loss weights
   v3  — v2 architecture + GradNorm adaptive loss balancing
 
-Features: AMP mixed precision, warmup+cosine LR, NaN guards, resume support.
+Extended features (sweep-ready):
+  --focal_gamma     — Focal loss for patch classification (0 = standard CE)
+  --label_smoothing — Label smoothing epsilon for patch classification
+  --ohem_ratio      — OHEM: keep only top-K% hardest samples per batch
+  --task_attention   — MTAN-style task attention gates
+  --patch_conditioned — FiLM-conditioned regression (replaces segmented)
+  --manifold_mixup  — Manifold Mixup at trunk output level
+  --mixup_alpha     — Mixup Beta distribution parameter
+  --uncertainty_wt  — Kendall-Gal uncertainty weighting (learns log-variance per task)
+  --fourier         — Enable Fourier features for v1 architecture
+  --fourier_freq    — Number of Fourier frequencies
+  --fourier_scale   — Fourier frequency scale (sigma)
+  --lambda_patch    — Loss weight for patch classification
+  --lambda_proj     — Loss weight for projection regression
+
+Features: AMP mixed precision (GPU), CPU thread tuning, warmup+cosine LR,
+          NaN guards, resume support.
 
 Usage:
-    # Fresh training
-    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_multitask_v2.py --variant v3
+    # GPU training
+    python3 nn_contact/scripts/train_multitask.py --variant v1 --focal_gamma 2 --label_smoothing 0.05
 
-    # Resume from checkpoint
-    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_multitask_v2.py --variant v3 --resume
+    # CPU/HPC training
+    python3 nn_contact/scripts/train_multitask.py --variant v1 --device cpu --num_threads 16
 
-    # Custom settings
-    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_multitask_v2.py --variant v2b --epochs 300 --batch_size 4096
+    # Full sweep via sweep_multitask.py
+    python3 nn_contact/scripts/sweep_multitask.py --index 0
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,7 +56,10 @@ if str(project_root) not in sys.path:
 from nn_contact.config import DataConfig, FourierMLPConfig, MLPConfig, MultiTaskConfig
 from nn_contact.data.loader import make_dataloaders
 from nn_contact.models.multitask import MultiTaskContactNet
-from nn_contact.training.losses import segmented_regression_loss
+from nn_contact.training.losses import (
+    focal_loss,
+    segmented_regression_loss,
+)
 
 
 # ── Variant configs ──────────────────────────────────────────────────────────
@@ -90,13 +111,55 @@ VARIANT_CONFIGS = {
 
 # ── Loss computation ─────────────────────────────────────────────────────────
 
-def compute_individual_losses(outputs, gn, patch_id, xi):
+def compute_individual_losses(outputs, gn, patch_id, xi,
+                              focal_gamma=0.0, label_smoothing=0.0,
+                              patch_conditioned=False):
     """Return 3 individual task losses. Clamps logits to prevent AMP overflow."""
     loss_gn = F.mse_loss(outputs["gn_pred"].squeeze(-1), gn)
     logits = outputs["patch_logits"].float().clamp(-30, 30)
-    loss_patch = F.cross_entropy(logits, patch_id)
-    loss_proj = segmented_regression_loss(outputs["xi_pred"], xi, patch_id)
+
+    if focal_gamma > 0:
+        loss_patch = focal_loss(logits, patch_id, gamma=focal_gamma,
+                                label_smoothing=label_smoothing)
+    else:
+        loss_patch = F.cross_entropy(logits, patch_id,
+                                     label_smoothing=label_smoothing)
+
+    # Patch-conditioned: use xi_cond if available (direct 2-output from FiLM head)
+    if patch_conditioned and "xi_cond" in outputs:
+        loss_proj = F.mse_loss(outputs["xi_cond"], xi)
+    else:
+        loss_proj = segmented_regression_loss(outputs["xi_pred"], xi, patch_id)
+
     return loss_gn, loss_patch, loss_proj
+
+
+# ── Manifold Mixup utility ───────────────────────────────────────────────────
+
+def manifold_mixup(features, targets_tuple, alpha=0.4):
+    """Mix features and targets at the trunk output level.
+
+    Parameters
+    ----------
+    features : (B, D) — trunk features
+    targets_tuple : (gn, patch_id, xi) — target tensors
+    alpha : float — Beta distribution parameter
+
+    Returns
+    -------
+    mixed_features, (mixed_gn, patch_id_a, patch_id_b, xi_a, xi_b, lam)
+    """
+    B = features.shape[0]
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    lam = max(lam, 1 - lam)  # Ensure lam >= 0.5 (keep dominant sample identity)
+
+    idx = torch.randperm(B, device=features.device)
+
+    gn, patch_id, xi = targets_tuple
+    mixed_features = lam * features + (1 - lam) * features[idx]
+    mixed_gn = lam * gn + (1 - lam) * gn[idx]
+
+    return mixed_features, (mixed_gn, patch_id, patch_id[idx], xi, xi[idx], lam)
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
@@ -105,26 +168,69 @@ def train(args):
     device = args.device
     variant = args.variant
     epochs = args.epochs
-    use_gradnorm = (variant == "v3")
+    use_gradnorm = (variant == "v3") or args.uncertainty_wt
+    is_cpu = (device == "cpu")
+
+    # ── CPU/HPC thread setup ──
+    if is_cpu:
+        slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
+        if args.num_threads > 0:
+            n_threads = args.num_threads
+        else:
+            n_threads = min(16, slurm_cpus)
+        torch.set_num_threads(n_threads)
+        torch.set_num_interop_threads(min(4, n_threads))
+        print(f"CPU threads: {n_threads} (SLURM_CPUS={slurm_cpus})", flush=True)
 
     torch.manual_seed(42)
-    torch.backends.cudnn.benchmark = True
+    if not is_cpu:
+        torch.backends.cudnn.benchmark = True
 
     # Config
     model_cfg = VARIANT_CONFIGS[variant]()
-    ckpt_dir = Path(f"nn_contact/checkpoints/multitask_{variant}")
+
+    # Override loss weights from CLI
+    if args.lambda_patch != 1.0:
+        model_cfg.lambda_patch = args.lambda_patch
+    if args.lambda_proj != 1.0:
+        model_cfg.lambda_proj = args.lambda_proj
+
+    # Override Fourier features from CLI for v1
+    if args.fourier and model_cfg.input_encoding == "none":
+        model_cfg.input_encoding = "fourier"
+        model_cfg.fourier_config = FourierMLPConfig(
+            n_frequencies=args.fourier_freq,
+            frequency_scale=args.fourier_scale,
+        )
+
+    ckpt_tag = args.ckpt_tag or f"multitask_{variant}"
+    ckpt_dir = Path(f"nn_contact/checkpoints/{ckpt_tag}")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Data
-    data_cfg = DataConfig(batch_size=args.batch_size, num_workers=4, pin_memory=True)
+    n_workers = min(4, max(1, (os.cpu_count() or 4) - 2)) if is_cpu else 4
+    data_cfg = DataConfig(
+        batch_size=args.batch_size,
+        num_workers=n_workers,
+        pin_memory=not is_cpu,
+    )
     loaders = make_dataloaders(data_cfg, seed=42, verbose=True)
 
     # Model
-    model = MultiTaskContactNet.from_config(model_cfg).to(device)
+    model = MultiTaskContactNet.from_config(
+        model_cfg,
+        task_attention=args.task_attention,
+        patch_conditioned=args.patch_conditioned,
+    ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
 
+    # Uncertainty weighting: learn log-variance per task (Kendall-Gal)
+    log_vars = None
+    if args.uncertainty_wt:
+        log_vars = nn.Parameter(torch.zeros(3, device=device))
+
     # GradNorm state (v3 only)
-    log_weights = nn.Parameter(torch.zeros(3, device=device)) if use_gradnorm else None
+    log_weights = nn.Parameter(torch.zeros(3, device=device)) if (variant == "v3") else None
     gradnorm_alpha = 1.5
     gradnorm_lr = 0.025
     initial_losses = None
@@ -142,24 +248,39 @@ def train(args):
             model.load_state_dict(ckpt["model_state"])
             start_epoch = ckpt["epoch"] + 1
             best_val = ckpt["best_val_loss"]
-            if use_gradnorm and "log_weights" in ckpt:
+            if log_weights is not None and "log_weights" in ckpt:
                 log_weights.data.copy_(ckpt["log_weights"].to(device))
-                print(f"  Restored GradNorm log_weights: {log_weights.data.tolist()}", flush=True)
             print(f"Resumed from epoch {start_epoch}, best val={best_val:.6f}", flush=True)
 
-    print(f"Model ({variant}): {n_params:,} params, device={device}", flush=True)
-    if use_gradnorm:
-        print(f"  GradNorm enabled (alpha={gradnorm_alpha}, lr={gradnorm_lr})", flush=True)
+    # Print config
+    features_str = f"variant={variant}"
+    if args.focal_gamma > 0:
+        features_str += f" focal={args.focal_gamma}"
+    if args.label_smoothing > 0:
+        features_str += f" ls={args.label_smoothing}"
+    if args.ohem_ratio < 1.0:
+        features_str += f" ohem={args.ohem_ratio}"
+    if args.task_attention:
+        features_str += " attn"
+    if args.patch_conditioned:
+        features_str += " pcond"
+    if args.manifold_mixup:
+        features_str += f" mixup={args.mixup_alpha}"
+    if args.uncertainty_wt:
+        features_str += " uncwt"
+    if model_cfg.input_encoding == "fourier":
+        features_str += f" fourier({args.fourier_freq},{args.fourier_scale})"
+
+    print(f"Model ({features_str}): {n_params:,} params, device={device}", flush=True)
 
     # Optimizer
     warmup = 10
-    if use_gradnorm:
-        optimizer = torch.optim.AdamW([
-            {"params": model.parameters(), "lr": 1e-3, "weight_decay": 1e-4},
-            {"params": [log_weights], "lr": gradnorm_lr, "weight_decay": 0},
-        ])
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    param_groups = [{"params": model.parameters(), "lr": args.lr, "weight_decay": 1e-4}]
+    if log_weights is not None:
+        param_groups.append({"params": [log_weights], "lr": gradnorm_lr, "weight_decay": 0})
+    if log_vars is not None:
+        param_groups.append({"params": [log_vars], "lr": args.lr, "weight_decay": 0})
+    optimizer = torch.optim.AdamW(param_groups)
 
     def lr_lambda(epoch):
         if epoch < warmup:
@@ -171,9 +292,10 @@ def train(args):
     for _ in range(start_epoch):
         scheduler.step()
 
-    scaler = torch.amp.GradScaler("cuda")
+    use_amp = not is_cpu
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
     patience_counter = 0
-    patience = 40
+    patience = args.patience
 
     # ── Epoch loop ──
     for epoch in range(start_epoch, epochs):
@@ -183,8 +305,6 @@ def train(args):
         model.train()
         train_total = 0.0
         train_bd = {"loss_gn": 0, "loss_patch": 0, "loss_proj": 0}
-        if use_gradnorm:
-            train_bd.update({"w_gn": 0, "w_patch": 0, "w_proj": 0})
         n = 0
         nan_batches = 0
 
@@ -192,33 +312,64 @@ def train(args):
             xyz, patch_id, xi, gn, normal, dndxs = [t.to(device, non_blocking=True) for t in batch]
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast("cuda"):
-                outputs = model(xyz)
-                loss_gn, loss_patch, loss_proj = compute_individual_losses(outputs, gn, patch_id, xi)
+            amp_ctx = torch.amp.autocast("cuda") if use_amp else torch.amp.autocast("cpu", enabled=False)
+            with amp_ctx:
+                # Forward pass (pass true patch_id for patch-conditioned head)
+                outputs = model(xyz, patch_id_true=patch_id if args.patch_conditioned else None)
 
-            # NaN guard: skip batch if any loss is NaN
+                loss_gn, loss_patch, loss_proj = compute_individual_losses(
+                    outputs, gn, patch_id, xi,
+                    focal_gamma=args.focal_gamma,
+                    label_smoothing=args.label_smoothing,
+                    patch_conditioned=args.patch_conditioned,
+                )
+
+            # NaN guard
             if not (torch.isfinite(loss_gn) and torch.isfinite(loss_patch) and torch.isfinite(loss_proj)):
                 nan_batches += 1
                 continue
 
-            # Compute weighted total
-            if use_gradnorm:
+            # OHEM: recompute with hard sample selection
+            if args.ohem_ratio < 1.0:
+                from nn_contact.training.losses import multitask_loss
+                total, _ = multitask_loss(
+                    outputs,
+                    {"gn": gn, "patch_id": patch_id, "xi": xi},
+                    lambda_gn=model_cfg.lambda_gn,
+                    lambda_patch=model_cfg.lambda_patch,
+                    lambda_proj=model_cfg.lambda_proj,
+                    focal_gamma=args.focal_gamma,
+                    label_smoothing=args.label_smoothing,
+                    ohem_ratio=args.ohem_ratio,
+                )
+            elif args.uncertainty_wt and log_vars is not None:
+                # Kendall-Gal uncertainty weighting: L_i / (2*sigma_i^2) + log(sigma_i)
+                precision = torch.exp(-log_vars)  # 1/sigma^2
+                total = (precision[0] * loss_gn + 0.5 * log_vars[0]
+                         + precision[1] * loss_patch + 0.5 * log_vars[1]
+                         + precision[2] * loss_proj + 0.5 * log_vars[2])
+            elif log_weights is not None:
+                # GradNorm weights
                 weights = torch.softmax(log_weights, dim=0) * 3.0
                 total = weights[0] * loss_gn + weights[1] * loss_patch + weights[2] * loss_proj
             else:
-                lam_gn = getattr(model_cfg, "lambda_gn", 1.0)
-                lam_patch = getattr(model_cfg, "lambda_patch", 1.0)
-                lam_proj = getattr(model_cfg, "lambda_proj", 1.0)
-                total = lam_gn * loss_gn + lam_patch * loss_patch + lam_proj * loss_proj
+                total = (model_cfg.lambda_gn * loss_gn
+                         + model_cfg.lambda_patch * loss_patch
+                         + model_cfg.lambda_proj * loss_proj)
 
-            scaler.scale(total).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            if use_amp:
+                scaler.scale(total).backward()
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                total.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
             # GradNorm weight update (v3 only)
-            if use_gradnorm:
+            if log_weights is not None:
                 with torch.no_grad():
                     losses_det = torch.tensor(
                         [loss_gn.item(), loss_patch.item(), loss_proj.item()], device=device
@@ -239,10 +390,6 @@ def train(args):
             train_bd["loss_gn"] += loss_gn.item()
             train_bd["loss_patch"] += loss_patch.item()
             train_bd["loss_proj"] += loss_proj.item()
-            if use_gradnorm:
-                train_bd["w_gn"] += weights[0].item()
-                train_bd["w_patch"] += weights[1].item()
-                train_bd["w_proj"] += weights[2].item()
             n += 1
 
         if n == 0:
@@ -255,8 +402,11 @@ def train(args):
         # ── Validate (unweighted sum for fair comparison) ──
         model.eval()
         val_loss = 0.0
+        val_correct = 0
+        val_total_samples = 0
         nv = 0
-        with torch.no_grad(), torch.amp.autocast("cuda"):
+        amp_ctx_val = torch.amp.autocast("cuda") if use_amp else torch.amp.autocast("cpu", enabled=False)
+        with torch.no_grad(), amp_ctx_val:
             for batch in loaders.val:
                 xyz, patch_id, xi, gn, normal, dndxs = [t.to(device, non_blocking=True) for t in batch]
                 outputs = model(xyz)
@@ -265,7 +415,13 @@ def train(args):
                 if math.isfinite(v):
                     val_loss += v
                     nv += 1
+                # Track accuracy
+                pred_patch = outputs["patch_logits"].argmax(dim=-1)
+                val_correct += (pred_patch == patch_id).sum().item()
+                val_total_samples += patch_id.shape[0]
+
         val_loss = val_loss / nv if nv > 0 else float("inf")
+        val_acc = val_correct / max(1, val_total_samples) * 100
 
         scheduler.step()
         lr = optimizer.param_groups[0]["lr"]
@@ -281,11 +437,15 @@ def train(args):
                 "optimizer_state": optimizer.state_dict(),
                 "best_val_loss": best_val,
                 "config": model_cfg,
+                "features": features_str,
+                "task_attention": args.task_attention,
+                "patch_conditioned": args.patch_conditioned,
             }
-            if use_gradnorm:
+            if log_weights is not None:
                 state["log_weights"] = log_weights.data.clone()
+            if log_vars is not None:
+                state["log_vars"] = log_vars.data.clone()
             torch.save(state, ckpt_dir / "best_model.pt")
-            torch.save(state, ckpt_dir / "checkpoint.pt")
         else:
             patience_counter += 1
 
@@ -294,13 +454,15 @@ def train(args):
         nan_info = f" nan_skip={nan_batches}" if nan_batches > 0 else ""
 
         if epoch % 10 == 0 or is_best or epoch < start_epoch + 5:
-            w_info = ""
-            if use_gradnorm:
-                w_info = f" w=[{train_bd['w_gn']:.2f},{train_bd['w_patch']:.2f},{train_bd['w_proj']:.2f}]"
+            extra = ""
+            if log_vars is not None:
+                w = torch.exp(-log_vars).detach()
+                extra = f" uw=[{w[0]:.2f},{w[1]:.2f},{w[2]:.2f}]"
             print(
                 f"[{epoch:3d}/{epochs}] "
-                f"train={train_total:.4e} (gn={train_bd['loss_gn']:.3e} cls={train_bd['loss_patch']:.3e} proj={train_bd['loss_proj']:.3e}) "
-                f"val={val_loss:.4e} lr={lr:.2e}{w_info} "
+                f"train={train_total:.4e} (gn={train_bd['loss_gn']:.3e} "
+                f"cls={train_bd['loss_patch']:.3e} proj={train_bd['loss_proj']:.3e}) "
+                f"val={val_loss:.4e} acc={val_acc:.2f}% lr={lr:.2e}{extra} "
                 f"dt={dt:.0f}s{star}{nan_info}",
                 flush=True,
             )
@@ -314,19 +476,43 @@ def train(args):
         {"config": model_cfg, "data_config": data_cfg, "normalizer": loaders.normalizer.state_dict()},
         ckpt_dir / "config.pt",
     )
-    print(f"\nDone ({variant}). Best val loss: {best_val:.6f}", flush=True)
-    if use_gradnorm:
-        w = torch.softmax(log_weights, 0) * 3
-        print(f"Final weights: gn={w[0]:.2f}, patch={w[1]:.2f}, proj={w[2]:.2f}", flush=True)
+    print(f"\nDone ({features_str}). Best val loss: {best_val:.6f}", flush=True)
+    if log_vars is not None:
+        w = torch.exp(-log_vars).detach()
+        print(f"Final uncertainty weights: gn={w[0]:.2f}, patch={w[1]:.2f}, proj={w[2]:.2f}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train multi-task contact NN")
-    parser.add_argument("--variant", default="v2", choices=["v1", "v2", "v2b", "v3"])
+    parser.add_argument("--variant", default="v1", choices=["v1", "v2", "v2b", "v3"])
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=2048)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--resume", action="store_true", help="Resume from best checkpoint")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--patience", type=int, default=40)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--ckpt_tag", type=str, default=None, help="Checkpoint subdirectory name")
+    parser.add_argument("--num_threads", type=int, default=0, help="CPU threads (0=auto)")
+
+    # Loss improvements
+    parser.add_argument("--focal_gamma", type=float, default=0.0, help="Focal loss gamma (0=off)")
+    parser.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing eps")
+    parser.add_argument("--ohem_ratio", type=float, default=1.0, help="OHEM: keep top ratio (1=off)")
+    parser.add_argument("--lambda_patch", type=float, default=1.0, help="Classification loss weight")
+    parser.add_argument("--lambda_proj", type=float, default=1.0, help="Projection loss weight")
+    parser.add_argument("--uncertainty_wt", action="store_true", help="Kendall-Gal uncertainty weighting")
+
+    # Architecture improvements
+    parser.add_argument("--task_attention", action="store_true", help="MTAN-style task attention")
+    parser.add_argument("--patch_conditioned", action="store_true", help="FiLM patch-conditioned regression")
+    parser.add_argument("--fourier", action="store_true", help="Enable Fourier features for v1")
+    parser.add_argument("--fourier_freq", type=int, default=128, help="Fourier frequencies")
+    parser.add_argument("--fourier_scale", type=float, default=10.0, help="Fourier scale sigma")
+
+    # Data augmentation
+    parser.add_argument("--manifold_mixup", action="store_true", help="Manifold Mixup at trunk")
+    parser.add_argument("--mixup_alpha", type=float, default=0.4, help="Mixup Beta param")
+
     args = parser.parse_args()
     train(args)
 

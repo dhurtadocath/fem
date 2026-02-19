@@ -12,31 +12,31 @@ COORDINATE NORMALIZATION MATH:
   ∂²g_nn/∂x_norm² = L * ∂n/∂x_raw  (Hessian targets must be scaled by L)
 
 Uses SIREN architecture (sin activations) with curriculum training:
-  Phase A (warmup):     L_sdf + L_eikonal only
-  Phase B (gradients):  + L_grad (normal supervision)
+  Phase A (warmup):     L_sdf only (NO autograd — fast on CPU)
+  Phase B (gradients):  + L_grad + L_eikonal (normal supervision)
   Phase C (Hessians):   + L_hess (dn/dx_s supervision) [optional, off by default]
 
-Features:
-  - Gradient-focused checkpointing: val_sdf + val_grad_weight * val_grad
-  - StEik regularizer: nᵀ∇²gn curvature penalty (NeurIPS 2023)
-  - Dual-head: explicit gradient output head alongside SDF head
-  - GradNorm: adaptive loss balancing (ICML 2018)
-  - L-BFGS refinement: quasi-Newton fine-tuning after Adam converges
-
-IMPORTANT: autodiff with create_graph=True requires float32 — no AMP autocast.
+CPU/HPC optimizations:
+  - Phase A skips requires_grad and autograd entirely (pure forward pass)
+  - Gradient subsampling: compute grad/eikonal on a fraction of each batch
+  - DataLoader auto-tuned: num_workers from SLURM, pin_memory only on GPU
+  - Thread count set from SLURM_CPUS_PER_TASK
 
 Usage:
+    # GPU
     PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py
-    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py --steik 0.1
-    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py --dual_head --lambda_grad 10
-    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py --gradnorm
-    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py --lbfgs_epochs 20
+    # HPC CPU (SLURM) — LR auto-scaled, eikonal active in Phase A
+    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py --device cpu --batch_size 4096 --grad_subsample 0.5
+    # Full config
+    PYTHONUNBUFFERED=1 python3 nn_contact/scripts/train_neural_pull.py \
+      --dual_head --lambda_grad 50 --lambda_grad_final 10 --grad_subsample 0.5
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -85,7 +85,41 @@ def train(args):
     device = args.device
     epochs = args.epochs
     torch.manual_seed(42)
-    torch.backends.cudnn.benchmark = True
+
+    # ── CPU/GPU environment setup ──
+    is_cpu = (device == "cpu")
+    if not is_cpu:
+        torch.backends.cudnn.benchmark = True
+
+    if is_cpu:
+        # Thread tuning for SIREN (512-wide layers): optimal ~8-16 threads.
+        # More threads → thread sync overhead dominates small GEMM ops.
+        # Use --num_threads to override if needed.
+        slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
+        if args.num_threads > 0:
+            n_threads = args.num_threads
+        else:
+            # Auto: cap at 16 for typical SIREN workloads, scale down for small nodes
+            n_threads = min(16, slurm_cpus)
+        n_interop = min(4, slurm_cpus // max(1, n_threads))
+        n_interop = max(1, n_interop)
+        torch.set_num_threads(n_threads)
+        torch.set_num_interop_threads(n_interop)
+        # Use remaining cores for data loading
+        nw_override = min(slurm_cpus - n_threads, 8)
+        nw_override = max(2, nw_override)
+        print(f"CPU mode: {n_threads} intra-op threads, {n_interop} inter-op threads "
+              f"(SLURM CPUs={slurm_cpus})", flush=True)
+
+    # Diagnostics
+    print(f"PyTorch {torch.__version__}, dtype={torch.get_default_dtype()}", flush=True)
+    try:
+        cfg_str = torch.__config__.show()
+        # Print just the key info (first 3 lines)
+        for line in cfg_str.strip().split("\n")[:3]:
+            print(f"  {line.strip()}", flush=True)
+    except Exception:
+        pass
 
     # ── Config ──
     from nn_contact.config import SIRENConfig
@@ -112,12 +146,20 @@ def train(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Data ──
+    # Auto-tune DataLoader for CPU vs GPU
+    if is_cpu:
+        nw = nw_override  # computed during thread setup
+    else:
+        nw = 4
+    pin_mem = not is_cpu
+
     data_cfg = DataConfig(
-        batch_size=args.batch_size, num_workers=4, pin_memory=True,
+        batch_size=args.batch_size, num_workers=nw, pin_memory=pin_mem,
         gn_min=args.gn_min, gn_max=args.gn_max,
     )
     loaders = make_dataloaders(data_cfg, seed=42, verbose=True, data_fraction=args.data_fraction)
     char_length = data_cfg.char_length  # 8.0
+    print(f"DataLoader: num_workers={nw}, pin_memory={pin_mem}, batch_size={args.batch_size}", flush=True)
 
     # ── Target normalization ──
     print(f"Target normalization: gn/={char_length}, dndxs*={char_length}", flush=True)
@@ -142,17 +184,21 @@ def train(args):
             print(f"No checkpoint at {ckpt_path}, starting fresh", flush=True)
 
     print(f"Model ({args.arch}): {n_params:,} params, device={device}", flush=True)
+    print(f"  param dtype: {next(model.parameters()).dtype}", flush=True)
     if args.dual_head:
         print(f"Dual-head mode: explicit gradient output head enabled", flush=True)
 
     # ── Curriculum schedule ──
     grad_start = args.grad_start
     hess_start = args.hess_start
+    grad_sub = args.grad_subsample
     print(f"Curriculum: grad at epoch {grad_start}, hess at epoch {hess_start}", flush=True)
     sched_str = f" → {args.lambda_grad_final}" if args.lambda_grad_final is not None else ""
     print(f"Weights: sdf={model_cfg.lambda_sdf}, grad={model_cfg.lambda_grad}{sched_str}, "
           f"hess={model_cfg.lambda_hess}, eik={model_cfg.lambda_eikonal}, "
           f"steik={model_cfg.lambda_steik}, gh_align={model_cfg.lambda_gh_align}", flush=True)
+    if grad_sub < 1.0:
+        print(f"Gradient subsampling: {grad_sub:.0%} of batch for grad/eikonal losses", flush=True)
     if args.h_siren:
         print("H-SIREN: sin(sinh(2ωx)) first layer enabled", flush=True)
 
@@ -168,9 +214,21 @@ def train(args):
         gradnorm.log_weights = gradnorm.log_weights.to(device)
         print(f"GradNorm enabled: {n_tasks} tasks, alpha=1.5", flush=True)
 
+    # ── LR scaling for large batch sizes (CPU/HPC only) ──
+    # Larger batches → fewer gradient updates per epoch → need higher LR.
+    # sqrt scaling is a safer compromise (Hoffer et al., 2017).
+    # Only applied on CPU where batch_size is typically 4096 vs GPU's 512.
+    base_batch = 512  # reference batch size (GPU default)
+    effective_lr = args.lr
+    if is_cpu and args.batch_size > base_batch:
+        scale = math.sqrt(args.batch_size / base_batch)
+        effective_lr = args.lr * scale
+        print(f"LR scaling: {args.lr:.1e} × sqrt({args.batch_size}/{base_batch}) "
+              f"= {effective_lr:.2e}", flush=True)
+
     # ── Optimizer ──
     warmup = 10
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=effective_lr, weight_decay=1e-5)
 
     def lr_lambda(epoch):
         if epoch < warmup:
@@ -204,6 +262,16 @@ def train(args):
         lam_hess = model_cfg.lambda_hess if use_hess else 0.0
         lam_steik = model_cfg.lambda_steik if use_grad else 0.0
         lam_gh_align = model_cfg.lambda_gh_align if use_grad else 0.0
+        lam_eik = model_cfg.lambda_eikonal  # always active (even Phase A)
+
+        # Do we need autograd on inputs this epoch?
+        needs_input_grad = (
+            use_hess
+            or lam_grad > 0.0
+            or lam_eik > 0.0
+            or lam_steik > 0.0
+            or lam_gh_align > 0.0
+        )
 
         # ── Train ──
         model.train()
@@ -218,62 +286,156 @@ def train(args):
             dndxs = dndxs * char_length
 
             optimizer.zero_grad(set_to_none=True)
-            xyz = xyz.requires_grad_(True)
 
-            if use_hess:
-                g_pred, grad_pred, hess_pred = model.forward_with_hessian(xyz)
-                grad_direct = None
-            else:
-                g_pred, grad_pred, grad_direct = model.forward_with_grad(xyz)
-                hess_pred = None
-
-            if gradnorm is not None and use_grad:
-                # GradNorm: compute individual losses, let balancer set weights
+            if not use_grad and not use_hess and is_cpu:
+                # ── Phase A (CPU only): SDF + eikonal on small subsample ──
+                # Full batch for SDF (cheap forward only)
+                g_pred = model(xyz)
                 loss_sdf = F.mse_loss(g_pred.squeeze(-1), gn)
-                loss_grad_val = F.mse_loss(grad_pred, normal)
-                grad_norm_val = grad_pred.norm(dim=-1)
+                loss = model_cfg.lambda_sdf * loss_sdf
+
+                # Eikonal on small subsample (10% or grad_sub) to warm up SDF geometry
+                if lam_eik > 0:
+                    B = xyz.shape[0]
+                    k_eik = max(1, int(B * min(grad_sub, 0.1)))
+                    idx_eik = torch.randperm(B, device=device)[:k_eik]
+                    xyz_eik = xyz[idx_eik].detach().requires_grad_(True)
+                    g_eik = model(xyz_eik)
+                    grad_eik = torch.autograd.grad(
+                        g_eik.sum(), xyz_eik, create_graph=True,
+                    )[0]
+                    grad_norm_eik = grad_eik.norm(dim=-1)
+                    loss_eik = F.mse_loss(grad_norm_eik, torch.ones_like(grad_norm_eik))
+                    loss = loss + lam_eik * loss_eik
+                    bd = {"loss_sdf": loss_sdf.item(), "loss_eikonal": loss_eik.item(),
+                          "loss_total": loss.item()}
+                else:
+                    bd = {"loss_sdf": loss_sdf.item(), "loss_total": loss.item()}
+
+            elif use_hess:
+                # ── Phase C: full Hessian ──
+                xyz = xyz.requires_grad_(True)
+                g_pred, grad_pred, hess_pred = model.forward_with_hessian(xyz)
+                loss, bd = neural_pull_loss(
+                    g_pred, grad_pred, gn, normal,
+                    xyz=xyz, grad_direct=None,
+                    hess_pred=hess_pred,
+                    dndxs_target=dndxs,
+                    lambda_sdf=model_cfg.lambda_sdf,
+                    lambda_grad=lam_grad,
+                    lambda_hess=lam_hess,
+                    lambda_eikonal=lam_eik,
+                    lambda_steik=lam_steik,
+                    lambda_gh_align=lam_gh_align,
+                    lambda_consistency=model_cfg.lambda_consistency,
+                )
+
+            elif grad_sub < 1.0 and gradnorm is None:
+                # ── Phase B with gradient subsampling (CPU-optimized) ──
+                # Full batch: SDF loss (cheap forward only)
+                g_pred_full = model(xyz)
+                loss_sdf = F.mse_loss(g_pred_full.squeeze(-1), gn)
+
+                # Subset: grad/eikonal losses (expensive autograd)
+                B = xyz.shape[0]
+                k = max(1, int(B * grad_sub))
+                idx = torch.randperm(B, device=device)[:k]
+                xyz_g = xyz[idx].detach().requires_grad_(True)
+                normal_g = normal[idx]
+
+                g_sub, grad_sub_pred, grad_direct_sub = model.forward_with_grad(xyz_g)
+
+                # Gradient supervision
+                loss_grad_val = F.mse_loss(grad_sub_pred, normal_g)
+                grad_norm_val = grad_sub_pred.norm(dim=-1)
                 loss_eik = F.mse_loss(grad_norm_val, torch.ones_like(grad_norm_val))
 
-                task_losses = [loss_sdf, loss_grad_val, loss_eik]
-                if lam_steik > 0 and xyz is not None:
-                    from nn_contact.training.losses import steik_loss as _steik
-                    task_losses.append(_steik(grad_pred, xyz))
-                if lam_gh_align > 0 and xyz is not None:
-                    from nn_contact.training.losses import gh_alignment_loss as _gh
-                    task_losses.append(_gh(grad_pred, xyz))
-
-                shared_params = [p for p in model.parameters() if p.requires_grad]
-                gn_weights = gradnorm.step(task_losses, shared_params)
-
-                loss = sum(w * l for w, l in zip(gn_weights, task_losses))
-                if grad_direct is not None:
-                    loss = loss + lam_grad * F.mse_loss(grad_direct, normal)
-                    if model_cfg.lambda_consistency > 0:
-                        loss = loss + model_cfg.lambda_consistency * F.mse_loss(grad_pred.detach(), grad_direct)
+                loss = (model_cfg.lambda_sdf * loss_sdf
+                        + lam_grad * loss_grad_val
+                        + lam_eik * loss_eik)
 
                 bd = {
                     "loss_sdf": loss_sdf.item(),
                     "loss_grad": loss_grad_val.item(),
                     "loss_eikonal": loss_eik.item(),
-                    "loss_total": loss.item(),
-                    "gn_w_sdf": gn_weights[0].item(),
-                    "gn_w_grad": gn_weights[1].item(),
                 }
+
+                # Optional regularizers on subset
+                if lam_steik > 0:
+                    from nn_contact.training.losses import steik_loss as _steik
+                    l_st = _steik(grad_sub_pred, xyz_g)
+                    loss = loss + lam_steik * l_st
+                    bd["loss_steik"] = l_st.item()
+                if lam_gh_align > 0:
+                    from nn_contact.training.losses import gh_alignment_loss as _gh
+                    l_gh = _gh(grad_sub_pred, xyz_g)
+                    loss = loss + lam_gh_align * l_gh
+                    bd["loss_gh_align"] = l_gh.item()
+
+                # Dual-head: direct gradient on subset
+                if grad_direct_sub is not None:
+                    l_gd = F.mse_loss(grad_direct_sub, normal_g)
+                    loss = loss + lam_grad * l_gd
+                    bd["loss_grad_direct"] = l_gd.item()
+                    if model_cfg.lambda_consistency > 0:
+                        loss = loss + model_cfg.lambda_consistency * F.mse_loss(
+                            grad_sub_pred.detach(), grad_direct_sub)
+
+                bd["loss_total"] = loss.item()
+
             else:
-                loss, bd = neural_pull_loss(
-                    g_pred, grad_pred, gn, normal,
-                    xyz=xyz,
-                    grad_direct=grad_direct,
-                    hess_pred=hess_pred,
-                    dndxs_target=dndxs if use_hess else None,
-                    lambda_sdf=model_cfg.lambda_sdf,
-                    lambda_grad=lam_grad,
-                    lambda_hess=lam_hess,
-                    lambda_eikonal=model_cfg.lambda_eikonal,
-                    lambda_steik=lam_steik,
-                    lambda_gh_align=lam_gh_align,
-                    lambda_consistency=model_cfg.lambda_consistency,
-                )
+                # ── Phase B: full batch gradient (GPU or no subsampling) ──
+                xyz = xyz.requires_grad_(True)
+
+                if gradnorm is not None and use_grad:
+                    g_pred, grad_pred, grad_direct = model.forward_with_grad(xyz)
+                    loss_sdf = F.mse_loss(g_pred.squeeze(-1), gn)
+                    loss_grad_val = F.mse_loss(grad_pred, normal)
+                    grad_norm_val = grad_pred.norm(dim=-1)
+                    loss_eik = F.mse_loss(grad_norm_val, torch.ones_like(grad_norm_val))
+
+                    task_losses = [loss_sdf, loss_grad_val, loss_eik]
+                    if lam_steik > 0:
+                        from nn_contact.training.losses import steik_loss as _steik
+                        task_losses.append(_steik(grad_pred, xyz))
+                    if lam_gh_align > 0:
+                        from nn_contact.training.losses import gh_alignment_loss as _gh
+                        task_losses.append(_gh(grad_pred, xyz))
+
+                    shared_params = [p for p in model.parameters() if p.requires_grad]
+                    gn_weights = gradnorm.step(task_losses, shared_params)
+
+                    loss = sum(w * l for w, l in zip(gn_weights, task_losses))
+                    if grad_direct is not None:
+                        loss = loss + lam_grad * F.mse_loss(grad_direct, normal)
+                        if model_cfg.lambda_consistency > 0:
+                            loss = loss + model_cfg.lambda_consistency * F.mse_loss(grad_pred.detach(), grad_direct)
+
+                    bd = {
+                        "loss_sdf": loss_sdf.item(),
+                        "loss_grad": loss_grad_val.item(),
+                        "loss_eikonal": loss_eik.item(),
+                        "loss_total": loss.item(),
+                        "gn_w_sdf": gn_weights[0].item(),
+                        "gn_w_grad": gn_weights[1].item(),
+                    }
+                else:
+                    g_pred, grad_pred, grad_direct = model.forward_with_grad(xyz)
+                    hess_pred = None
+                    loss, bd = neural_pull_loss(
+                        g_pred, grad_pred, gn, normal,
+                        xyz=xyz,
+                        grad_direct=grad_direct,
+                        hess_pred=hess_pred,
+                        dndxs_target=None,
+                        lambda_sdf=model_cfg.lambda_sdf,
+                        lambda_grad=lam_grad,
+                        lambda_hess=lam_hess,
+                        lambda_eikonal=lam_eik,
+                        lambda_steik=lam_steik,
+                        lambda_gh_align=lam_gh_align,
+                        lambda_consistency=model_cfg.lambda_consistency,
+                    )
 
             if not torch.isfinite(loss):
                 continue
@@ -495,6 +657,11 @@ def main():
                         help="Epoch to start gradient supervision")
     parser.add_argument("--hess_start", type=int, default=9999,
                         help="Epoch to start Hessian supervision (9999 = disabled)")
+    # CPU optimization
+    parser.add_argument("--grad_subsample", type=float, default=1.0,
+                        help="Fraction of batch for grad/eikonal (e.g. 0.25 for 25%%, saves CPU)")
+    parser.add_argument("--num_threads", type=int, default=0,
+                        help="PyTorch intra-op threads (0=auto: min(16,SLURM_CPUS))")
     # Data filtering
     parser.add_argument("--gn_min", type=float, default=-0.5,
                         help="Min gap for data filtering")

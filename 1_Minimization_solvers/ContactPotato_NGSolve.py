@@ -45,7 +45,7 @@ from PyClasses._contact_tr_multi_helpers import project_points_tr_multi_batch
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 15                # mesh density (n x n x n hex elements)
+n           = 5                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -75,7 +75,7 @@ vtk_fields  = "minimal"    # "minimal" | "standard" | "full" (see Section 7)
 # Performance
 taskmanager = "auto"       # True/False/"auto" — auto enables for n >= 30 (27k+ elements)
 realcompile = "auto"       # True/False/"auto" — auto enables for nsteps >= 20
-profile     = True        # built-in per-operation timing (prints breakdown per step)
+profile     = False        # built-in per-operation timing (prints breakdown per step)
 linear_solver = "pardiso"  # "umfpack" | "pardiso" | "mumps" — direct solver for Newton
 
 # Plasticity (J2 von Mises, multiplicative decomposition F = Fe·Fp)
@@ -88,8 +88,8 @@ consistent_tangent = False   # FD-based algorithmic tangent correction for yield
                               # Marginal benefit with contact; can destabilize at large steps
 
 # AI-enhanced contact
-nn_contact       = True   # enable NN for contact detection
-nn_contact_mode  = "multitask"  # "multitask" (Phase 1: NN broad + C++ refine) or "neural_pull" (Phase 2: pure NN)
+nn_contact       = True  # enable NN for contact detection
+nn_contact_mode  = "neural_pull"  # "multitask" (Phase 1: NN broad + C++ refine) or "neural_pull" (Phase 2: pure NN)
 nn_contact_model = "v1"     # multitask variant: "v1", "v2", "v3"
 nn_contact_device = "cuda"  # "cuda" or "cpu"
 nn_contact_topk  = 3        # multitask only: K candidates per node

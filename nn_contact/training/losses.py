@@ -28,6 +28,31 @@ import torch.nn.functional as F
 
 # ── Phase 1: Multi-task losses ───────────────────────────────────────────
 
+def focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float = 2.0,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Focal loss for classification: down-weights easy examples.
+
+    FL(p_t) = -(1 - p_t)^gamma * log(p_t)
+
+    Ref: Lin et al., "Focal Loss for Dense Object Detection", ICCV 2017.
+
+    Parameters
+    ----------
+    logits : (B, C) — raw logits
+    targets : (B,) — class indices
+    gamma : float — focusing parameter (0 = standard CE, 2 = strong focus)
+    label_smoothing : float — label smoothing epsilon (0 = none)
+    """
+    ce = F.cross_entropy(logits, targets, reduction="none",
+                         label_smoothing=label_smoothing)
+    pt = torch.exp(-ce)
+    return ((1.0 - pt) ** gamma * ce).mean()
+
+
 def segmented_regression_loss(
     xi_pred: torch.Tensor,
     xi_target: torch.Tensor,
@@ -61,6 +86,9 @@ def multitask_loss(
     lambda_gn: float = 1.0,
     lambda_patch: float = 1.0,
     lambda_proj: float = 1.0,
+    focal_gamma: float = 0.0,
+    label_smoothing: float = 0.0,
+    ohem_ratio: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Combined multi-task loss (Eq. 17 in paper).
 
@@ -68,22 +96,60 @@ def multitask_loss(
     ----------
     outputs : dict from MultiTaskContactNet.forward()
     targets : dict with 'gn', 'patch_id', 'xi'
+    focal_gamma : float — focal loss gamma (0 = standard CE)
+    label_smoothing : float — label smoothing epsilon
+    ohem_ratio : float — fraction of hardest samples to keep (1.0 = all)
 
     Returns
     -------
     total_loss : scalar tensor
     breakdown  : dict of individual loss values (for logging)
     """
-    # Task 1: signed distance MSE
-    loss_gn = F.mse_loss(outputs["gn_pred"].squeeze(-1), targets["gn"])
+    gn_pred = outputs["gn_pred"].squeeze(-1)
+    patch_logits = outputs["patch_logits"]
+    xi_pred = outputs["xi_pred"]
+    gn_target = targets["gn"]
+    patch_id = targets["patch_id"]
+    xi_target = targets["xi"]
 
-    # Task 2: patch classification cross-entropy
-    loss_patch = F.cross_entropy(outputs["patch_logits"], targets["patch_id"])
+    # OHEM: compute per-sample losses, keep only the hardest fraction
+    if ohem_ratio < 1.0:
+        B = gn_pred.shape[0]
+        k = max(1, int(B * ohem_ratio))
+
+        # Per-sample losses for difficulty scoring
+        per_gn = (gn_pred - gn_target).pow(2)  # (B,)
+        per_cls = F.cross_entropy(patch_logits, patch_id, reduction="none",
+                                  label_smoothing=label_smoothing)  # (B,)
+        idx_xi = patch_id.unsqueeze(-1).unsqueeze(-1).expand(B, 1, 2)
+        xi_sel = xi_pred.gather(1, idx_xi).squeeze(1)
+        per_proj = (xi_sel - xi_target).pow(2).sum(dim=-1)  # (B,)
+
+        # Difficulty = sum of all per-sample losses
+        difficulty = per_gn + per_cls + per_proj
+        _, hard_idx = difficulty.topk(k)
+
+        # Select hard samples
+        gn_pred = gn_pred[hard_idx]
+        gn_target = gn_target[hard_idx]
+        patch_logits = patch_logits[hard_idx]
+        patch_id = patch_id[hard_idx]
+        xi_pred = xi_pred[hard_idx]
+        xi_target = xi_target[hard_idx]
+
+    # Task 1: signed distance MSE
+    loss_gn = F.mse_loss(gn_pred, gn_target)
+
+    # Task 2: patch classification (focal or standard CE)
+    if focal_gamma > 0:
+        loss_patch = focal_loss(patch_logits, patch_id, gamma=focal_gamma,
+                                label_smoothing=label_smoothing)
+    else:
+        loss_patch = F.cross_entropy(patch_logits, patch_id,
+                                     label_smoothing=label_smoothing)
 
     # Task 3: segmented regression
-    loss_proj = segmented_regression_loss(
-        outputs["xi_pred"], targets["xi"], targets["patch_id"]
-    )
+    loss_proj = segmented_regression_loss(xi_pred, xi_target, patch_id)
 
     total = lambda_gn * loss_gn + lambda_patch * loss_patch + lambda_proj * loss_proj
 

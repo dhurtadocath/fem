@@ -8,6 +8,11 @@ Architecture (from paper2.tex Section 5, Fig. MTL-arch):
 
 The segmented regression (Eq. 15) only supervises the (xi1, xi2) pair
 corresponding to the true closest patch — all other patch outputs are masked.
+
+Extended with:
+  - Optional task-specific attention (MTAN-style): sigmoid gate on trunk features
+  - Optional patch-conditioned regression: FiLM-modulated head using patch embeddings
+  - Optional manifold mixup hook (applied at trunk output level)
 """
 
 from __future__ import annotations
@@ -20,6 +25,106 @@ from nn_contact.config import MultiTaskConfig
 from nn_contact.models.mlp import MLP, FourierFeatures, get_activation
 
 
+class TaskAttention(nn.Module):
+    """MTAN-style task-specific attention gate.
+
+    Learns a sigmoid mask over shared features so each task can select
+    the most relevant trunk dimensions.
+
+    Ref: Liu et al., "End-to-End Multi-Task Learning with Attention",
+    CVPR 2019.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.ReLU(),
+            nn.Linear(dim // 4, dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gate(x)
+
+
+class PatchConditionedHead(nn.Module):
+    """FiLM-conditioned regression head for parametric coordinates.
+
+    Instead of outputting 2*96 values (segmented regression), this head
+    takes (features, patch_embedding) and outputs (xi1, xi2) for one patch.
+    The patch embedding modulates features via FiLM: gamma * features + beta.
+
+    At training time: uses true patch_id for conditioning.
+    At inference time: uses predicted patch_id(s) for conditioning.
+    """
+
+    def __init__(self, trunk_dim: int, n_patches: int, head_dims: list[int],
+                 embed_dim: int = 32):
+        super().__init__()
+        self.n_patches = n_patches
+        self.embed_dim = embed_dim
+
+        # Learnable patch embeddings
+        self.patch_embed = nn.Embedding(n_patches, embed_dim)
+
+        # FiLM: patch embedding -> (gamma, beta) for trunk features
+        self.film = nn.Linear(embed_dim, 2 * trunk_dim)
+
+        # Regression MLP: modulated features -> (xi1, xi2)
+        layers: list[nn.Module] = []
+        dims = [trunk_dim] + head_dims
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(nn.ReLU())
+        layers.append(nn.Linear(dims[-1], 2))
+        self.head = nn.Sequential(*layers)
+
+    def forward(self, features: torch.Tensor, patch_ids: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        features : (B, D) — trunk features
+        patch_ids : (B,) — patch indices for conditioning
+
+        Returns
+        -------
+        xi_pred : (B, 2) — predicted (xi1, xi2)
+        """
+        emb = self.patch_embed(patch_ids)  # (B, embed_dim)
+        film_params = self.film(emb)  # (B, 2*D)
+        gamma, beta = film_params.chunk(2, dim=-1)  # each (B, D)
+        modulated = (1 + gamma) * features + beta  # FiLM modulation
+        return self.head(modulated)  # (B, 2)
+
+    def forward_multi(self, features: torch.Tensor, patch_ids: torch.Tensor) -> torch.Tensor:
+        """Forward for multiple patch candidates per sample.
+
+        Parameters
+        ----------
+        features : (B, D) — trunk features
+        patch_ids : (B, K) — K patch candidates per sample
+
+        Returns
+        -------
+        xi_pred : (B, K, 2) — predicted (xi1, xi2) per candidate
+        """
+        B, K = patch_ids.shape
+        D = features.shape[1]
+
+        emb = self.patch_embed(patch_ids)  # (B, K, embed_dim)
+        film_params = self.film(emb)  # (B, K, 2*D)
+        gamma, beta = film_params.chunk(2, dim=-1)  # each (B, K, D)
+
+        feat_exp = features.unsqueeze(1).expand(B, K, D)  # (B, K, D)
+        modulated = (1 + gamma) * feat_exp + beta  # (B, K, D)
+
+        # Flatten for MLP, then reshape
+        xi = self.head(modulated.reshape(B * K, D))  # (B*K, 2)
+        return xi.view(B, K, 2)
+
+
 class MultiTaskContactNet(nn.Module):
     """Multi-task network for simultaneous patch ID, projection, and gap prediction.
 
@@ -29,12 +134,20 @@ class MultiTaskContactNet(nn.Module):
         Full model configuration.
     in_dim : int
         Input dimension (3 for raw xyz, or 2*n_freq for Fourier-encoded).
+    task_attention : bool
+        If True, add MTAN-style attention gates per task head.
+    patch_conditioned : bool
+        If True, use FiLM-conditioned regression instead of segmented regression.
     """
 
-    def __init__(self, cfg: MultiTaskConfig, in_dim: int = 3):
+    def __init__(self, cfg: MultiTaskConfig, in_dim: int = 3,
+                 task_attention: bool = False,
+                 patch_conditioned: bool = False):
         super().__init__()
         self.cfg = cfg
         self.n_patches = cfg.n_patches
+        self.use_task_attention = task_attention
+        self.use_patch_conditioned = patch_conditioned
 
         # Optional Fourier encoding
         self.fourier = None
@@ -54,6 +167,12 @@ class MultiTaskContactNet(nn.Module):
         self.trunk = nn.Sequential(*trunk_layers)
         trunk_out = trunk_dims[-1]
 
+        # Optional task attention gates
+        if task_attention:
+            self.attn_gn = TaskAttention(trunk_out)
+            self.attn_patch = TaskAttention(trunk_out)
+            self.attn_proj = TaskAttention(trunk_out)
+
         # Task 1: Signed distance head (scalar regression)
         gn_layers: list[nn.Module] = []
         gn_dims = [trunk_out] + cfg.gn_head_dims
@@ -72,14 +191,22 @@ class MultiTaskContactNet(nn.Module):
         patch_layers.append(nn.Linear(patch_dims[-1], cfg.n_patches))
         self.patch_head = nn.Sequential(*patch_layers)
 
-        # Task 3: Parametric projection head (2*n_patches segmented regression)
-        proj_layers: list[nn.Module] = []
-        proj_dims = [trunk_out] + cfg.proj_head_dims
-        for i in range(len(proj_dims) - 1):
-            proj_layers.append(nn.Linear(proj_dims[i], proj_dims[i + 1]))
-            proj_layers.append(nn.ReLU())
-        proj_layers.append(nn.Linear(proj_dims[-1], 2 * cfg.n_patches))
-        self.proj_head = nn.Sequential(*proj_layers)
+        # Task 3: Parametric projection
+        if patch_conditioned:
+            self.proj_head_cond = PatchConditionedHead(
+                trunk_out, cfg.n_patches, cfg.proj_head_dims, embed_dim=32,
+            )
+            self.proj_head = None
+        else:
+            # Standard segmented regression (2*n_patches outputs)
+            proj_layers: list[nn.Module] = []
+            proj_dims = [trunk_out] + cfg.proj_head_dims
+            for i in range(len(proj_dims) - 1):
+                proj_layers.append(nn.Linear(proj_dims[i], proj_dims[i + 1]))
+                proj_layers.append(nn.ReLU())
+            proj_layers.append(nn.Linear(proj_dims[-1], 2 * cfg.n_patches))
+            self.proj_head = nn.Sequential(*proj_layers)
+            self.proj_head_cond = None
 
         self._init_weights()
 
@@ -90,36 +217,62 @@ class MultiTaskContactNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, xyz: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, xyz: torch.Tensor,
+                patch_id_true: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         """Forward pass.
 
         Parameters
         ----------
         xyz : (B, 3) tensor
             Normalized spatial coordinates.
+        patch_id_true : (B,) tensor, optional
+            True patch IDs for patch-conditioned regression during training.
 
         Returns
         -------
         dict with keys:
-            gn_pred    : (B, 1)          — predicted signed distance
-            patch_logits : (B, 96)       — raw logits for patch classification
-            xi_pred    : (B, 96, 2)      — predicted (xi1, xi2) per patch
+            gn_pred      : (B, 1)          — predicted signed distance
+            patch_logits : (B, 96)         — raw logits for patch classification
+            xi_pred      : (B, 96, 2)      — predicted (xi1, xi2) per patch
+                           OR (B, 2) if patch_conditioned and patch_id_true given
+            features     : (B, D)          — trunk features (for manifold mixup)
         """
         if self.fourier is not None:
             xyz = self.fourier(xyz)
 
         features = self.trunk(xyz)
 
-        gn_pred = self.gn_head(features)                    # (B, 1)
-        patch_logits = self.patch_head(features)             # (B, 96)
-        xi_flat = self.proj_head(features)                   # (B, 192)
-        xi_pred = xi_flat.view(-1, self.n_patches, 2)        # (B, 96, 2)
+        # Apply task attention if enabled
+        feat_gn = self.attn_gn(features) if self.use_task_attention else features
+        feat_patch = self.attn_patch(features) if self.use_task_attention else features
+        feat_proj = self.attn_proj(features) if self.use_task_attention else features
 
-        return {
+        gn_pred = self.gn_head(feat_gn)                      # (B, 1)
+        patch_logits = self.patch_head(feat_patch)            # (B, 96)
+
+        result = {
             "gn_pred": gn_pred,
             "patch_logits": patch_logits,
-            "xi_pred": xi_pred,
+            "features": features,
         }
+
+        if self.use_patch_conditioned:
+            if patch_id_true is not None:
+                # Training: use true patch for conditioning
+                xi_cond = self.proj_head_cond(feat_proj, patch_id_true)  # (B, 2)
+                result["xi_cond"] = xi_cond
+            # Always produce full xi_pred for compatibility with segmented loss
+            # by running all 96 patches (only at eval or if needed)
+            all_pids = torch.arange(self.n_patches, device=features.device)
+            all_pids = all_pids.unsqueeze(0).expand(features.shape[0], -1)  # (B, 96)
+            xi_pred = self.proj_head_cond.forward_multi(feat_proj, all_pids)  # (B, 96, 2)
+            result["xi_pred"] = xi_pred
+        else:
+            xi_flat = self.proj_head(feat_proj)                # (B, 192)
+            xi_pred = xi_flat.view(-1, self.n_patches, 2)      # (B, 96, 2)
+            result["xi_pred"] = xi_pred
+
+        return result
 
     def predict(self, xyz: torch.Tensor, topk: int = 1) -> dict[str, torch.Tensor]:
         """Inference: return top-K patch candidates with corresponding xi.
@@ -144,10 +297,15 @@ class MultiTaskContactNet(nn.Module):
         probs = F.softmax(out["patch_logits"], dim=-1)        # (B, 96)
         top_probs, top_ids = probs.topk(topk, dim=-1)         # (B, topk)
 
-        # Gather xi for top-K patches
-        # xi_pred is (B, 96, 2) — index with top_ids (B, topk)
-        idx = top_ids.unsqueeze(-1).expand(-1, -1, 2)         # (B, topk, 2)
-        xi = torch.gather(out["xi_pred"], 1, idx)             # (B, topk, 2)
+        if self.use_patch_conditioned:
+            # Use FiLM head for top-K patches
+            features = out["features"]
+            feat_proj = self.attn_proj(features) if self.use_task_attention else features
+            xi = self.proj_head_cond.forward_multi(feat_proj, top_ids)  # (B, topk, 2)
+        else:
+            # Gather xi from full (B, 96, 2) output
+            idx = top_ids.unsqueeze(-1).expand(-1, -1, 2)      # (B, topk, 2)
+            xi = torch.gather(out["xi_pred"], 1, idx)          # (B, topk, 2)
 
         return {
             "gn": gn,
@@ -157,5 +315,8 @@ class MultiTaskContactNet(nn.Module):
         }
 
     @classmethod
-    def from_config(cls, cfg: MultiTaskConfig) -> "MultiTaskContactNet":
-        return cls(cfg, in_dim=3)
+    def from_config(cls, cfg: MultiTaskConfig,
+                    task_attention: bool = False,
+                    patch_conditioned: bool = False) -> "MultiTaskContactNet":
+        return cls(cfg, in_dim=3, task_attention=task_attention,
+                   patch_conditioned=patch_conditioned)
