@@ -193,6 +193,10 @@ def train_one(cfg: SweepConfig, device: str = "cpu", num_threads: int = 0):
             frequency_scale=cfg.fourier_scale,
         )
 
+    # Store architecture flags on config so they're saved with checkpoint
+    model_cfg.task_attention = cfg.task_attention
+    model_cfg.patch_conditioned = cfg.patch_conditioned
+
     ckpt_dir = Path(f"nn_contact/checkpoints/mt_sweep_{cfg.name}")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,11 +210,7 @@ def train_one(cfg: SweepConfig, device: str = "cpu", num_threads: int = 0):
     loaders = make_dataloaders(data_cfg, seed=42, verbose=True)
 
     # ── Model ──
-    model = MultiTaskContactNet.from_config(
-        model_cfg,
-        task_attention=cfg.task_attention,
-        patch_conditioned=cfg.patch_conditioned,
-    ).to(device)
+    model = MultiTaskContactNet.from_config(model_cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
 
     # Uncertainty weighting

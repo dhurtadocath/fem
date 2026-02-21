@@ -119,6 +119,10 @@ class MultiTaskConfig:
     input_encoding: Literal["none", "fourier"] = "none"
     fourier_config: FourierMLPConfig | None = None
 
+    # Architecture variants
+    task_attention: bool = False       # per-task gating attention
+    patch_conditioned: bool = False    # patch-conditioned regression head
+
 
 # ---------------------------------------------------------------------------
 # Phase 2: Neural-Pull (Direct SDF + Derivatives)

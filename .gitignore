@@ -36,3 +36,5 @@ ContactData*
 *.vtu
 *.pt
 *.bib
+*.npy
+*.log

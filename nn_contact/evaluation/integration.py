@@ -58,32 +58,26 @@ class HybridCDA:
         self.model.eval()
 
     @classmethod
-    def from_variant(
-        cls,
-        variant: str = "v1",
+    def from_checkpoint(
+        cls, checkpoint_dir: str | Path | None = None,
         device: str = "cuda",
-        gn_threshold: float = 0.5,
-        confidence_threshold: float = 0.5,
-        checkpoint_base: str | Path | None = None,
     ) -> "HybridCDA":
-        """Load a trained model by variant name (v1, v2, v2b, v3).
+        """Load from a checkpoint directory containing best_model.pt [+ config.pt].
 
-        Expects checkpoints at {checkpoint_base}/multitask_{variant}/
-        with best_model.pt and config.pt files.
+        Parameters
+        ----------
+        checkpoint_dir : path to directory with best_model.pt and optionally config.pt.
+            None defaults to nn_contact/checkpoints/multitask_v1/.
         """
-        if checkpoint_base is None:
-            checkpoint_base = Path(__file__).resolve().parents[1] / "checkpoints"
-        ckpt_dir = Path(checkpoint_base) / f"multitask_{variant}"
+        if checkpoint_dir is None:
+            checkpoint_dir = Path(__file__).resolve().parents[1] / "checkpoints" / "multitask_v1"
+        ckpt_dir = Path(checkpoint_dir)
         model_path = ckpt_dir / "best_model.pt"
         config_path = ckpt_dir / "config.pt"
 
         if not model_path.exists():
-            raise FileNotFoundError(
-                f"No checkpoint for variant '{variant}' at {model_path}. "
-                f"Train with: python3 nn_contact/scripts/train_multitask.py --variant {variant}"
-            )
+            raise FileNotFoundError(f"No multitask checkpoint at {model_path}")
 
-        # Load normalizer from config.pt
         normalizer = CoordinateNormalizer()
         if config_path.exists():
             config_data = torch.load(config_path, map_location="cpu", weights_only=False)
@@ -93,8 +87,6 @@ class HybridCDA:
         return cls(
             model_path=model_path,
             normalizer=normalizer,
-            gn_threshold=gn_threshold,
-            confidence_threshold=confidence_threshold,
             device=device,
         )
 

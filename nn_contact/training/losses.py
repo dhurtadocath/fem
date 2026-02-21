@@ -323,6 +323,9 @@ def return_mapping_loss(
     lambda_Fp: float = 1.0,
     lambda_ep: float = 1.0,
     lambda_det: float = 10.0,
+    lambda_iso: float = 5.0,
+    lambda_elastic: float = 5.0,
+    lambda_inc: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Return mapping surrogate loss with physics constraints.
 
@@ -331,25 +334,60 @@ def return_mapping_loss(
     outputs    : dict from ReturnMappingNet.forward()
     Fp_target  : (B, 9) — true updated Fp (flattened)
     dep_target : (B,)   — true delta epcum
+    lambda_Fp  : weight for Fp reconstruction
+    lambda_ep  : weight for delta_ep reconstruction
+    lambda_det : weight for det(Fp) > 0 constraint
+    lambda_iso : weight for isochoric constraint det(Fp) ≈ 1
+    lambda_elastic : weight for elastic regime accuracy (delta_ep should be 0)
+    lambda_inc : weight for plastic increment accuracy (Fp_new - Fp_old)
     """
     Fp_new = outputs["Fp_new"]
     delta_ep = outputs["delta_ep"]
+    Fp_old = outputs["Fp_old"]
 
-    # Reconstruction losses
+    # Primary: Fp reconstruction (Frobenius)
     loss_Fp = F.mse_loss(Fp_new, Fp_target)
+
+    # Primary: delta_ep reconstruction
     loss_ep = F.mse_loss(delta_ep, dep_target)
 
-    # Physics: det(Fp_new) > 0 penalty
+    # Physics 1: det(Fp_new) > 0 — hard constraint (prevent inversion)
     det_Fp = _det3x3(Fp_new)
     loss_det = torch.clamp(-det_Fp, min=0.0).pow(2).mean()
 
-    total = lambda_Fp * loss_Fp + lambda_ep * loss_ep + lambda_det * loss_det
+    # Physics 2: isochoric plastic flow — det(Fp) ≈ 1 for J2 plasticity
+    loss_iso = F.mse_loss(det_Fp, torch.ones_like(det_Fp))
+
+    # Physics 3: elastic regime accuracy — if target delta_ep = 0,
+    # prediction should also be ~0 (correct elastic-plastic transition)
+    elastic_mask = dep_target < 1e-10
+    if elastic_mask.any():
+        loss_elastic = F.mse_loss(
+            delta_ep[elastic_mask],
+            torch.zeros_like(delta_ep[elastic_mask]))
+    else:
+        loss_elastic = torch.tensor(0.0, device=Fp_new.device)
+
+    # Physics 4: plastic increment accuracy — Fp_new - Fp_old should
+    # match the target increment (focus on the actual plastic update)
+    loss_inc = F.mse_loss(Fp_new - Fp_old, Fp_target - Fp_old)
+
+    total = (lambda_Fp * loss_Fp
+             + lambda_ep * loss_ep
+             + lambda_det * loss_det
+             + lambda_iso * loss_iso
+             + lambda_elastic * loss_elastic
+             + lambda_inc * loss_inc)
 
     breakdown = {
         "loss_Fp": loss_Fp.item(),
         "loss_ep": loss_ep.item(),
         "loss_det": loss_det.item(),
+        "loss_iso": loss_iso.item(),
+        "loss_elastic": loss_elastic.item(),
+        "loss_inc": loss_inc.item(),
         "det_Fp_min": det_Fp.min().item(),
+        "det_Fp_mean": det_Fp.mean().item(),
         "loss_total": total.item(),
     }
     return total, breakdown

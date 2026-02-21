@@ -79,7 +79,7 @@ profile     = False        # built-in per-operation timing (prints breakdown per
 linear_solver = "pardiso"  # "umfpack" | "pardiso" | "mumps" — direct solver for Newton
 
 # Plasticity (J2 von Mises, multiplicative decomposition F = Fe·Fp)
-plastic       = False                  # enable elastoplastic constitutive model
+plastic       = True                  # enable elastoplastic constitutive model
 plastic_param = [0.01, 0.05, 1.0]     # [My0, H_hard, m_hard]
 # My0     = initial yield stress
 # H_hard  = hardening modulus
@@ -88,11 +88,20 @@ consistent_tangent = False   # FD-based algorithmic tangent correction for yield
                               # Marginal benefit with contact; can destabilize at large steps
 
 # AI-enhanced contact
-nn_contact       = True  # enable NN for contact detection
-nn_contact_mode  = "neural_pull"  # "multitask" (Phase 1: NN broad + C++ refine) or "neural_pull" (Phase 2: pure NN)
-nn_contact_model = "v1"     # multitask variant: "v1", "v2", "v3"
-nn_contact_device = "cuda"  # "cuda" or "cpu"
-nn_contact_topk  = 3        # multitask only: K candidates per node
+nn_contact          = True        # enable NN for contact detection
+nn_contact_mode     = "multitask" # "multitask" (Phase 1) or "neural_pull" (Phase 2)
+nn_contact_device   = "cuda"      # "cuda" or "cpu"
+nn_contact_topk     = 3           # multitask only: K candidates per node
+nn_contact_checkpoint = "nn_contact/checkpoints/external/mt_sweep_unc_wt"      # path to checkpoint dir containing best_model.pt + config.pt
+                                  # None = nn_contact/checkpoints/multitask_v1/neural_pull/
+                                  # e.g. "nn_contact/checkpoints/external/mt_sweep_unc_wt"
+                                  # e.g. "nn_contact/checkpoints/external/neural_pull_v1"
+
+# AI-enhanced return mapping (Phase 3)
+nn_return_mapping     = False   # enable NN return mapping surrogate
+nn_rm_checkpoint      = None    # path to RM checkpoint dir or .pt file; None = nn_contact/checkpoints/return_mapping/best.pt
+nn_rm_device          = "cpu"   # "cpu" or "cuda" — CPU often sufficient for small MLP
+nn_rm_autodiff_tangent = True   # use autodiff consistent tangent (replaces FD)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Profiling instrumentation ────────────────────────────────────────────────
@@ -484,19 +493,21 @@ if nn_contact:
     try:
         if nn_contact_mode == "neural_pull":
             from nn_contact.evaluation.integration import NeuralPullCDA
-            neural_pull_cda = NeuralPullCDA.from_checkpoint(device=nn_contact_device)
+            neural_pull_cda = NeuralPullCDA.from_checkpoint(
+                checkpoint_dir=nn_contact_checkpoint, device=nn_contact_device)
             neural_pull_cda.coord_offset = _nn_coord_offset
-            print(f"NN contact enabled: mode=neural_pull, device={nn_contact_device}, "
-                  f"char_length={neural_pull_cda.char_length}")
+            print(f"NN contact: neural_pull, device={nn_contact_device}, "
+                  f"char_length={neural_pull_cda.char_length}, "
+                  f"ckpt={nn_contact_checkpoint or 'default'}")
         elif nn_contact_mode == "multitask":
             from nn_contact.evaluation.integration import HybridCDA
-            hybrid_cda = HybridCDA.from_variant(
-                nn_contact_model, device=nn_contact_device,
-            )
+            hybrid_cda = HybridCDA.from_checkpoint(
+                checkpoint_dir=nn_contact_checkpoint, device=nn_contact_device)
             hybrid_cda.topk = nn_contact_topk
             hybrid_cda.coord_offset = _nn_coord_offset
-            print(f"NN contact enabled: mode=multitask, model={nn_contact_model}, "
-                  f"device={nn_contact_device}, topk={nn_contact_topk}")
+            print(f"NN contact: multitask, device={nn_contact_device}, "
+                  f"topk={nn_contact_topk}, "
+                  f"ckpt={nn_contact_checkpoint or 'default'}")
         else:
             raise ValueError(f"Unknown nn_contact_mode: {nn_contact_mode}")
     except Exception as e:
@@ -533,6 +544,29 @@ if not _nn_active:
     print(f"Potato: {npatches} patches, {len(surf_pts)} surface samples for KD-tree")
 else:
     print(f"Potato: {npatches} patches (KD-tree deferred, NN active)")
+
+# --- NN return mapping initialization (Phase 3) ---
+nn_rm_model = None
+if nn_return_mapping and plastic:
+    _rm_path = nn_rm_checkpoint
+    if _rm_path is None:
+        _rm_path = os.path.join("nn_contact", "checkpoints", "return_mapping", "best.pt")
+    try:
+        import torch as _torch
+        from nn_contact.models.return_mapping import ReturnMappingNet
+        _rm_ckpt = _torch.load(_rm_path, map_location=nn_rm_device,
+                                weights_only=False)
+        nn_rm_model = ReturnMappingNet.from_config(_rm_ckpt["config"])
+        nn_rm_model.load_state_dict(_rm_ckpt["model_state_dict"])
+        nn_rm_model.to(nn_rm_device)
+        nn_rm_model.eval()
+        _nn_rm_params = sum(p.numel() for p in nn_rm_model.parameters())
+        print(f"NN return mapping enabled: {_nn_rm_params:,} params, "
+              f"device={nn_rm_device}, autodiff_tangent={nn_rm_autodiff_tangent}, "
+              f"ckpt={_rm_path}")
+    except Exception as e:
+        print(f"WARNING: NN return mapping disabled — {e}")
+        nn_rm_model = None
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4.  IDENTIFY SLAVE (BOTTOM) AND DIRICHLET (TOP) VERTICES
@@ -1473,6 +1507,94 @@ if plastic:
             mask = pos_map >= 0
             vals_np[pos_map[mask]] += dK[mask]
 
+    def _add_nn_tangent_correction():
+        """Add consistent tangent correction using NN autodiff dFp/dF.
+
+        Instead of 9 return-mapping perturbations per yielding GP (classical FD),
+        uses torch.func.vmap(jacrev) to compute dFp_new/dF in one batched call,
+        then combines with FD-based dP/dFp (stress evaluation only, no RM needed).
+
+        The correction to the stiffness matrix is:
+            ΔCxx[a,k,b,l] = Σ_{m,n} (∂P[a,k]/∂Fp[m,n]) · (dFp[m,n]/dF[b,l])
+
+        Cost: 9 stress evaluations per yielding GP (vs 9 RM + 18 stress evals for FD).
+        Plus one batched autodiff call for all yielding GPs.
+        """
+        global _elem_csr_pos_plastic
+
+        if _elem_csr_pos_plastic is None:
+            _build_elem_csr_pos_plastic()
+
+        vals_np = np.array(a_form.mat.CSR()[0], copy=False)
+
+        F_all = _F_flat_cache.reshape(n_ip, 3, 3)
+        Fp_new_all = _Fp_temp.reshape(n_ip, 3, 3)
+
+        # Identify yielding GPs
+        yield_mask = _delta_epcum > 0
+        n_yield = np.count_nonzero(yield_mask)
+        if n_yield == 0:
+            return
+
+        yield_ips = np.where(yield_mask)[0]
+
+        # ── Batched autodiff: dFp_new/dF for all yielding GPs ──
+        dFp_dF_all = nn_rm_model.compute_jacobian_numpy(
+            _F_flat_cache.reshape(-1, 9)[yield_mask],
+            _Fp_conv.reshape(-1, 9)[yield_mask],
+            _epcum_conv[yield_mask],
+        )  # (n_yield, 9, 9)
+
+        # ── Per-GP: FD-based dP/dFp + chain rule assembly ──
+        for idx_y, ip in enumerate(yield_ips):
+            e  = ip // _gps_per_elem
+            ig = ip %  _gps_per_elem
+
+            F      = F_all[ip]
+            Fp_new = Fp_new_all[ip]
+
+            # Base stress P0 at (F, Fp_new)
+            P0 = _compute_P_at_gp(F, Fp_new, c10, d1)
+            if P0 is None:
+                continue
+
+            # dP/dFp via FD: perturb each Fp component
+            h = max(1e-7, np.linalg.norm(Fp_new) * 1e-7)
+            dP_dFp = np.zeros((3, 3, 3, 3))  # dP[a,k] / dFp[m,n]
+            skip = False
+            for m in range(3):
+                for nn_idx in range(3):
+                    Fp_pert = Fp_new.copy()
+                    Fp_pert[m, nn_idx] += h
+                    P_pert = _compute_P_at_gp(F, Fp_pert, c10, d1)
+                    if P_pert is None:
+                        skip = True
+                        break
+                    dP_dFp[:, :, m, nn_idx] = (P_pert - P0) / h
+                if skip:
+                    break
+            if skip:
+                continue
+
+            # Chain rule: ΔCxx[a,k,b,l] = Σ_{m,n} dP_dFp[a,k,m,n] * dFp_dF[m*3+n, b*3+l]
+            # dFp_dF_all[idx_y] is (9, 9) where row = Fp component, col = F component
+            dFp_dF = dFp_dF_all[idx_y].reshape(3, 3, 3, 3)  # [m,n,b,l]
+            dCxx = np.einsum('akmn,mnbl->akbl', dP_dFp, dFp_dF)
+
+            # Assembly (same as _add_plastic_tangent_correction)
+            dNdX = _all_dNdX[e, ig]
+            w_detJ = _gp_weight * _all_detJ[e, ig]
+
+            temp = np.einsum('Ik,akbl->Iabl', dNdX, dCxx)
+            dK_4d = np.einsum('Iabl,Jl->IaJb', temp, dNdX)
+
+            # Block DOF order: dK_4d[I,a,J,b] → dK[a*8+I, b*8+J]
+            dK = w_detJ * dK_4d.transpose(1, 0, 3, 2).reshape(24, 24)
+
+            pos_map = _elem_csr_pos_plastic[e]
+            mask = pos_map >= 0
+            vals_np[pos_map[mask]] += dK[mask]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 6b. NEWTON SOLVER WITH DYNAMIC CONTACT
@@ -1682,8 +1804,31 @@ def newton_solve():
             global _Fp_temp, _delta_epcum, _F_flat_cache
             F_flat = _read_F_at_ips()
             _F_flat_cache = F_flat  # cache for tangent correction
-            _Fp_temp, _delta_epcum, rm_ok = return_mapping(
-                F_flat, _Fp_conv, _epcum_conv, c10, d1, My0, H_hard, m_hard)
+
+            nn_rm_used = False
+            if nn_rm_model is not None:
+                # NN return mapping path: batched MLP forward pass
+                _Fp_temp, _delta_epcum = nn_rm_model.predict_numpy(
+                    F_flat, _Fp_conv, _epcum_conv)
+                # Validation gate: check det(Fp) and finite values
+                Fp_check = _Fp_temp.reshape(-1, 3, 3)
+                det_check = np.linalg.det(Fp_check)
+                if np.any(det_check < 0.1) or not np.isfinite(_Fp_temp).all():
+                    # Fallback to classical return mapping
+                    _Fp_temp, _delta_epcum, rm_ok = return_mapping(
+                        F_flat, _Fp_conv, _epcum_conv,
+                        c10, d1, My0, H_hard, m_hard)
+                    if nit == 0:
+                        print(f"    [NN-RM] fallback to classical "
+                              f"(det_min={det_check.min():.3f})")
+                else:
+                    rm_ok = True
+                    nn_rm_used = True
+            else:
+                _Fp_temp, _delta_epcum, rm_ok = return_mapping(
+                    F_flat, _Fp_conv, _epcum_conv,
+                    c10, d1, My0, H_hard, m_hard)
+
             if not rm_ok:
                 print(f"    Newton {nit}: return mapping FAILED — aborting")
                 gfu.vec.FV().NumPy()[:] = _u_backup
@@ -1768,12 +1913,15 @@ def newton_solve():
         if perf: perf.record("assemble_lin", perf_counter() - _t0)
 
         # 6b. Plastic consistent tangent correction (yielding GPs only)
-        #     Adds the rank-1 correction ΔK[ia,jb] = B[ia]·D[jb] per GP
-        #     that accounts for dFp/dF.  B is analytical (exact), D is FD-based
-        #     (exact: captures full dN/dF chain via return-mapping perturbation).
+        #     Two paths:
+        #     - NN autodiff: dFp/dF from torch.func.vmap(jacrev) + FD dP/dFp
+        #     - Classical FD: 9 return-mapping perturbations per yielding GP
         if plastic and consistent_tangent and np.any(_delta_epcum > 0):
             if perf: _t0 = perf_counter()
-            _add_plastic_tangent_correction()
+            if nn_rm_autodiff_tangent and nn_rm_used:
+                _add_nn_tangent_correction()
+            else:
+                _add_plastic_tangent_correction()
             if perf: perf.record("plastic_tangent", perf_counter() - _t0)
 
         # 7. Add contact Hessian: K_con = kn * (n⊗n + g·dn/dx_s)

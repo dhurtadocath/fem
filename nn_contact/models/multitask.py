@@ -318,5 +318,8 @@ class MultiTaskContactNet(nn.Module):
     def from_config(cls, cfg: MultiTaskConfig,
                     task_attention: bool = False,
                     patch_conditioned: bool = False) -> "MultiTaskContactNet":
-        return cls(cfg, in_dim=3, task_attention=task_attention,
-                   patch_conditioned=patch_conditioned)
+        # Config-level flags take priority, then explicit args for backwards compat
+        _attn = getattr(cfg, "task_attention", False) or task_attention
+        _pcond = getattr(cfg, "patch_conditioned", False) or patch_conditioned
+        return cls(cfg, in_dim=3, task_attention=_attn,
+                   patch_conditioned=_pcond)
