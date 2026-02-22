@@ -62,7 +62,7 @@ _cli, _unknown = _parser.parse_known_args()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 10                # mesh density (n x n x n hex elements)
+n           = 5                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -1918,9 +1918,9 @@ def newton_solve():
     # residual floor ~kn * 0.01.  Multitask uses C++ TR refinement → exact gaps.
     # NN return mapping introduces O(1e-3) Fp error → residual floor ~1e-9 to 1e-7.
     if neural_pull_cda is not None:
-        newton_gtol = max(gtol, 1e-4)
+        newton_gtol = max(gtol, 1e-3) # slower but capable with *1e-2
     elif nn_rm_model is not None:
-        newton_gtol = max(gtol, 1e-7)
+        newton_gtol = max(gtol, 1e-6) # slower but capable with *1e-2
     else:
         newton_gtol = gtol
     _u_backup = gfu.vec.FV().NumPy().copy()
