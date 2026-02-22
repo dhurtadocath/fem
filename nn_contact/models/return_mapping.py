@@ -55,6 +55,9 @@ class ReturnMappingNet(nn.Module):
 
         self._init_weights()
 
+        # Pre-allocated buffer for predict_numpy (lazy-sized on first call)
+        self._input_buf: torch.Tensor | None = None
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -187,16 +190,22 @@ class ReturnMappingNet(nn.Module):
         """
         import numpy as np
 
-        F = F.reshape(-1, 9)
-        Fp_old = Fp_old.reshape(-1, 9)
-        epcum = epcum.reshape(-1, 1)
+        F_np = F.reshape(-1, 9)
+        Fp_np = Fp_old.reshape(-1, 9)
+        n = F_np.shape[0]
 
-        x = torch.from_numpy(
-            np.hstack([F, Fp_old, epcum]).astype(np.float32)
-        )
+        # Reuse pre-allocated buffer if same batch size
+        if self._input_buf is None or self._input_buf.shape[0] != n:
+            self._input_buf = torch.empty(n, 19, dtype=torch.float32)
+
+        buf = self._input_buf
+        buf[:, :9] = torch.from_numpy(F_np.astype(np.float32))
+        buf[:, 9:18] = torch.from_numpy(Fp_np.astype(np.float32))
+        buf[:, 18:] = torch.from_numpy(
+            epcum.reshape(-1, 1).astype(np.float32))
 
         with torch.no_grad():
-            out = self.forward(x)
+            out = self.forward(buf)
 
         return (
             out["Fp_new"].numpy().ravel(),

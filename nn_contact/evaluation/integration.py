@@ -51,10 +51,17 @@ class HybridCDA:
         from nn_contact.models.multitask import MultiTaskContactNet
         from nn_contact.config import MultiTaskConfig
 
-        # Reconstruct model from checkpoint
+        # Reconstruct model from checkpoint, detecting features from state_dict
         cfg = checkpoint.get("config", MultiTaskConfig())
-        self.model = MultiTaskContactNet.from_config(cfg).to(device)
-        self.model.load_state_dict(checkpoint["model_state"])
+        state = checkpoint["model_state"]
+        # Detect task_attention and patch_conditioned from state_dict keys
+        # (some checkpoints don't store these flags in config)
+        has_attn = any(k.startswith("attn_gn.") for k in state)
+        has_pcond = any(k.startswith("proj_head_cond.") for k in state)
+        self.model = MultiTaskContactNet.from_config(
+            cfg, task_attention=has_attn, patch_conditioned=has_pcond,
+        ).to(device)
+        self.model.load_state_dict(state)
         self.model.eval()
 
     @classmethod
@@ -67,10 +74,10 @@ class HybridCDA:
         Parameters
         ----------
         checkpoint_dir : path to directory with best_model.pt and optionally config.pt.
-            None defaults to nn_contact/checkpoints/multitask_v1/.
+            None defaults to nn_contact/checkpoints/external/mt_sweep_unc_wt/.
         """
         if checkpoint_dir is None:
-            checkpoint_dir = Path(__file__).resolve().parents[1] / "checkpoints" / "multitask_v1"
+            checkpoint_dir = Path(__file__).resolve().parents[1] / "checkpoints" / "external" / "mt_sweep_unc_wt"
         ckpt_dir = Path(checkpoint_dir)
         model_path = ckpt_dir / "best_model.pt"
         config_path = ckpt_dir / "config.pt"
@@ -187,9 +194,15 @@ class NeuralPullCDA:
         cls, checkpoint_dir: str | Path | None = None,
         device: str = "cuda",
     ) -> "NeuralPullCDA":
-        """Load from checkpoint directory."""
+        """Load from checkpoint directory.
+
+        Parameters
+        ----------
+        checkpoint_dir : path to directory with best_model.pt and optionally config.pt.
+            None defaults to nn_contact/checkpoints/external/neural_pull_v1/.
+        """
         if checkpoint_dir is None:
-            checkpoint_dir = Path(__file__).resolve().parents[1] / "checkpoints" / "neural_pull"
+            checkpoint_dir = Path(__file__).resolve().parents[1] / "checkpoints" / "external" / "neural_pull_v1"
         ckpt_dir = Path(checkpoint_dir)
         model_path = ckpt_dir / "best_model.pt"
         config_path = ckpt_dir / "config.pt"

@@ -1721,7 +1721,8 @@ py::tuple batch_refine_from_init(
     py::array_t<double> t_init_arr,      // (N, 2) NN-predicted (t1, t2)
     const Eigen::MatrixXd &slave_pos,    // (N, 3) slave positions
     py::array_t<double> radii_arr,       // (npatches,) BS radii for geom check
-    double eps)
+    double eps,
+    bool compute_hessian)
 {
     const int rows_per_patch = 20;
     int nPatches = static_cast<int>(CtrlPtsAll.rows() / rows_per_patch);
@@ -1745,6 +1746,12 @@ py::tuple batch_refine_from_init(
     py::array_t<double> gn_out({nPoints});
     py::array_t<double> nor_out({nPoints, 3});
     py::array_t<double> xc_out({nPoints, 3});
+    py::array_t<double> dndxs_out;
+    if (compute_hessian) {
+        dndxs_out = py::array_t<double>({nPoints, 3, 3});
+    } else {
+        dndxs_out = py::array_t<double>({0, 3, 3});
+    }
 
     auto conv_buf = conv_out.request();
     auto po_buf   = pids_out.request();
@@ -1761,6 +1768,11 @@ py::tuple batch_refine_from_init(
     double *gn_ptr   = static_cast<double*>(gn_buf.ptr);
     double *no_ptr   = static_cast<double*>(no_buf.ptr);
     double *xo_ptr   = static_cast<double*>(xo_buf.ptr);
+    double *dndxs_ptr = nullptr;
+    if (compute_hessian) {
+        auto dndxs_buf = dndxs_out.request();
+        dndxs_ptr = static_cast<double*>(dndxs_buf.ptr);
+    }
 
     // Initialize outputs (not converged, invalid)
     for (int i = 0; i < nPoints; ++i) {
@@ -1771,6 +1783,9 @@ py::tuple batch_refine_from_init(
         gn_ptr[i]   = std::numeric_limits<double>::infinity();
         no_ptr[3*i] = 0.0; no_ptr[3*i+1] = 0.0; no_ptr[3*i+2] = 0.0;
         xo_ptr[3*i] = 0.0; xo_ptr[3*i+1] = 0.0; xo_ptr[3*i+2] = 0.0;
+    }
+    if (compute_hessian) {
+        for (int i = 0; i < nPoints * 9; ++i) dndxs_ptr[i] = 0.0;
     }
 
     #pragma omp parallel for schedule(dynamic)
@@ -1816,26 +1831,84 @@ py::tuple batch_refine_from_init(
             v = vc;
         }
 
-        // Compute signed distance and normal at refined (u, v)
-        Eigen::Vector3d xc, nor;
-        point_and_normal_internal(CP, u, v, eps, xc, nor);
+        if (!compute_hessian) {
+            // Fast path: just point and normal (reuse point_and_normal_internal)
+            Eigen::Vector3d xc, nor;
+            point_and_normal_internal(CP, u, v, eps, xc, nor);
 
-        // Check for degenerate normal
-        if (nor.squaredNorm() < 1e-30) continue;
+            if (nor.squaredNorm() < 1e-30) continue;
+            double gn = (xs - xc).dot(nor);
 
-        double gn = (xs - xc).dot(nor);
+            conv_ptr[i] = true;
+            po_ptr[i]   = pid;
+            t1_ptr[i]   = u;
+            t2_ptr[i]   = v;
+            gn_ptr[i]   = gn;
+            no_ptr[3*i] = nor(0); no_ptr[3*i+1] = nor(1); no_ptr[3*i+2] = nor(2);
+            xo_ptr[3*i] = xc(0);  xo_ptr[3*i+1] = xc(1);  xo_ptr[3*i+2] = xc(2);
+        } else {
+            // Hessian path: compute gn, normal, xc AND dn/dx_s in one shot
+            // (same logic as batch_evaluate_contact Hessian path)
+            GrgDerivs2Result d = Grg_derivs2_impl_generic(CP, u, v, eps);
 
-        // Store results
-        conv_ptr[i] = true;
-        po_ptr[i]   = pid;
-        t1_ptr[i]   = u;
-        t2_ptr[i]   = v;
-        gn_ptr[i]   = gn;
-        no_ptr[3*i] = nor(0); no_ptr[3*i+1] = nor(1); no_ptr[3*i+2] = nor(2);
-        xo_ptr[3*i] = xc(0);  xo_ptr[3*i+1] = xc(1);  xo_ptr[3*i+2] = xc(2);
+            Eigen::Vector3d tau1 = d.D1p;
+            Eigen::Vector3d tau2 = d.D2p;
+            Eigen::Vector3d N = tau1.cross(tau2);
+            double normN = N.norm();
+            if (normN < 1e-30) continue;
+            Eigen::Vector3d nor = N / normN;
+
+            Eigen::Vector3d delta = xs - d.p;
+            double gn = delta.dot(nor);
+
+            // Store basic results
+            conv_ptr[i] = true;
+            po_ptr[i]   = pid;
+            t1_ptr[i]   = u;
+            t2_ptr[i]   = v;
+            gn_ptr[i]   = gn;
+            no_ptr[3*i] = nor(0); no_ptr[3*i+1] = nor(1); no_ptr[3*i+2] = nor(2);
+            xo_ptr[3*i] = d.p(0); xo_ptr[3*i+1] = d.p(1); xo_ptr[3*i+2] = d.p(2);
+
+            // --- Compute dn/dx_s via implicit function theorem ---
+            Eigen::Matrix<double, 3, 2> dxcdt;
+            dxcdt.col(0) = d.D1p;
+            dxcdt.col(1) = d.D2p;
+
+            Eigen::Matrix2d delta_dot_d2xc;
+            delta_dot_d2xc(0, 0) = delta.dot(d.D1D1p);
+            delta_dot_d2xc(0, 1) = delta.dot(d.D1D2p);
+            delta_dot_d2xc(1, 0) = delta.dot(d.D1D2p);
+            delta_dot_d2xc(1, 1) = delta.dot(d.D2D2p);
+
+            Eigen::Matrix2d dfdt = -2.0 * delta_dot_d2xc + 2.0 * (dxcdt.transpose() * dxcdt);
+
+            double det_dfdt = dfdt.determinant();
+            if (std::abs(det_dfdt) < 1e-30) continue;  // singular — skip Hessian but keep basic results
+
+            Eigen::Matrix<double, 2, 3> dfdxs = -2.0 * dxcdt.transpose();
+            Eigen::Matrix<double, 2, 3> dtdxs = (-dfdt).inverse() * dfdxs;
+
+            Eigen::Matrix<double, 3, 2> dtau1dt, dtau2dt;
+            dtau1dt.col(0) = d.D1D1p;
+            dtau1dt.col(1) = d.D1D2p;
+            dtau2dt.col(0) = d.D1D2p;
+            dtau2dt.col(1) = d.D2D2p;
+
+            Eigen::Matrix3d dndN = (Eigen::Matrix3d::Identity() - nor * nor.transpose()) / normN;
+            Eigen::Matrix3d dNdtau1 = -skew_mat(tau2);
+            Eigen::Matrix3d dNdtau2 = skew_mat(tau1);
+            Eigen::Matrix<double, 3, 2> dNdt = dNdtau1 * dtau1dt + dNdtau2 * dtau2dt;
+            Eigen::Matrix<double, 3, 2> dndt = dndN * dNdt;
+            Eigen::Matrix3d dndxs = dndt * dtdxs;
+
+            for (int a = 0; a < 3; ++a)
+                for (int b = 0; b < 3; ++b)
+                    dndxs_ptr[9*i + 3*a + b] = dndxs(a, b);
+        }
     }
 
-    return py::make_tuple(conv_out, pids_out, t1_out, t2_out, gn_out, nor_out, xc_out);
+    return py::make_tuple(conv_out, pids_out, t1_out, t2_out, gn_out, nor_out, xc_out, dndxs_out);
 }
 
 
@@ -1866,5 +1939,6 @@ PYBIND11_MODULE(gregory_patch_backend, m) {
     m.def("batch_refine_from_init", &batch_refine_from_init,
           "Newton-refine contact projection from NN initial guess (batch, OpenMP)",
           py::arg("CtrlPtsAll"), py::arg("patch_ids"), py::arg("t_init"),
-          py::arg("slave_pos"), py::arg("radii"), py::arg("eps"));
+          py::arg("slave_pos"), py::arg("radii"), py::arg("eps"),
+          py::arg("compute_hessian") = false);
 }

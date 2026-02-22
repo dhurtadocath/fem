@@ -30,6 +30,7 @@ Solvers
 import os, sys, pickle
 from contextlib import nullcontext
 from datetime import datetime
+from pathlib import Path
 from time import perf_counter
 
 import numpy as np
@@ -42,6 +43,22 @@ from ngsolve.meshes import MakeStructured3DMesh
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from PyClasses import gregory_patch_backend as gb
 from PyClasses._contact_tr_multi_helpers import project_points_tr_multi_batch
+
+# ── CLI overrides (optional) ──────────────────────────────────────────────────
+import argparse
+_parser = argparse.ArgumentParser(description="ContactPotato NGSolve simulation")
+_parser.add_argument("--n", type=int, default=None, help="Mesh density override")
+_parser.add_argument("--nsteps", type=int, default=None, help="Number of load steps")
+_parser.add_argument("--nn-mode", type=str, default=None,
+                     help="NN contact mode: auto, multitask, neural_pull, off")
+_parser.add_argument("--nn-checkpoint", type=str, default=None,
+                     help="Path to NN checkpoint dir (or name in external/)")
+_parser.add_argument("--nn-device", type=str, default=None, help="cuda or cpu")
+_parser.add_argument("--plastic", type=str, default=None, help="true/false")
+_parser.add_argument("--nn-rm", type=str, default=None, help="NN return mapping: true/false")
+_parser.add_argument("--plot", type=int, default=None, help="VTK export frequency")
+_parser.add_argument("--profile", action="store_true", default=None, help="Enable profiling")
+_cli, _unknown = _parser.parse_known_args()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
@@ -89,19 +106,50 @@ consistent_tangent = False   # FD-based algorithmic tangent correction for yield
 
 # AI-enhanced contact
 nn_contact          = True        # enable NN for contact detection
-nn_contact_mode     = "multitask" # "multitask" (Phase 1) or "neural_pull" (Phase 2)
+nn_contact_mode     = "auto"      # "auto" (detect from checkpoint), "multitask", or "neural_pull"
 nn_contact_device   = "cuda"      # "cuda" or "cpu"
 nn_contact_topk     = 3           # multitask only: K candidates per node
-nn_contact_checkpoint = "nn_contact/checkpoints/external/mt_sweep_unc_wt"      # path to checkpoint dir containing best_model.pt + config.pt
-                                  # None = nn_contact/checkpoints/multitask_v1/neural_pull/
-                                  # e.g. "nn_contact/checkpoints/external/mt_sweep_unc_wt"
-                                  # e.g. "nn_contact/checkpoints/external/neural_pull_v1"
+nn_contact_checkpoint = "nn_contact/checkpoints/external/neural_pull_v1"#mt_sweep_unc_wt" #neural_pull_v1"      # path to checkpoint dir containing best_model.pt + config.pt
+                                  # None = best default per mode:
+                                  #   multitask   → nn_contact/checkpoints/external/mt_sweep_unc_wt
+                                  #   neural_pull → nn_contact/checkpoints/external/neural_pull_v1
 
 # AI-enhanced return mapping (Phase 3)
-nn_return_mapping     = False   # enable NN return mapping surrogate
-nn_rm_checkpoint      = None    # path to RM checkpoint dir or .pt file; None = nn_contact/checkpoints/return_mapping/best.pt
+nn_return_mapping     = True    # enable NN return mapping surrogate
+nn_rm_checkpoint      = "nn_contact/checkpoints/external/return_mapping/best.pt"  # path to RM checkpoint .pt file
 nn_rm_device          = "cpu"   # "cpu" or "cuda" — CPU often sufficient for small MLP
 nn_rm_autodiff_tangent = True   # use autodiff consistent tangent (replaces FD)
+
+# ── Apply CLI overrides ──────────────────────────────────────────────────────
+if _cli.n is not None:
+    n = _cli.n
+if _cli.nsteps is not None:
+    nsteps = _cli.nsteps
+if _cli.nn_device is not None:
+    nn_contact_device = _cli.nn_device
+if _cli.plastic is not None:
+    plastic = _cli.plastic.lower() in ("true", "1", "yes")
+if _cli.nn_rm is not None:
+    nn_return_mapping = _cli.nn_rm.lower() in ("true", "1", "yes")
+if _cli.plot is not None:
+    plot = _cli.plot
+if _cli.profile is not None and _cli.profile:
+    profile = True
+if _cli.nn_mode is not None:
+    if _cli.nn_mode == "off":
+        nn_contact = False
+    else:
+        nn_contact = True
+        nn_contact_mode = _cli.nn_mode
+if _cli.nn_checkpoint is not None:
+    nn_contact = True
+    nn_contact_checkpoint = _cli.nn_checkpoint
+    # Allow short names: "neural_pull_v2" → full path in external/
+    _short = Path(_cli.nn_checkpoint)
+    if not _short.is_absolute() and not _short.exists():
+        _ext_candidate = Path(__file__).resolve().parent.parent / "nn_contact" / "checkpoints" / "external" / _cli.nn_checkpoint
+        if _ext_candidate.exists():
+            nn_contact_checkpoint = str(_ext_candidate)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Profiling instrumentation ────────────────────────────────────────────────
@@ -489,27 +537,95 @@ _nn_coord_offset = -_ptt_center  # [-6, 0, 0] approximately
 _ptt_bounding_r = np.linalg.norm(np.array(ptt.X) - _ptt_center, axis=1).max()
 _nn_cutoff_r = _ptt_bounding_r + 1.5  # conservative: beyond training data range
 
+# Project root: parent of this script's directory (1_Minimization_solvers/../)
+# Used to resolve relative checkpoint paths after os.chdir() changes CWD.
+_project_root = Path(__file__).resolve().parent.parent
+
+def _resolve_ckpt_path(ckpt_path):
+    """Resolve a checkpoint path relative to the project root."""
+    if ckpt_path is None:
+        return None
+    p = Path(ckpt_path)
+    if p.is_absolute():
+        return p
+    # Relative to project root (not CWD, which is 1_Minimization_solvers/)
+    return _project_root / p
+
+def _detect_checkpoint_type(ckpt_dir):
+    """Peek at best_model.pt keys to determine model type."""
+    import torch as _torch
+    model_path = Path(ckpt_dir) / "best_model.pt"
+    if not model_path.exists():
+        raise FileNotFoundError(f"No best_model.pt in {ckpt_dir}")
+    ckpt = _torch.load(model_path, map_location="cpu", weights_only=False)
+    keys = set(ckpt.keys())
+    if "char_length" in keys:
+        return "neural_pull"
+    if "model_state_dict" in keys:
+        return "return_mapping"
+    if "model_state" in keys:
+        cfg = ckpt.get("config")
+        if cfg is not None and hasattr(cfg, "n_patches"):
+            return "multitask"
+        # Check state_dict keys for multitask signature
+        state = ckpt["model_state"]
+        state_keys = set(state.keys()) if isinstance(state, dict) else set()
+        if any(k.startswith("patch_head.") for k in state_keys):
+            return "multitask"
+        if any(k in keys for k in ("features", "task_attention", "patch_conditioned")):
+            return "multitask"
+    return "unknown"
+
 if nn_contact:
     try:
-        if nn_contact_mode == "neural_pull":
+        # Resolve checkpoint path relative to project root (handles os.chdir)
+        _ckpt_dir = _resolve_ckpt_path(nn_contact_checkpoint)
+        _resolved_mode = nn_contact_mode
+
+        if _resolved_mode == "auto":
+            if _ckpt_dir is not None:
+                _resolved_mode = _detect_checkpoint_type(_ckpt_dir)
+                if _resolved_mode == "unknown":
+                    raise ValueError(
+                        f"Cannot auto-detect model type from checkpoint at {_ckpt_dir}. "
+                        f"Set nn_contact_mode='multitask' or 'neural_pull' explicitly.")
+                if _resolved_mode == "return_mapping":
+                    raise ValueError(
+                        f"Checkpoint at {_ckpt_dir} is a return_mapping model, not a contact model. "
+                        f"Use nn_rm_checkpoint instead.")
+                print(f"NN contact: auto-detected mode '{_resolved_mode}' from checkpoint")
+            else:
+                # No checkpoint given: default to neural_pull (best overall model)
+                _resolved_mode = "neural_pull"
+                print(f"NN contact: mode='auto' with default checkpoint → neural_pull")
+
+        elif _ckpt_dir is not None:
+            # Explicit mode + explicit checkpoint: validate they match
+            _detected = _detect_checkpoint_type(_ckpt_dir)
+            if _detected != "unknown" and _detected != _resolved_mode:
+                raise ValueError(
+                    f"nn_contact_mode='{_resolved_mode}' but checkpoint at {_ckpt_dir} "
+                    f"is a '{_detected}' model. Fix nn_contact_mode or nn_contact_checkpoint.")
+
+        if _resolved_mode == "neural_pull":
             from nn_contact.evaluation.integration import NeuralPullCDA
             neural_pull_cda = NeuralPullCDA.from_checkpoint(
-                checkpoint_dir=nn_contact_checkpoint, device=nn_contact_device)
+                checkpoint_dir=_ckpt_dir, device=nn_contact_device)
             neural_pull_cda.coord_offset = _nn_coord_offset
             print(f"NN contact: neural_pull, device={nn_contact_device}, "
                   f"char_length={neural_pull_cda.char_length}, "
-                  f"ckpt={nn_contact_checkpoint or 'default'}")
-        elif nn_contact_mode == "multitask":
+                  f"ckpt={_ckpt_dir or 'default'}")
+        elif _resolved_mode == "multitask":
             from nn_contact.evaluation.integration import HybridCDA
             hybrid_cda = HybridCDA.from_checkpoint(
-                checkpoint_dir=nn_contact_checkpoint, device=nn_contact_device)
+                checkpoint_dir=_ckpt_dir, device=nn_contact_device)
             hybrid_cda.topk = nn_contact_topk
             hybrid_cda.coord_offset = _nn_coord_offset
             print(f"NN contact: multitask, device={nn_contact_device}, "
                   f"topk={nn_contact_topk}, "
-                  f"ckpt={nn_contact_checkpoint or 'default'}")
+                  f"ckpt={_ckpt_dir or 'default'}")
         else:
-            raise ValueError(f"Unknown nn_contact_mode: {nn_contact_mode}")
+            raise ValueError(f"Unknown nn_contact_mode: {_resolved_mode}")
     except Exception as e:
         print(f"WARNING: NN contact disabled — {e}")
         hybrid_cda = None
@@ -548,9 +664,9 @@ else:
 # --- NN return mapping initialization (Phase 3) ---
 nn_rm_model = None
 if nn_return_mapping and plastic:
-    _rm_path = nn_rm_checkpoint
+    _rm_path = _resolve_ckpt_path(nn_rm_checkpoint)
     if _rm_path is None:
-        _rm_path = os.path.join("nn_contact", "checkpoints", "return_mapping", "best.pt")
+        _rm_path = _project_root / "nn_contact" / "checkpoints" / "return_mapping" / "best.pt"
     try:
         import torch as _torch
         from nn_contact.models.return_mapping import ReturnMappingNet
@@ -630,10 +746,30 @@ class ContactCache:
         self.tol_reuse   = contact_tol_reuse
         self.xc_surf     = None      # (n_slave, 3) surface points for linesearch
         self.last_normals = None     # (n_slave, 3) normals for linesearch
+        # Per-step NN warm-start stats (accumulated across Newton iterations)
+        self._nn_conv = 0
+        self._nn_nonconv = 0
+        self._nn_fallback = 0
+        self._nn_calls = 0
 
     def reset(self):
         """Call at the start of each load step."""
         self.prev_pos = None
+        self._nn_conv = 0
+        self._nn_nonconv = 0
+        self._nn_fallback = 0
+        self._nn_calls = 0
+
+    def nn_step_summary(self):
+        """Return a short summary string for the step printout (empty if no NN calls)."""
+        if self._nn_calls == 0:
+            return ""
+        total = self._nn_conv + self._nn_nonconv
+        conv_pct = self._nn_conv / max(total, 1) * 100
+        parts = [f"nn={self._nn_conv}/{total}({conv_pct:.0f}%)"]
+        if self._nn_fallback > 0:
+            parts.append(f"fb={self._nn_fallback}")
+        return "  " + " ".join(parts)
 
     def _neural_pull_evaluate(self, slave_pos, compute_hessian):
         """Pure NN evaluation: g, ∇g, ∇²g directly from Neural-Pull SDF.
@@ -668,7 +804,11 @@ class ContactCache:
         # Store for linesearch
         self.xc_surf = xc_surf
         self.last_normals = normals
-        self.patch_ids = np.zeros(n_slave, dtype=np.int32)
+        # Mark only near-surface nodes as valid for linesearch gap computation.
+        # Far-field nodes (gn=+inf, normals=[0,0,0]) must have patch_ids=-1 so
+        # _precompute_ls_data() excludes them via _ls_valid = patch_ids >= 0.
+        self.patch_ids = np.full(n_slave, -1, dtype=np.int32)
+        self.patch_ids[idx_near] = 0
         self.prev_pos = slave_pos.copy()
 
         active = gn < 0
@@ -721,39 +861,35 @@ class ContactCache:
             nn_xi   = nn_out["xi_init"][idx_nn_local, 0]     # top-1 xi (N, 2)
             pos_nn  = pos_full[idx_nn]
 
-            # Fast path: Newton refinement from NN's (patch, xi) guess
-            conv_mask, ref_pids, ref_t1, ref_t2, ref_gn, ref_nor, ref_xc = \
+            # Fast path: Newton refinement + optional Hessian in single C++ call
+            conv_mask, ref_pids, ref_t1, ref_t2, ref_gn, ref_nor, ref_xc, ref_dndxs = \
                 gb.batch_refine_from_init(
                     ctrlpts_all,
                     nn_pids.astype(np.int32),
                     nn_xi.astype(np.float64),
-                    pos_nn, radii, eps)
+                    pos_nn, radii, eps, compute_hessian)
 
             conv = np.asarray(conv_mask, dtype=bool)
+            self._nn_calls += 1
+            self._nn_conv += int(conv.sum())
+            self._nn_nonconv += int((~conv).sum())
             idx_conv = idx_nn[conv]
             if idx_conv.size > 0:
-                pids[idx_conv]      = np.asarray(ref_pids)[conv]
-                params[idx_conv, 0] = np.asarray(ref_t1)[conv]
-                params[idx_conv, 1] = np.asarray(ref_t2)[conv]
+                ref_pids_np = np.asarray(ref_pids)
+                ref_t1_np   = np.asarray(ref_t1)
+                ref_t2_np   = np.asarray(ref_t2)
+                pids[idx_conv]      = ref_pids_np[conv]
+                params[idx_conv, 0] = ref_t1_np[conv]
+                params[idx_conv, 1] = ref_t2_np[conv]
                 gn_out[idx_conv]    = np.asarray(ref_gn)[conv]
                 nor_out[idx_conv]   = np.asarray(ref_nor)[conv]
                 xc_out[idx_conv]    = np.asarray(ref_xc)[conv]
-                if compute_hessian:
-                    params_c = np.column_stack([
-                        np.asarray(ref_t1)[conv],
-                        np.asarray(ref_t2)[conv]])
-                    _, _, _, dndxs_c = gb.batch_evaluate_contact(
-                        ctrlpts_all, np.asarray(ref_pids)[conv].astype(np.int32),
-                        params_c, pos_nn[conv], eps, True)
-                    if dndxs_c.size > 0:
-                        dndxs_out[idx_conv] = dndxs_c
+                if compute_hessian and ref_dndxs.size > 0:
+                    dndxs_out[idx_conv] = np.asarray(ref_dndxs)[conv]
 
-            # Slow path: full TR for non-converged nodes (~1% expected)
+            # Slow path: full TR for non-converged nodes
             idx_nonconv = idx_nn[~conv]
             if idx_nonconv.size > 0:
-                n_nc = idx_nonconv.size
-                print(f"  [NN contact] Newton non-conv: {n_nc}/{idx_nn.size} "
-                      f"({n_nc/idx_nn.size*100:.1f}%) → full TR", flush=True)
                 # Use NN top-K as candidate seeds for full TR
                 nn_pids_k = nn_out["patch_ids"][idx_nn_local[~conv]]  # (n_nc, K)
                 pos_nc = pos_full[idx_nonconv]
@@ -765,19 +901,20 @@ class ContactCache:
                         BASE_NCAND, MIN_NCAND, MAX_NCAND, RADIUS_FACTOR,
                     )
                 fb_pids = np.asarray(fb_pids, dtype=np.int32)
+                fb_t1_np = np.asarray(fb_t1)
+                fb_t2_np = np.asarray(fb_t2)
                 valid_fb = fb_pids >= 0
                 idx_vfb = idx_nonconv[valid_fb]
                 if idx_vfb.size > 0:
                     pids[idx_vfb]      = fb_pids[valid_fb]
-                    params[idx_vfb, 0] = np.asarray(fb_t1)[valid_fb]
-                    params[idx_vfb, 1] = np.asarray(fb_t2)[valid_fb]
+                    params[idx_vfb, 0] = fb_t1_np[valid_fb]
+                    params[idx_vfb, 1] = fb_t2_np[valid_fb]
                     gn_out[idx_vfb]    = np.asarray(fb_gn)[valid_fb]
                     nor_out[idx_vfb]   = np.asarray(fb_nor)[valid_fb]
                     xc_out[idx_vfb]    = np.asarray(fb_xc)[valid_fb]
                     if compute_hessian:
                         params_fb = np.column_stack([
-                            np.asarray(fb_t1)[valid_fb],
-                            np.asarray(fb_t2)[valid_fb]])
+                            fb_t1_np[valid_fb], fb_t2_np[valid_fb]])
                         _, _, _, dndxs_fb = gb.batch_evaluate_contact(
                             ctrlpts_all, fb_pids[valid_fb], params_fb,
                             pos_nc[valid_fb], eps, True)
@@ -786,8 +923,7 @@ class ContactCache:
 
         # ── Fallback path: classical TR for low-confidence nodes ──
         if idx_fb.size > 0:
-            print(f"  [NN contact] low-conf fallback to TR for {idx_fb.size}/{n} nodes "
-                  f"({idx_fb.size/n*100:.1f}%)", flush=True)
+            self._nn_fallback += idx_fb.size
             _ensure_kdtree()
             pos_fb = pos_full[idx_fb]
             pids_fb, t1_fb, t2_fb, gn_fb, nor_fb, xc_fb = project_points_tr_multi_batch(
@@ -1780,12 +1916,16 @@ def newton_solve():
     """
     # Neural-Pull bypasses C++ entirely → irreducible gap error ~0.01 →
     # residual floor ~kn * 0.01.  Multitask uses C++ TR refinement → exact gaps.
+    # NN return mapping introduces O(1e-3) Fp error → residual floor ~1e-9 to 1e-7.
     if neural_pull_cda is not None:
         newton_gtol = max(gtol, 1e-3)
+    elif nn_rm_model is not None:
+        newton_gtol = max(gtol, 1e-6)
     else:
         newton_gtol = gtol
     _u_backup = gfu.vec.FV().NumPy().copy()
 
+    rnorm = np.inf
     rnorm_prev = np.inf
     rnorm_initial = np.inf
     stag_count = 0
@@ -1807,21 +1947,42 @@ def newton_solve():
 
             nn_rm_used = False
             if nn_rm_model is not None:
-                # NN return mapping path: batched MLP forward pass
-                _Fp_temp, _delta_epcum = nn_rm_model.predict_numpy(
+                # ── NN-first approach: run NN on ALL GPs, threshold output ──
+                # Faster than yield-check-first: batched NN (~3-4ms) is cheaper
+                # than vectorized yield criterion (~6ms with np.linalg.inv).
+                _n_gp = len(_epcum_conv)
+
+                # Single batched forward pass on all GPs
+                _Fp_nn_all, _dep_nn_all = nn_rm_model.predict_numpy(
                     F_flat, _Fp_conv, _epcum_conv)
-                # Validation gate: check det(Fp) and finite values
-                Fp_check = _Fp_temp.reshape(-1, 3, 3)
-                det_check = np.linalg.det(Fp_check)
-                if np.any(det_check < 0.1) or not np.isfinite(_Fp_temp).all():
-                    # Fallback to classical return mapping
+                _Fp_nn_all = _Fp_nn_all.reshape(-1, 9)
+
+                # Safety check: NaN/Inf in NN output → full classical fallback
+                if not (np.isfinite(_Fp_nn_all).all()
+                        and np.isfinite(_dep_nn_all).all()):
                     _Fp_temp, _delta_epcum, rm_ok = return_mapping(
                         F_flat, _Fp_conv, _epcum_conv,
                         c10, d1, My0, H_hard, m_hard)
                     if nit == 0:
-                        print(f"    [NN-RM] fallback to classical "
-                              f"(det_min={det_check.min():.3f})")
+                        print("    [NN-RM] NaN in NN output, classical fallback")
                 else:
+                    # Threshold: identify truly yielding GPs from NN output.
+                    # Elastic GPs produce delta_ep ≈ 1.26e-5 (softplus floor)
+                    # and near-zero Fp correction. Yielding GPs have larger values.
+                    _corr_norm = np.linalg.norm(
+                        _Fp_nn_all - _Fp_conv.reshape(-1, 9), axis=1)
+                    _plastic_mask = (_dep_nn_all > 5e-5) | (_corr_norm > 1e-4)
+
+                    # Default: elastic (Fp unchanged, delta_ep = 0)
+                    _Fp_temp = _Fp_conv.copy()
+                    _delta_epcum = np.zeros(_n_gp)
+
+                    if _plastic_mask.any():
+                        _idx_p = np.where(_plastic_mask)[0]
+                        _Fp_temp.reshape(-1, 9)[_idx_p] = _Fp_nn_all[_idx_p]
+                        _delta_epcum[_idx_p] = np.clip(
+                            _dep_nn_all[_idx_p], 0.0, 0.1)
+
                     rm_ok = True
                     nn_rm_used = True
             else:
@@ -1904,7 +2065,9 @@ def newton_solve():
                     converged = True  # stagnated after significant reduction
                     break
             else:
-                stag_count = 0
+                # Don't reset to 0 — allow slow accumulation when residual
+                # oscillates (common with NN return mapping approximation error)
+                stag_count = max(stag_count - 1, 0)
         rnorm_prev = rnorm
 
         # 6. Material tangent
@@ -2025,7 +2188,7 @@ def newton_solve():
         gfu.vec.FV().NumPy()[:] = _u_backup
         converged = False
 
-    return nit + 1, converged, gn_out, normals_out, active_out
+    return nit + 1, converged, gn_out, normals_out, active_out, rnorm
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2123,6 +2286,13 @@ print(f"  VTK: every {plot} steps ({vtk_fields}), "
       f"perf: {', '.join(perf_opts) if perf_opts else 'none'}")
 print(f"{'='*60}\n")
 
+# Warm-up Apply to trigger realcompile JIT and suppress NGSolve debug prints
+# ("called base class apply, type = ...") before the time-stepping output.
+if realcompile:
+    import io as _io, contextlib as _cl
+    with _cl.redirect_stderr(_io.StringIO()):
+        a_form.Apply(gfu.vec, res_vec)
+
 t_wall_start = perf_counter()
 
 # --- Helper: compute contact forces and update fields ---
@@ -2176,7 +2346,7 @@ with TaskManager() if taskmanager else nullcontext():
         # ══════════════════════════════════════════════════════════════════
 
         if solver == "newton":
-            n_iters, step_converged, _, _, _ = newton_solve()
+            n_iters, step_converged, _gn_n, _nor_n, _act_n, _rnorm_n = newton_solve()
         else:
             # ── Scipy minimize solvers ──
             SCIPY_SOLVERS = {
@@ -2248,28 +2418,35 @@ with TaskManager() if taskmanager else nullcontext():
                     _epcum_conv += _delta_epcum
 
         # ── Finalize contact state ───────────────────────────────────────
-        gn, normals, active, n_active, max_pen = finalize_contact_state()
+        # Newton already computed contact state + residual norm in its loop;
+        # reuse them directly instead of re-evaluating (saves 1 NN inference
+        # for Neural-Pull and 1 batch_evaluate_contact + 1 Apply for all modes).
+        if solver == "newton" and _gn_n is not None:
+            gn, normals, active = _gn_n, _nor_n, _act_n
+            f_con = compute_contact_forces(gn, normals, active)
+            update_contact_fields(gn, normals, active, f_con)
+            n_active = int(np.sum(active))
+            max_pen = -np.min(gn[active]) if n_active > 0 else 0.0
+            rnorm = _rnorm_n
+        else:
+            gn, normals, active, n_active, max_pen = finalize_contact_state()
 
         # ── Print step info ──────────────────────────────────────────────
         cutback_tag = f"  *cutback" if bisect_level > 0 else ""
         curr_base_step = int(load / dt_base + 1e-9)  # floor with eps (avoids banker's rounding)
 
         if solver == "newton":
-            a_form.Apply(gfu.vec, res_vec)
-            f_con = compute_contact_forces(gn, normals, active)
-            res_vec.FV().NumPy()[:] += f_con
-            rnorm = np.linalg.norm(res_vec.FV().NumPy()[free_dofs])
-
             ep_info = ""
             if plastic:
                 max_epcum = np.max(_epcum_conv)
                 n_plastic = np.sum(_epcum_conv > 1e-12)
                 ep_info = f"  ep_max={max_epcum:.2e}  n_plast={n_plastic}"
 
+            nn_tag = contact_cache.nn_step_summary()
             dt_step = perf_counter() - t_step
             print(f"Step {curr_base_step:3d}/{nsteps}  newton: nit={n_iters:3d}  "
                   f"|r|={rnorm:.2e}  active={n_active:3d}  maxpen={max_pen:.2e}"
-                  f"{ep_info}  t={dt_step:.1f}s{cutback_tag}")
+                  f"{ep_info}  t={dt_step:.1f}s{cutback_tag}{nn_tag}")
         else:
             dt_step = perf_counter() - t_step
             if hasattr(result, "optimality") and result.optimality is not None:
