@@ -62,7 +62,7 @@ _cli, _unknown = _parser.parse_known_args()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 5                # mesh density (n x n x n hex elements)
+n           = 10                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -101,7 +101,7 @@ plastic_param = [0.01, 0.05, 1.0]     # [My0, H_hard, m_hard]
 # My0     = initial yield stress
 # H_hard  = hardening modulus
 # m_hard  = hardening exponent (1.0 = linear hardening)
-consistent_tangent = False   # FD-based algorithmic tangent correction for yielding GPs
+consistent_tangent = True   # FD-based algorithmic tangent correction for yielding GPs
                               # Marginal benefit with contact; can destabilize at large steps
 
 # AI-enhanced contact
@@ -1918,9 +1918,9 @@ def newton_solve():
     # residual floor ~kn * 0.01.  Multitask uses C++ TR refinement → exact gaps.
     # NN return mapping introduces O(1e-3) Fp error → residual floor ~1e-9 to 1e-7.
     if neural_pull_cda is not None:
-        newton_gtol = max(gtol, 1e-3)
+        newton_gtol = max(gtol, 1e-4)
     elif nn_rm_model is not None:
-        newton_gtol = max(gtol, 1e-6)
+        newton_gtol = max(gtol, 1e-7)
     else:
         newton_gtol = gtol
     _u_backup = gfu.vec.FV().NumPy().copy()
