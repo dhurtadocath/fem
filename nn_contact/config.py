@@ -169,12 +169,13 @@ class ReturnMappingConfig:
     # Output: Fp_new(9) + delta_epcum(1) = 10
     output_dim: int = 10
 
-    # Loss weights
+    # Loss weights (must match return_mapping_loss() signature)
     lambda_Fp: float = 1.0
     lambda_epcum: float = 1.0
     lambda_det: float = 10.0       # det(Fp_new) > 0 constraint
-    lambda_yield: float = 1.0      # yield consistency
-    lambda_flow_dir: float = 1.0   # plastic flow direction
+    lambda_iso: float = 5.0        # isochoric: det(Fp) ≈ 1
+    lambda_elastic: float = 5.0    # elastic regime: delta_ep ≈ 0 when target = 0
+    lambda_inc: float = 1.0        # plastic increment accuracy
 
 
 # ---------------------------------------------------------------------------

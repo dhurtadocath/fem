@@ -125,6 +125,8 @@ def parse_args():
     # Output
     parser.add_argument("--checkpoint-dir", type=str,
                         default="nn_contact/checkpoints/gnn_newton")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from (e.g. best.pt)")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--patience", type=int, default=50,
                         help="Early stopping patience")
@@ -291,16 +293,38 @@ def main():
         optimizer, T_max=args.epochs, eta_min=1e-5
     )
 
-    # ── Training loop ────────────────────────────────────────────────────
+    # ── Resume from checkpoint ────────────────────────────────────────────
+    start_epoch = 1
     best_val_loss = float("inf")
     patience_counter = 0
+
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.exists():
+            resume_path = ckpt_dir / args.resume
+        if resume_path.exists():
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state_dict"])
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            prev_epoch = ckpt.get("epoch", 0)
+            best_val_loss = ckpt.get("val_loss", float("inf"))
+            # Set scheduler to correct epoch without triggering warnings
+            scheduler.last_epoch = prev_epoch
+            start_epoch = prev_epoch + 1
+            print(f"\nResumed from {resume_path} (epoch {prev_epoch}, "
+                  f"val_loss={best_val_loss:.6f})")
+        else:
+            print(f"WARNING: resume checkpoint not found: {args.resume}")
+
+    # ── Training loop ────────────────────────────────────────────────────
     t_start = time.perf_counter()
 
-    print(f"\nTraining for {args.epochs} epochs "
+    print(f"\nTraining for epochs {start_epoch}..{args.epochs} "
           f"(curriculum: first {args.curriculum_epochs} on easy samples)")
     print("-" * 80)
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         t_epoch = time.perf_counter()
 
         # Curriculum: use easy data for first N epochs

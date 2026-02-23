@@ -56,13 +56,15 @@ _parser.add_argument("--nn-checkpoint", type=str, default=None,
 _parser.add_argument("--nn-device", type=str, default=None, help="cuda or cpu")
 _parser.add_argument("--plastic", type=str, default=None, help="true/false")
 _parser.add_argument("--nn-rm", type=str, default=None, help="NN return mapping: true/false")
+_parser.add_argument("--gnn-newton", type=str, default=None,
+                     help="GNN Newton warm-start: true/false or path to checkpoint")
 _parser.add_argument("--plot", type=int, default=None, help="VTK export frequency")
 _parser.add_argument("--profile", action="store_true", default=None, help="Enable profiling")
 _cli, _unknown = _parser.parse_known_args()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 5                # mesh density (n x n x n hex elements)
+n           = 10                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -105,7 +107,7 @@ consistent_tangent = True   # FD-based algorithmic tangent correction for yieldi
                               # Marginal benefit with contact; can destabilize at large steps
 
 # AI-enhanced contact
-nn_contact          = True        # enable NN for contact detection
+nn_contact          = False        # enable NN for contact detection
 nn_contact_mode     = "auto"      # "auto" (detect from checkpoint), "multitask", or "neural_pull"
 nn_contact_device   = "cuda"      # "cuda" or "cpu"
 nn_contact_topk     = 3           # multitask only: K candidates per node
@@ -120,6 +122,10 @@ nn_rm_checkpoint      = "nn_contact/checkpoints/external/return_mapping/best.pt"
 nn_rm_device          = "cpu"   # "cpu" or "cuda" — CPU often sufficient for small MLP
 nn_rm_autodiff_tangent = True   # use autodiff consistent tangent (replaces FD)
 
+# GNN Newton step predictor (Phase 4)
+gnn_newton            = True   # enable GNN warm-start for Newton iteration 0
+gnn_newton_checkpoint = "nn_contact/checkpoints/gnn_newton/best.pt"
+
 # ── Apply CLI overrides ──────────────────────────────────────────────────────
 if _cli.n is not None:
     n = _cli.n
@@ -131,6 +137,15 @@ if _cli.plastic is not None:
     plastic = _cli.plastic.lower() in ("true", "1", "yes")
 if _cli.nn_rm is not None:
     nn_return_mapping = _cli.nn_rm.lower() in ("true", "1", "yes")
+if _cli.gnn_newton is not None:
+    _gnn_val = _cli.gnn_newton.lower()
+    if _gnn_val in ("true", "1", "yes"):
+        gnn_newton = True
+    elif _gnn_val in ("false", "0", "no"):
+        gnn_newton = False
+    else:
+        gnn_newton = True
+        gnn_newton_checkpoint = _cli.gnn_newton  # treat as path
 if _cli.plot is not None:
     plot = _cli.plot
 if _cli.profile is not None and _cli.profile:
@@ -715,6 +730,24 @@ free_dofs   = np.array([i for i in range(ndof) if freedofs_ba[i]], dtype=np.int3
 top_dofs_x = np.array([v for v in top_verts], dtype=np.int32)           # x-comp
 top_dofs_y = np.array([v + nv for v in top_verts], dtype=np.int32)      # y-comp
 top_dofs_z = np.array([v + 2*nv for v in top_verts], dtype=np.int32)    # z-comp
+
+# --- GNN Newton step predictor initialization (Phase 4) ---
+gnn_newton_model = None
+if gnn_newton:
+    try:
+        from nn_contact.evaluation.integration import GNNNewtonIntegration
+        _gnn_ckpt = _resolve_ckpt_path(gnn_newton_checkpoint)
+        if _gnn_ckpt is None:
+            _gnn_ckpt = _project_root / "nn_contact" / "checkpoints" / "gnn_newton" / "best.pt"
+        gnn_newton_model = GNNNewtonIntegration(
+            checkpoint_path=_gnn_ckpt,
+            mesh=mesh, n=n, X_ref=X_ref,
+            slave_verts=slave_verts, top_verts=top_verts,
+            free_dofs=free_dofs,
+        )
+    except Exception as e:
+        print(f"WARNING: GNN Newton disabled — {e}")
+        gnn_newton_model = None
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5.  CONTACT PROJECTION
@@ -1925,12 +1958,49 @@ def newton_solve():
         newton_gtol = gtol
     _u_backup = gfu.vec.FV().NumPy().copy()
 
+    global _cached_inv
     rnorm = np.inf
     rnorm_prev = np.inf
     rnorm_initial = np.inf
     stag_count = 0
     converged = False
     gn_out, normals_out, active_out = None, None, None
+
+    # GNN Newton pre-step: improve initial guess before Newton iterations
+    if gnn_newton_model is not None:
+        if perf: _t0 = perf_counter()
+        try:
+            # Quick residual + contact eval for GNN features
+            a_form.Apply(gfu.vec, res_vec)
+            _r_pre = res_vec.FV().NumPy()
+            _sp = compute_slave_pos()
+            _gn_pre, _n_pre, _act_pre, _ = contact_cache.evaluate(
+                _sp, compute_hessian=False
+            )
+            # Add contact forces to residual (matching Newton iter 0)
+            _act_idx = np.where(_act_pre)[0]
+            if len(_act_idx) > 0:
+                _va = slave_verts[_act_idx]
+                _kgn = kn * _gn_pre[_act_idx]
+                _r_pre[_va]          += _kgn * _n_pre[_act_idx, 0]
+                _r_pre[_va + nv]     += _kgn * _n_pre[_act_idx, 1]
+                _r_pre[_va + 2*nv]   += _kgn * _n_pre[_act_idx, 2]
+
+            _load_frac = load + dt
+            _du_gnn = gnn_newton_model.predict_step(
+                gfu.vec.FV().NumPy(), _r_pre,
+                (_gn_pre, _n_pre, _act_pre), _load_frac,
+            )
+            if np.isfinite(_du_gnn).all():
+                # Apply GNN prediction directly: u_new = u - du_gnn
+                # (du_gnn is the Newton solve direction w = K^{-1}*r)
+                vec = gfu.vec.FV().NumPy()
+                vec[free_dofs] -= _du_gnn[free_dofs]
+            # Reset contact cache since u changed
+            contact_cache.reset()
+        except Exception:
+            pass  # silently fall through to standard Newton
+        if perf: perf.record("gnn_prestep", perf_counter() - _t0)
 
     for nit in range(max_iter):
         # 0. Return mapping (plasticity only): recompute Fp at all Gauss points
@@ -2105,7 +2175,6 @@ def newton_solve():
 
         # 8. Solve K·Δu = -r
         if perf: _t0 = perf_counter()
-        global _cached_inv
         solve_ok = False
         try:
             if _inv_supports_update and _cached_inv is not None:
