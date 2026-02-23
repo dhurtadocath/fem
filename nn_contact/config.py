@@ -178,6 +178,41 @@ class ReturnMappingConfig:
 
 
 # ---------------------------------------------------------------------------
+# Phase 4: GNN Newton Step Predictor
+# ---------------------------------------------------------------------------
+@dataclass
+class GNNNewtonConfig:
+    """Encode-Process-Decode GNN for Newton step prediction.
+
+    Predicts the first Newton displacement increment Δu from current state
+    (displacement, residual, contact info) to reduce iteration count.
+    """
+
+    # Encoder dims
+    node_in: int = 17       # u(3) + r_norm(3) + x_ref(3) + contact(1) + gap(1) + normal(3) + load(1) + is_dirichlet(1) + bc_value(1)
+    edge_in: int = 4        # dx_ref(3) + ||dx_ref||(1)
+    hidden: int = 64
+    node_out: int = 3       # Δu per node (3 components)
+
+    # Message passing
+    n_layers: int = 4       # 4 for n=5, 6 for n=10, 8 for n=15
+    aggr: Literal["mean", "sum", "max"] = "mean"
+
+    # Activation
+    activation: Literal["silu", "relu", "gelu"] = "silu"
+
+
+@dataclass
+class GNNDataCollectionConfig:
+    """Configuration for collecting GNN Newton training data."""
+
+    enabled: bool = False
+    output_dir: str = "nn_contact/data/gnn_newton_raw"
+    record_every_n_steps: int = 1   # record every N-th load step (1 = all)
+    normalize_residual: bool = True  # normalize r by max(||r||, eps)
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 @dataclass

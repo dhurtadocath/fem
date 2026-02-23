@@ -38,3 +38,4 @@ ContactData*
 *.bib
 *.npy
 *.log
+*.npz
