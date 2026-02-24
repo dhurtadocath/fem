@@ -34,7 +34,6 @@ from pathlib import Path
 from time import perf_counter
 
 import numpy as np
-from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
 from ngsolve import *
@@ -106,7 +105,7 @@ consistent_tangent = True   # FD-based algorithmic tangent correction for yieldi
                               # Marginal benefit with contact; can destabilize at large steps
 
 # AI-enhanced contact
-nn_contact          = False        # enable NN for contact detection
+nn_contact          = True       # enable NN for contact detection
 nn_contact_mode     = "auto"      # "auto" (detect from checkpoint), "multitask", or "neural_pull"
 nn_contact_device   = "cuda"      # "cuda" or "cpu"
 nn_contact_topk     = 3           # multitask only: K candidates per node
@@ -116,13 +115,13 @@ nn_contact_checkpoint = "nn_contact/checkpoints/external/neural_pull_v1"  # path
                                   #   neural_pull → nn_contact/checkpoints/external/neural_pull_v1
 
 # AI-enhanced return mapping (Phase 3)
-nn_return_mapping     = False    # enable NN return mapping surrogate
+nn_return_mapping     = True    # enable NN return mapping surrogate
 nn_rm_checkpoint      = "nn_contact/checkpoints/external/return_mapping/best.pt"  # path to RM checkpoint .pt file
 nn_rm_device          = "cpu"   # "cpu" or "cuda" — CPU often sufficient for small MLP
 nn_rm_autodiff_tangent = True   # use autodiff consistent tangent (replaces FD)
 
 # GNN Newton step predictor (Phase 4)
-gnn_newton            = True   # enable GNN warm-start for Newton iteration 0
+gnn_newton            = False  # enable GNN warm-start for Newton iteration 0
 gnn_newton_checkpoint = "nn_contact/checkpoints/gnn_newton/best.pt"
 
 # ── Apply CLI overrides ──────────────────────────────────────────────────────
@@ -377,94 +376,88 @@ if plastic:
           f"({n_ip // mesh.ne} per element)")
 
     # --- Consistent tangent infrastructure (element-level data) --------
+    # Only needed when consistent_tangent=True; skip entirely otherwise
+    # to avoid O(n_elem * 8) Python loop with np.linalg.inv at startup.
     _gps_per_elem = n_ip // mesh.ne   # should be 8 for order=1 hex
 
-    # Element connectivity: vertex numbers for each element
-    _elem_verts = np.array(
-        [[v.nr for v in el.vertices] for el in mesh.Elements(VOL)],
-        dtype=np.int32)  # (n_elem, 8)
+    if consistent_tangent:
+        # Element connectivity: vertex numbers for each element
+        _elem_verts = np.array(
+            [[v.nr for v in el.vertices] for el in mesh.Elements(VOL)],
+            dtype=np.int32)  # (n_elem, 8)
 
-    # Shape function gradients at all GPs (constant in total Lagrangian).
-    # For the uniform structured hex mesh, J = diag(h, h, h) for all elements,
-    # so dN/dX = dN/dξ / h and detJ = h^3.  We still compute per-element
-    # for generality (handles non-uniform meshes without code change).
-    #
-    # GP positions in [0,1]^3 reference element (2-point Gauss-Legendre per axis):
-    _gp_lo = 0.5 - 0.5 / np.sqrt(3.0)   # ≈ 0.211325
-    _gp_hi = 0.5 + 0.5 / np.sqrt(3.0)   # ≈ 0.788675
-    _gp_1d = np.array([_gp_lo, _gp_hi])
-    # All 8 GP positions: ordered as NGSolve IRS (ζ fastest, then η, then ξ — per intrule.cpp:3088)
-    _gp_ref = np.array([[xi, eta, zeta]
-                         for xi in _gp_1d for eta in _gp_1d for zeta in _gp_1d])
-    _gp_weight = 0.125   # = 0.5^3 (product rule on [0,1]^3)
+        # GP positions in [0,1]^3 reference element (2-point Gauss-Legendre per axis):
+        _gp_1d = np.array([0.5 - 0.5 / np.sqrt(3.0), 0.5 + 0.5 / np.sqrt(3.0)])
+        _gp_ref = np.array([[xi, eta, zeta]
+                             for xi in _gp_1d for eta in _gp_1d for zeta in _gp_1d])
+        _gp_weight = 0.125   # = 0.5^3 (product rule on [0,1]^3)
 
-    def _hex8_dNdxi(xi, eta, zeta):
-        """Parametric gradients of 8-node hex shape functions in [0,1]^3.
+        def _hex8_dNdxi(xi, eta, zeta):
+            """Parametric gradients of 8-node hex shape functions in [0,1]^3.
 
-        Vertex ordering matches NGSolve MakeStructured3DMesh(hexes=True):
-          0: (0,0,0)  1: (0,0,1)  2: (0,1,1)  3: (0,1,0)
-          4: (1,0,0)  5: (1,0,1)  6: (1,1,1)  7: (1,1,0)
-        Returns (8, 3) array: dN_I/dξ_j.
-        """
-        x, y, z = xi, eta, zeta
-        return np.array([
-            [-(1-y)*(1-z), -(1-x)*(1-z), -(1-x)*(1-y)],  # N0 = (1-x)(1-y)(1-z)
-            [-(1-y)*z,     -(1-x)*z,       (1-x)*(1-y)],  # N1 = (1-x)(1-y)(z)
-            [-(y)*z,        (1-x)*z,        (1-x)*(y)  ],  # N2 = (1-x)(y)(z)
-            [-(y)*(1-z),    (1-x)*(1-z),   -(1-x)*(y)  ],  # N3 = (1-x)(y)(1-z)
-            [ (1-y)*(1-z), -(x)*(1-z),     -(x)*(1-y)  ],  # N4 = (x)(1-y)(1-z)
-            [ (1-y)*z,     -(x)*z,          (x)*(1-y)  ],  # N5 = (x)(1-y)(z)
-            [ (y)*z,        (x)*z,          (x)*(y)    ],  # N6 = (x)(y)(z)
-            [ (y)*(1-z),    (x)*(1-z),     -(x)*(y)    ],  # N7 = (x)(y)(1-z)
-        ])
+            Vertex ordering matches NGSolve MakeStructured3DMesh(hexes=True):
+              0: (0,0,0)  1: (0,0,1)  2: (0,1,1)  3: (0,1,0)
+              4: (1,0,0)  5: (1,0,1)  6: (1,1,1)  7: (1,1,0)
+            Returns (8, 3) array: dN_I/dξ_j.
+            """
+            x, y, z = xi, eta, zeta
+            return np.array([
+                [-(1-y)*(1-z), -(1-x)*(1-z), -(1-x)*(1-y)],
+                [-(1-y)*z,     -(1-x)*z,       (1-x)*(1-y)],
+                [-(y)*z,        (1-x)*z,        (1-x)*(y)  ],
+                [-(y)*(1-z),    (1-x)*(1-z),   -(1-x)*(y)  ],
+                [ (1-y)*(1-z), -(x)*(1-z),     -(x)*(1-y)  ],
+                [ (1-y)*z,     -(x)*z,          (x)*(1-y)  ],
+                [ (y)*z,        (x)*z,          (x)*(y)    ],
+                [ (y)*(1-z),    (x)*(1-z),     -(x)*(y)    ],
+            ])
 
-    # Precompute dN/dX and detJ at all (element, GP) pairs
-    _all_dNdX = np.zeros((mesh.ne, _gps_per_elem, 8, 3))
-    _all_detJ = np.zeros((mesh.ne, _gps_per_elem))
-    _X_ref_local = np.array([list(mesh.vertices[i].point) for i in range(mesh.nv)])
-
-    for e in range(mesh.ne):
-        verts = _elem_verts[e]
-        X_el = _X_ref_local[verts]   # (8, 3) physical coords of element vertices
+        # Precompute dN/dX and detJ at all (element, GP) pairs.
+        # For uniform structured hex: Jac is identical for all elements,
+        # so compute once per GP (8 iters) and broadcast.
+        _all_dNdX = np.zeros((mesh.ne, _gps_per_elem, 8, 3))
+        _all_detJ = np.zeros((mesh.ne, _gps_per_elem))
+        _X_ref_local = np.array([list(mesh.vertices[i].point) for i in range(mesh.nv)])
+        X_el0 = _X_ref_local[np.array([v.nr for v in list(mesh.Elements(VOL))[0].vertices])]
         for ig in range(_gps_per_elem):
             xi, eta, zeta = _gp_ref[ig]
-            dNdxi = _hex8_dNdxi(xi, eta, zeta)   # (8, 3)
-            Jac = dNdxi.T @ X_el                  # (3, 3) = dX/dξ
+            dNdxi = _hex8_dNdxi(xi, eta, zeta)
+            Jac = dNdxi.T @ X_el0
             detJ = np.linalg.det(Jac)
             invJT = np.linalg.inv(Jac).T
-            _all_dNdX[e, ig] = dNdxi @ invJT      # (8, 3) = dN/dX
-            _all_detJ[e, ig] = detJ
+            _all_dNdX[:, ig] = dNdxi @ invJT   # broadcast to all elements
+            _all_detJ[:, ig] = detJ
+        del _X_ref_local
 
-    # Element CSR position map: built lazily after first AssembleLinearization
-    _elem_csr_pos_plastic = None
+        # Element CSR position map: built lazily after first AssembleLinearization
+        _elem_csr_pos_plastic = None
 
-    def _build_elem_csr_pos_plastic():
-        """Build element-level CSR position map for consistent tangent assembly.
+        def _build_elem_csr_pos_plastic():
+            """Build element-level CSR position map for consistent tangent assembly.
 
-        Maps (element, local_dof_i, local_dof_j) → CSR value index.
-        Local DOFs are in block order: [v0..v7, v0+nv..v7+nv, v0+2nv..v7+2nv].
-        """
-        global _elem_csr_pos_plastic
-        mat = a_form.mat
-        _, cols_fv, firsti_fv = mat.CSR()
-        cols = np.array(cols_fv, copy=False)
-        firsti = np.array(firsti_fv, copy=False)
-        ne = mesh.ne
-        _elem_csr_pos_plastic = np.full((ne, 24, 24), -1, dtype=np.int64)
-        for e in range(ne):
-            verts = _elem_verts[e]
-            # 24 global DOFs in block order: [x-comp(8), y-comp(8), z-comp(8)]
-            global_dofs = np.concatenate([verts, verts + nv, verts + 2*nv])
-            for ii in range(24):
-                row = int(global_dofs[ii])
-                row_start = int(firsti[row])
-                row_end = int(firsti[row + 1])
-                row_cols = cols[row_start:row_end]
-                for jj in range(24):
-                    col = int(global_dofs[jj])
-                    pos = np.searchsorted(row_cols, col)
-                    if pos < len(row_cols) and row_cols[pos] == col:
-                        _elem_csr_pos_plastic[e, ii, jj] = row_start + pos
+            Maps (element, local_dof_i, local_dof_j) → CSR value index.
+            Local DOFs are in block order: [v0..v7, v0+nv..v7+nv, v0+2nv..v7+2nv].
+            """
+            global _elem_csr_pos_plastic
+            mat = a_form.mat
+            _, cols_fv, firsti_fv = mat.CSR()
+            cols = np.array(cols_fv, copy=False)
+            firsti = np.array(firsti_fv, copy=False)
+            ne = mesh.ne
+            _elem_csr_pos_plastic = np.full((ne, 24, 24), -1, dtype=np.int64)
+            all_global_dofs = np.column_stack([_elem_verts, _elem_verts + nv, _elem_verts + 2*nv])
+            for e in range(ne):
+                global_dofs = all_global_dofs[e]
+                for ii in range(24):
+                    row = int(global_dofs[ii])
+                    row_start = int(firsti[row])
+                    row_end = int(firsti[row + 1])
+                    row_cols = cols[row_start:row_end]
+                    for jj in range(24):
+                        col = int(global_dofs[jj])
+                        pos = np.searchsorted(row_cols, col)
+                        if pos < len(row_cols) and row_cols[pos] == col:
+                            _elem_csr_pos_plastic[e, ii, jj] = row_start + pos
 
     # Cache for F_flat during Newton iteration (set by return mapping, used by tangent)
     _F_flat_cache = None
@@ -479,22 +472,18 @@ else:
 
 # --- Stress CFs for VTK output (built only if needed by vtk_fields) ------
 # Only compile what's needed — matrix-valued stress tensors are expensive.
-F_gfu   = Id(3) + Grad(gfu)
-
-# For plasticity, compute elastic deformation gradient Fe for stress evaluation
-if plastic:
-    Fe_gfu  = F_gfu * Inv(gf_Fp)
-    J_gfu   = Det(Fe_gfu)
-    B_e     = Fe_gfu * Fe_gfu.trans   # elastic left Cauchy-Green
-else:
-    J_gfu   = Det(F_gfu)
-    B_e     = F_gfu * F_gfu.trans     # B = F·Fᵀ (same as Be when Fp=I)
-F_inv_T = Inv(F_gfu).trans
-
 stress_1piola = stress_cauchy = stress_mandel = None
 vm_cauchy = vm_mandel = None
 
 if plot > 0:
+    F_gfu   = Id(3) + Grad(gfu)
+    if plastic:
+        Fe_gfu  = F_gfu * Inv(gf_Fp)
+        J_gfu   = Det(Fe_gfu)
+        B_e     = Fe_gfu * Fe_gfu.trans
+    else:
+        J_gfu   = Det(F_gfu)
+        B_e     = F_gfu * F_gfu.trans
     # Cauchy: σ = (1/J) [2c10(B_e - I) + 2d1·ln(J_e)·I]
     stress_cauchy = ((1/J_gfu) * (2*c10*(B_e - Id(3))
                      + 2*d1*log(J_gfu)*Id(3))).Compile()
@@ -510,16 +499,18 @@ if plot > 0:
             stress_1piola = (Pe_gfu * Inv(gf_Fp).trans).Compile()
             stress_mandel = (Fe_gfu.trans * Pe_gfu).Compile()
         else:
-            stress_1piola = (2*c10*(F_gfu - F_inv_T)
-                             + 2*d1*log(J_gfu)*F_inv_T).Compile()
-            stress_mandel = (F_gfu.trans * stress_1piola).Compile()
+            F_inv_T = Inv(F_gfu).trans
+            _P_expr = 2*c10*(F_gfu - F_inv_T) + 2*d1*log(J_gfu)*F_inv_T
+            stress_1piola = _P_expr.Compile()
+            stress_mandel = (F_gfu.trans * _P_expr).Compile()
         s_dev_mandel = stress_mandel - (1.0/3.0) * Trace(stress_mandel) * Id(3)
         vm_mandel = sqrt(1.5 * InnerProduct(s_dev_mandel, s_dev_mandel)).Compile()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3.  POTATO + GREGORY PATCHES
 # ══════════════════════════════════════════════════════════════════════════════
-[ptt] = pickle.load(open("Dat/PotatoAssembly.dat", "rb"))
+with open("Dat/PotatoAssembly.dat", "rb") as _f:
+    [ptt] = pickle.load(_f)
 if hasattr(ptt, 'hexas') and not hasattr(ptt, 'elements'):
     ptt.elements = ptt.hexas
 ptt.isRigid = True
@@ -1498,6 +1489,7 @@ if plastic:
 
             if not converged_rm and abs(R_val) > 1e-6:
                 n_local_fail += 1
+                continue  # keep Fp_new[ip] = Fp_old (set at init)
 
             Fp_new[ip]     = Fp_trial
             delta_epcum[ip] = max(dlam, 0.0)
@@ -1660,6 +1652,8 @@ if plastic:
                     break
             if skip:
                 continue
+            if not np.isfinite(dCxx).all():
+                continue  # skip GP with NaN/Inf correction
 
             # Assembly: ΔK[(I,a),(J,b)] = w*detJ * Σ_{k,l} dNdX[I,k] * dCxx[a,k,b,l] * dNdX[J,l]
             dNdX = _all_dNdX[e, ig]
@@ -1997,8 +1991,8 @@ def newton_solve():
                 vec[free_dofs] -= _du_gnn[free_dofs]
             # Reset contact cache since u changed
             contact_cache.reset()
-        except Exception:
-            pass  # silently fall through to standard Newton
+        except (RuntimeError, ValueError) as e:
+            print(f"    [GNN pre-step] failed: {e}")
         if perf: perf.record("gnn_prestep", perf_counter() - _t0)
 
     for nit in range(max_iter):
@@ -2314,6 +2308,7 @@ if plastic:
     _M_epcum_inv = _M_epcum.mat.Inverse()
     gf_epcum_irs = GridFunction(fes_ir)       # source (GP values)
     gf_epcum_vtk = GridFunction(_fes_epcum_draw)  # target (element values)
+    _f_ep = LinearForm(gf_epcum_irs * _qd_ep * irs_dx)   # reused each VTK step
     _vtk_coefs.append(gf_epcum_vtk)
     _vtk_names.append("epcum")
 
@@ -2368,8 +2363,9 @@ def finalize_contact_state():
     """Evaluate contact state and update output fields."""
     slave_pos = compute_slave_pos()
     gn, normals, active, _ = contact_cache.evaluate(slave_pos)
-    f_con = compute_contact_forces(gn, normals, active)
-    update_contact_fields(gn, normals, active, f_con)
+    if plot > 0:
+        f_con = compute_contact_forces(gn, normals, active)
+        update_contact_fields(gn, normals, active, f_con)
     n_active = int(np.sum(active))
     max_pen  = -np.min(gn[active]) if n_active > 0 else 0.0
     return gn, normals, active, n_active, max_pen
@@ -2416,7 +2412,8 @@ with TaskManager() if taskmanager else nullcontext():
         if solver == "newton":
             n_iters, step_converged, _gn_n, _nor_n, _act_n, _rnorm_n = newton_solve()
         else:
-            # ── Scipy minimize solvers ──
+            # ── Scipy minimize solvers (lazy import) ──
+            from scipy.optimize import minimize
             SCIPY_SOLVERS = {
                 "newton-cg":    ("Newton-CG",    True,  {"xtol": gtol}),
                 "trust-constr": ("trust-constr", True,  {"gtol": gtol, "xtol": 1e-30}),
@@ -2464,7 +2461,12 @@ with TaskManager() if taskmanager else nullcontext():
 
         # ── Plastic history commit (unified for Newton and scipy) ────────
         if plastic:
-            if solver == "newton" and step_converged:
+            if forced_accept:
+                # Forced accept (max cutback exceeded): displacement is not at
+                # equilibrium.  Skip plastic commit to avoid history drift.
+                # _Fp_conv/_epcum_conv stay at last converged state.
+                print(f"    [plasticity] skipping commit — forced accept")
+            elif solver == "newton" and step_converged:
                 # Newton converged: _Fp_temp is consistent with gfu (RM ran
                 # at the start of the converging iteration, before the
                 # convergence check).  Direct commit is safe.
@@ -2472,9 +2474,8 @@ with TaskManager() if taskmanager else nullcontext():
                     _Fp_conv[:] = _Fp_temp
                     _epcum_conv += _delta_epcum
             else:
-                # Scipy (converged or forced), or Newton forced-accept:
-                # Run final RM at current displacement to ensure Fp-
-                # consistency (after Newton's last linesearch update,
+                # Scipy converged: run final RM at current displacement to
+                # ensure Fp-consistency (after last linesearch update,
                 # _Fp_temp lags behind gfu.vec by one iteration).
                 F_flat = _read_F_at_ips()
                 _F_flat_cache = F_flat
@@ -2491,11 +2492,12 @@ with TaskManager() if taskmanager else nullcontext():
         # for Neural-Pull and 1 batch_evaluate_contact + 1 Apply for all modes).
         if solver == "newton" and _gn_n is not None:
             gn, normals, active = _gn_n, _nor_n, _act_n
-            f_con = compute_contact_forces(gn, normals, active)
-            update_contact_fields(gn, normals, active, f_con)
             n_active = int(np.sum(active))
             max_pen = -np.min(gn[active]) if n_active > 0 else 0.0
             rnorm = _rnorm_n
+            if plot > 0:
+                f_con = compute_contact_forces(gn, normals, active)
+                update_contact_fields(gn, normals, active, f_con)
         else:
             gn, normals, active, n_active, max_pen = finalize_contact_state()
 
@@ -2549,7 +2551,6 @@ with TaskManager() if taskmanager else nullcontext():
                 if perf: _t0 = perf_counter()
                 if plastic:
                     gf_epcum_irs.vec.FV().NumPy()[:] = _epcum_conv
-                    _f_ep = LinearForm(gf_epcum_irs * _qd_ep * irs_dx)
                     _f_ep.Assemble()
                     gf_epcum_vtk.vec.data = _M_epcum_inv * _f_ep.vec
                 vtk.Do(time=curr_base_step * dt_base)
