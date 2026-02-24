@@ -64,7 +64,7 @@ _cli, _unknown = _parser.parse_known_args()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 10                # mesh density (n x n x n hex elements)
+n           = 5                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
@@ -72,7 +72,7 @@ nu_val      = 0.3           # Poisson ratio
 
 # Contact
 kn_factor   = 20.0          # kn = kn_factor * E / h  (Wriggers 2006)
-contact_tol_reuse = 1e-5 #np.inf #0.05 #np.inf  # per-node displacement threshold for projection reuse
+contact_tol_reuse = 1e-5  # per-node displacement threshold for projection reuse
                             # inf  = lock projections during solve (most robust)
                             # finite (e.g. 1e-5) = re-project nodes that move beyond this
 
@@ -87,7 +87,6 @@ max_cutback = 5             # max bisection levels on non-convergence (2^5 = 32x
 full_hessian = False         # include curvature term dn/dx_s in contact Hessian
 
 # Output
-compare     = False         # write comparison outputs (u arrays, reactions CSV)
 plot        = 1            # VTK export every N steps (0 = off)
 vtk_fields  = "minimal"    # "minimal" | "standard" | "full" (see Section 7)
 
@@ -111,13 +110,13 @@ nn_contact          = False        # enable NN for contact detection
 nn_contact_mode     = "auto"      # "auto" (detect from checkpoint), "multitask", or "neural_pull"
 nn_contact_device   = "cuda"      # "cuda" or "cpu"
 nn_contact_topk     = 3           # multitask only: K candidates per node
-nn_contact_checkpoint = "nn_contact/checkpoints/external/neural_pull_v1"#mt_sweep_unc_wt" #neural_pull_v1"      # path to checkpoint dir containing best_model.pt + config.pt
+nn_contact_checkpoint = "nn_contact/checkpoints/external/neural_pull_v1"  # path to checkpoint dir containing best_model.pt + config.pt
                                   # None = best default per mode:
                                   #   multitask   → nn_contact/checkpoints/external/mt_sweep_unc_wt
                                   #   neural_pull → nn_contact/checkpoints/external/neural_pull_v1
 
 # AI-enhanced return mapping (Phase 3)
-nn_return_mapping     = True    # enable NN return mapping surrogate
+nn_return_mapping     = False    # enable NN return mapping surrogate
 nn_rm_checkpoint      = "nn_contact/checkpoints/external/return_mapping/best.pt"  # path to RM checkpoint .pt file
 nn_rm_device          = "cpu"   # "cpu" or "cuda" — CPU often sufficient for small MLP
 nn_rm_autodiff_tangent = True   # use autodiff consistent tangent (replaces FD)
@@ -2379,7 +2378,7 @@ def finalize_contact_state():
 load = 0.0              # accumulated load fraction [0, 1]
 dt = dt_base            # current sub-step size
 bisect_level = 0        # current bisection depth
-prev_base_step = 0      # last completed base step (for VTK/compare triggering)
+prev_base_step = 0      # last completed base step (for VTK triggering)
 total_substeps = 0      # total sub-step count (for summary)
 total_cutbacks = 0      # total bisection count (for summary)
 total_forced   = 0      # steps force-accepted at max cutback
@@ -2538,7 +2537,7 @@ with TaskManager() if taskmanager else nullcontext():
             if not result.success:
                 print(f"  >> {result.message}")
 
-        # ── Step size recovery + VTK/compare at base-step boundaries ─────
+        # ── Step size recovery + VTK at base-step boundaries ─────────────
         if curr_base_step > prev_base_step:
             # Crossed a base-step boundary → try to recover step size
             if bisect_level > 0:
@@ -2555,21 +2554,6 @@ with TaskManager() if taskmanager else nullcontext():
                     gf_epcum_vtk.vec.data = _M_epcum_inv * _f_ep.vec
                 vtk.Do(time=curr_base_step * dt_base)
                 if perf: perf.record("vtk_output", perf_counter() - _t0)
-
-            # Comparison output at base-step boundaries
-            if compare:
-                np.save(os.path.join(out_dir, f"u_step{curr_base_step:04d}.npy"),
-                        gfu.vec.FV().NumPy().copy())
-                a_form.Apply(gfu.vec, res_vec)
-                f_top = res_vec.FV().NumPy()
-                rx = np.sum(f_top[top_dofs_x])
-                ry = np.sum(f_top[top_dofs_y])
-                rz = np.sum(f_top[top_dofs_z])
-                with open(os.path.join(out_dir, "reactions.csv"), "a") as fout:
-                    if curr_base_step == 1:
-                        fout.write("step,time,rx,ry,rz\n")
-                    fout.write(f"{curr_base_step},{curr_base_step*dt_base:.6f},"
-                               f"{rx:.10e},{ry:.10e},{rz:.10e}\n")
 
             prev_base_step = curr_base_step
 

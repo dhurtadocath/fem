@@ -12,8 +12,6 @@ Extended features (sweep-ready):
   --ohem_ratio      — OHEM: keep only top-K% hardest samples per batch
   --task_attention   — MTAN-style task attention gates
   --patch_conditioned — FiLM-conditioned regression (replaces segmented)
-  --manifold_mixup  — Manifold Mixup at trunk output level
-  --mixup_alpha     — Mixup Beta distribution parameter
   --uncertainty_wt  — Kendall-Gal uncertainty weighting (learns log-variance per task)
   --fourier         — Enable Fourier features for v1 architecture
   --fourier_freq    — Number of Fourier frequencies
@@ -44,7 +42,6 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -132,34 +129,6 @@ def compute_individual_losses(outputs, gn, patch_id, xi,
         loss_proj = segmented_regression_loss(outputs["xi_pred"], xi, patch_id)
 
     return loss_gn, loss_patch, loss_proj
-
-
-# ── Manifold Mixup utility ───────────────────────────────────────────────────
-
-def manifold_mixup(features, targets_tuple, alpha=0.4):
-    """Mix features and targets at the trunk output level.
-
-    Parameters
-    ----------
-    features : (B, D) — trunk features
-    targets_tuple : (gn, patch_id, xi) — target tensors
-    alpha : float — Beta distribution parameter
-
-    Returns
-    -------
-    mixed_features, (mixed_gn, patch_id_a, patch_id_b, xi_a, xi_b, lam)
-    """
-    B = features.shape[0]
-    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-    lam = max(lam, 1 - lam)  # Ensure lam >= 0.5 (keep dominant sample identity)
-
-    idx = torch.randperm(B, device=features.device)
-
-    gn, patch_id, xi = targets_tuple
-    mixed_features = lam * features + (1 - lam) * features[idx]
-    mixed_gn = lam * gn + (1 - lam) * gn[idx]
-
-    return mixed_features, (mixed_gn, patch_id, patch_id[idx], xi, xi[idx], lam)
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
@@ -264,8 +233,6 @@ def train(args):
         features_str += " attn"
     if args.patch_conditioned:
         features_str += " pcond"
-    if args.manifold_mixup:
-        features_str += f" mixup={args.mixup_alpha}"
     if args.uncertainty_wt:
         features_str += " uncwt"
     if model_cfg.input_encoding == "fourier":
@@ -508,10 +475,6 @@ def main():
     parser.add_argument("--fourier", action="store_true", help="Enable Fourier features for v1")
     parser.add_argument("--fourier_freq", type=int, default=128, help="Fourier frequencies")
     parser.add_argument("--fourier_scale", type=float, default=10.0, help="Fourier scale sigma")
-
-    # Data augmentation
-    parser.add_argument("--manifold_mixup", action="store_true", help="Manifold Mixup at trunk")
-    parser.add_argument("--mixup_alpha", type=float, default=0.4, help="Mixup Beta param")
 
     args = parser.parse_args()
     train(args)

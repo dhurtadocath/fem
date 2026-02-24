@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 
 from nn_contact.config import NeuralPullConfig
-from nn_contact.models.mlp import SIREN, FourierMLP, MLP, build_backbone
+from nn_contact.models.mlp import SIREN, FourierMLP, MLP
 
 
 class NeuralPullNet(nn.Module):

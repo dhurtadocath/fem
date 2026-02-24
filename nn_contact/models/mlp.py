@@ -306,28 +306,3 @@ class FourierMLP(nn.Module):
             activation=cfg.activation,
             skip=cfg.skip_connections,
         )
-
-
-# ── Factory ──────────────────────────────────────────────────────────────
-
-def build_backbone(
-    arch: Literal["mlp", "siren", "fourier_mlp"],
-    in_dim: int,
-    out_dim: int,
-    *,
-    mlp_cfg: MLPConfig | None = None,
-    siren_cfg: SIRENConfig | None = None,
-    fourier_cfg: FourierMLPConfig | None = None,
-) -> nn.Module:
-    """Build a backbone network from config."""
-    if arch == "mlp":
-        cfg = mlp_cfg or MLPConfig()
-        return MLP.from_config(cfg, in_dim, out_dim)
-    elif arch == "siren":
-        cfg = siren_cfg or SIRENConfig()
-        return SIREN.from_config(cfg, in_dim, out_dim)
-    elif arch == "fourier_mlp":
-        cfg = fourier_cfg or FourierMLPConfig()
-        return FourierMLP.from_config(cfg, in_dim, out_dim)
-    else:
-        raise ValueError(f"Unknown architecture: {arch}")
