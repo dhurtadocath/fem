@@ -234,7 +234,7 @@ def _run_phase(
         else:
             patience_counter += 1
 
-        if (epoch + 1) % log_every == 0 or improved:
+        if (epoch + 1) % log_every == 0 or improved or epoch == start_epoch:
             lr_now = optimizer.param_groups[0]["lr"]
             det_str = (f"[{val_metrics['det_min']:.3f},{val_metrics['det_max']:.3f}]"
                        if phase == 1 else "")
