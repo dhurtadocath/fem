@@ -63,14 +63,14 @@ _cli, _unknown = _parser.parse_known_args()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Mesh
-n           = 5                # mesh density (n x n x n hex elements)
+n           = 30                # mesh density (n x n x n hex elements)
 
 # Material (compressible neo-Hookean)
 E_val       = 0.05          # Young's modulus
 nu_val      = 0.3           # Poisson ratio
 
 # Contact
-kn_factor   = 20.0          # kn = kn_factor * E / h  (Wriggers 2006)
+kn_factor   = 20.0 #1000.0          # kn = kn_factor * E / h  (Wriggers 2006)
 contact_tol_reuse = 1e-5  # per-node displacement threshold for projection reuse
                             # inf  = lock projections during solve (most robust)
                             # finite (e.g. 1e-5) = re-project nodes that move beyond this
@@ -105,7 +105,7 @@ consistent_tangent = True   # FD-based algorithmic tangent correction for yieldi
                               # Marginal benefit with contact; can destabilize at large steps
 
 # AI-enhanced contact
-nn_contact          = True       # enable NN for contact detection
+nn_contact          = True      # enable NN for contact detection
 nn_contact_mode     = "auto"      # "auto" (detect from checkpoint), "multitask", or "neural_pull"
 nn_contact_device   = "cuda"      # "cuda" or "cpu"
 nn_contact_topk     = 3           # multitask only: K candidates per node
@@ -115,7 +115,7 @@ nn_contact_checkpoint = "nn_contact/checkpoints/external/neural_pull_v1"  # path
                                   #   neural_pull → nn_contact/checkpoints/external/neural_pull_v1
 
 # AI-enhanced return mapping (Phase 3)
-nn_return_mapping     = True    # enable NN return mapping surrogate
+nn_return_mapping     = False    # enable NN return mapping surrogate
 nn_rm_checkpoint      = "nn_contact/checkpoints/external/return_mapping/best.pt"  # path to RM checkpoint .pt file
 nn_rm_device          = "cpu"   # "cpu" or "cuda" — CPU often sufficient for small MLP
 nn_rm_autodiff_tangent = True   # use autodiff consistent tangent (replaces FD)

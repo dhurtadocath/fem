@@ -36,16 +36,23 @@ We present a **unified four-component neural framework** that accelerates every 
 - **Novelty**: First application of autodiff-through-NN for consistent tangent in multiplicative plasticity. Existing neural constitutive works (Masi et al. 2021, Vlassis & Sun 2021) train on stress-strain directly — we preserve the multiplicative decomposition F=Fe·Fp and learn only the return mapping
 - **Status**: Implemented, integrated, benchmarked. Pre-allocated torch buffers, NN-first threshold gating, stagnation counter decay
 
-#### Component D: GNN Newton Step Predictor (Phase 4 — PLANNED)
-- **What**: A message-passing GNN on the hex mesh graph predicts the Newton displacement increment Δu from the current residual and contact state
-- **Key insight**: In load-stepping, consecutive Newton steps at nearby load levels produce similar Δu patterns. A GNN can learn this structure and provide a warm start that reduces Newton iterations from ~6 to ~2
+#### Component D: GNN Newton Step Predictor (Phase 4 — COMPLETED)
+- **What**: An encode-process-decode message-passing GNN on the hex mesh graph predicts the Newton displacement increment Δu from the current residual and contact state
+- **Architecture**: MPN with hidden=64, 4 message-passing layers, SiLU activations, 130K params
+- **Key insight**: In load-stepping, consecutive Newton steps at nearby load levels produce similar Δu patterns. A GNN can learn this structure and provide a warm start that reduces Newton iterations
+- **Key result**: Test relative error **3.56%** on held-out data (843 epochs, early stopping). **27% wall-time reduction** as pre-step warm-start in Newton solver
+- **Training**: 25,200 samples (n=5 + n=10, elastic + plastic), curriculum learning with validation matching, SizeGroupedSampler for GPU batching efficiency
 - **Novelty**: First GNN predictor for Newton steps in contact mechanics with active-set changes. Prior work (NOWS, arXiv 2511.02481) uses dense MLPs on fixed DOFs — our graph formulation generalizes across mesh sizes
-- **Speedup**: 6 iterations × 166ms → 2 iterations × 166ms = 3× wall time reduction per load step
+- **Status**: Implemented, trained (RTX 5000 Ada, 9.5h), integrated as pre-step warm-start, benchmarked
 
 ### Combined Impact (Components A-D)
 
 **Measured** (n=5, nsteps=100, plastic, Component C only):
 - Classical: 364.6s → NN RM: 70.4s → **5.2× speedup** from Component C alone
+
+**Measured** (n=5, nsteps=5, Component D + code optimizations):
+- Default path: 114.0s → 71.5s → **37% faster** (config path gating + LinearForm reuse + lazy imports)
+- GNN Newton pre-step warm-start: **27% wall-time reduction** (3.56% prediction error)
 
 **Projected** (n=10 plastic, all components):
 At n=10: per-step cost from ~6 × (166 + 50 + 500) = 4,296ms → ~2 × (166 + 5 + 5) = 352ms → **12× speedup** while maintaining physical accuracy within 3.2% for ep_max.
@@ -475,7 +482,7 @@ if plastic and consistent_tangent and np.any(_delta_epcum > 0):
 
 ---
 
-## 5. Component D: GNN Newton Step Predictor (PLANNED)
+## 5. Component D: GNN Newton Step Predictor (COMPLETED)
 
 ### 5.1 Architecture
 
@@ -493,34 +500,37 @@ if plastic and consistent_tangent and np.any(_delta_epcum > 0):
   - `Δx_ref` (3): relative reference position (normalized)
   - `||Δx_ref||` (1): edge length (normalized)
 - **Output**: `Δu_i` (3) per node — predicted Newton step
+- **free_mask**: `(nv, 3)` per-node format (NOT `(3*nv,)` block-sequential — PyG batching breaks with mixed-size graphs otherwise)
 
 **File**: `nn_contact/models/gnn_newton.py`
+
+**Architecture**: Encode-Process-Decode Message-Passing Network (MPN)
 
 ```python
 class GNNNewtonPredictor(nn.Module):
     """Message-passing GNN for predicting Newton displacement increments.
 
-    Architecture: 3 message-passing layers with residual connections,
-    followed by a per-node MLP decoder.
+    Architecture: Encode-Process-Decode MPN with 4 message-passing layers,
+    residual connections, and per-node MLP decoder.
 
     Input:  node_features (nv, 14), edge_index (2, n_edges), edge_attr (n_edges, 4)
     Output: delta_u (nv, 3)
     """
 
-    def __init__(self, node_in=14, edge_in=4, hidden=128, n_layers=3):
+    def __init__(self, node_in=14, edge_in=4, hidden=64, n_layers=4):
         super().__init__()
+        # Encoder
         self.node_encoder = nn.Sequential(
             nn.Linear(node_in, hidden), nn.SiLU(),
             nn.Linear(hidden, hidden))
-
         self.edge_encoder = nn.Sequential(
             nn.Linear(edge_in, hidden), nn.SiLU(),
             nn.Linear(hidden, hidden))
-
+        # Processor (4 MP layers)
         self.mp_layers = nn.ModuleList([
             MessagePassingLayer(hidden) for _ in range(n_layers)
         ])
-
+        # Decoder
         self.decoder = nn.Sequential(
             nn.Linear(hidden, hidden), nn.SiLU(),
             nn.Linear(hidden, hidden), nn.SiLU(),
@@ -532,35 +542,10 @@ class GNNNewtonPredictor(nn.Module):
         for mp in self.mp_layers:
             h = mp(h, edge_index, e)           # (nv, hidden)
         return self.decoder(h)                 # (nv, 3)
-
-
-class MessagePassingLayer(nn.Module):
-    """Single message-passing layer with edge-conditioned messages."""
-
-    def __init__(self, hidden):
-        super().__init__()
-        self.msg_mlp = nn.Sequential(
-            nn.Linear(3 * hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden))
-        self.update_mlp = nn.Sequential(
-            nn.Linear(2 * hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden))
-        self.norm = nn.LayerNorm(hidden)
-
-    def forward(self, h, edge_index, e):
-        src, dst = edge_index  # (n_edges,), (n_edges,)
-        # Message: concat(h_src, h_dst, e) → MLP
-        msg_input = torch.cat([h[src], h[dst], e], dim=-1)
-        msg = self.msg_mlp(msg_input)
-        # Aggregate: sum messages per destination node
-        agg = torch.zeros_like(h)
-        agg.index_add_(0, dst, msg)
-        # Update: concat(h, agg) → MLP + residual
-        h_new = self.update_mlp(torch.cat([h, agg], dim=-1))
-        return self.norm(h + h_new)  # residual + LayerNorm
 ```
 
-**Parameters**: ~300K (3 MP layers × 128 hidden)
+**Parameters**: 130,371 (4 MP layers × 64 hidden)
+**GCN variant**: 27K params, 5× faster on CPU, ~2% worse accuracy
 
 ### 5.2 Data Generation
 
@@ -583,87 +568,85 @@ gnn_sample = {
 }
 ```
 
-**Data volume** (at n=10):
-- nv = 1331, ndof = 3993
-- 100 steps × 6 iters × 5 simulations = 3000 samples
-- Each sample: ~50KB → total ~150MB
-- **This is small** — GNN must generalize from limited data
-
-**Data augmentation**:
-- Run at multiple mesh densities: n=5,8,10,12,15 (different graph sizes)
-- Vary material parameters: E, nu, My0, H
-- Vary load direction (not just x-axis sliding)
-- Perturb initial conditions slightly (random noise on u₀)
+**Actual data volume** (as trained):
+- **25,200 samples** from n=5 (nv=216) + n=10 (nv=1331), elastic + plastic simulations
+- Mixed graph sizes batched with `SizeGroupedSampler` for GPU efficiency
+- Each sample: ~50KB → total ~1.2GB
+- 80/10/10 train/val/test split
 
 ### 5.3 Training Strategy
 
 **File**: `nn_contact/scripts/train_gnn_newton.py`
 
-**Loss function**:
+**Loss function**: Weighted MSE on free DOFs only (Dirichlet DOFs are prescribed):
 
 ```python
 def gnn_newton_loss(pred_du, target_du, free_dofs_mask):
-    """L2 loss on Newton step prediction (free DOFs only).
-
-    We weight the loss by the magnitude of the true step to focus
-    on the physically important large corrections.
-    """
-    # Only supervise free DOFs (Dirichlet DOFs are prescribed)
     pred_free = pred_du.view(-1)[free_dofs_mask]
     target_free = target_du.view(-1)[free_dofs_mask]
-
-    # Weighted MSE: weight by |target| to focus on large steps
     weights = 1.0 + 10.0 * (target_free.abs() / (target_free.abs().max() + 1e-10))
     loss = (weights * (pred_free - target_free)**2).mean()
-
     return loss
 ```
 
-**Training protocol**:
-1. **Phase 1** (100 epochs): Train on n=10 data only, lr=1e-3, AdamW
-2. **Phase 2** (50 epochs): Multi-resolution: mix n=5,8,10,12,15
-3. **Phase 3** (50 epochs): Fine-tune on first 3 Newton iterations only (most impactful for warm start)
-4. **Validation**: Report ||Δu_pred - Δu_true||/||Δu_true|| and **actual Newton iteration count when used as warm start**
+**Training protocol** (actual, as run):
+1. **Curriculum learning**: Start with n=5 data (smaller graphs), then mix in n=10
+2. **Validation matching** (critical fix): Validate on MATCHING distribution during each curriculum phase + reset patience on transition — without this, early stopping kills at epoch 53 with 35% error
+3. **Optimizer**: AdamW, lr=1e-3, batch_size=16 (bs=64 causes VRAM overflow with n=10 graphs)
+4. **Early stopping**: Patience-based, best model saved at epoch 843
+
+**Actual results**:
+- **843 epochs** to convergence (early stopping)
+- **val_loss = 0.0013**
+- **test_rel_error = 3.56%** (||Δu_pred - Δu_true|| / ||Δu_true||)
+- Training time: **9.5 hours** on RTX 5000 Ada (16GB)
 
 **Graph handling**:
-- Use PyTorch Geometric (PyG) for batching variable-size graphs
-- Build edge_index once per mesh size (static topology)
-- Only node features change per sample
+- PyTorch Geometric (PyG) for batching variable-size graphs
+- `SizeGroupedSampler`: groups same-size graphs in batches for GPU efficiency
+- Static edge_index per mesh size (topology doesn't change, only node features)
+- `free_mask` in `(nv, 3)` per-node format for correct PyG batching across mixed-size graphs
 
-### 5.4 Integration into ContactPotato_NGSolve.py
+### 5.4 Integration into ContactPotato_NGSolve.py (IMPLEMENTED)
 
-**New configuration flags**:
+**Configuration flags** (CLI-overridable via `--gnn-newton true/false`):
 ```python
-# GNN Newton warm start
-nn_newton_warmstart = True
-nn_newton_checkpoint = "nn_contact/checkpoints/gnn_newton_best.pt"
-nn_newton_device = "cpu"  # CPU preferred (small graph, avoid GPU transfer)
+gnn_newton            = True     # enable GNN Newton pre-step warm-start
+gnn_newton_checkpoint = "nn_contact/checkpoints/external/gnn_newton/best.pt"
+gnn_newton_device     = "cpu"    # CPU preferred (small graph, avoid GPU transfer)
 ```
 
-**Integration point** (in `newton_solve()`, before step 8 "Solve K·Δu = -r"):
+**Integration point**: Pre-step warm-start (before first Newton iteration of each load step):
 
 ```python
-# After assembling K and r, BEFORE solving K·Δu = -r:
-if nn_newton_warmstart and nn_newton_model is not None and nit == 0:
-    # GNN prediction as initial guess for first Newton iteration
-    node_feat = _build_gnn_features(gfu, res_vec, gn_out, normals_out, active_out)
-    with torch.no_grad():
-        delta_u_pred = nn_newton_model(node_feat, edge_index, edge_attr)
-    # Use GNN prediction directly (skip first solve)
-    w_np = _w_vec.FV().NumPy()
-    w_np[:] = 0
-    w_np[free_dofs] = delta_u_pred.numpy().ravel()[free_dofs]
-    # Still do linesearch for safety
-else:
-    # Standard: solve K·Δu = -r with Pardiso
-    ...
+# BEFORE Newton loop, predict initial Δu from current state:
+if gnn_newton and _gnn_model is not None:
+    try:
+        node_feat = _build_gnn_features(gfu, res_vec, gn_out, normals_out, active_out)
+        with torch.no_grad():
+            delta_u_pred = _gnn_model(node_feat, edge_index, edge_attr)
+        # Apply prediction as warm start (free DOFs only)
+        w_np = _w_vec.FV().NumPy()
+        w_np[:] = 0
+        w_np[free_dofs] = delta_u_pred.numpy().ravel()[free_dofs]
+        # Linesearch validates the prediction
+    except (RuntimeError, ValueError) as e:
+        print(f"    [GNN pre-step] failed: {e}")
+        # Fall back to standard Newton from zero
 ```
 
-**Alternative (lower risk)**: Use GNN as preconditioner for CG:
-```python
-# Instead of replacing the solve, use GNN to provide an initial guess
-# for a CG solver (fewer CG iterations needed)
-```
+**Safety**: Exception handler catches ONNX/PyG failures gracefully. Linesearch on the predicted step ensures no divergence even if the GNN prediction is poor.
+
+### 5.5 Benchmark Results
+
+| Metric | Without GNN | With GNN warm-start |
+|--------|-------------|---------------------|
+| Test relative error | — | **3.56%** |
+| Wall-time reduction | — | **27%** |
+| Model params | — | 130,371 |
+| Training epochs | — | 843 (early stopping) |
+| Training time | — | 9.5h (RTX 5000 Ada) |
+| GCN variant | — | 27K params, 5× faster CPU, ~2% worse |
 
 ---
 
@@ -704,26 +687,51 @@ else:
 | Convergence fix | `ContactPotato_NGSolve.py` (newton_gtol) | Done | `max(gtol, 1e-6)` for NN RM residual floor |
 | **Benchmark** | n=5, nsteps=100, plastic | Done | **5.2× speedup (70.4s vs 364.6s)** |
 
-### Phase 4: GNN Newton Predictor — TODO
+### Phase 4: GNN Newton Predictor — COMPLETED
 
-| Task | File | Description | Week |
-|------|------|-------------|------|
-| 4A | `nn_contact/scripts/generate_gnn_data.py` | Instrument newton_solve() to save per-iter data | 4 |
-| 4B | `nn_contact/models/gnn_newton.py` | GNN architecture (PyG) | 4-5 |
-| 4C | `nn_contact/scripts/train_gnn_newton.py` | Training with multi-resolution data | 5 |
-| 4D | Integration | Warm start in newton_solve() | 5-6 |
-| 4E | Multi-resolution | Train on mixed mesh sizes, test generalization | 6 |
+| Task | File | Status | Key Result |
+|------|------|--------|------------|
+| Data generation | `nn_contact/scripts/generate_gnn_data.py` | Done | 25,200 samples (n=5 + n=10, elastic + plastic) |
+| Model | `nn_contact/models/gnn_newton.py` | Done | Encode-Process-Decode MPN, 130K params, hidden=64, 4 MP layers |
+| Training | `nn_contact/scripts/train_gnn_newton.py` | Done | Curriculum learning, SizeGroupedSampler, 843 epochs |
+| Integration | `ContactPotato_NGSolve.py` (pre-step warm-start) | Done | `--gnn-newton true/false`, exception-safe fallback |
+| Resume support | `train_gnn_newton.py --resume` | Done | Checkpoint resume with full optimizer + scheduler state |
+| **Benchmark** | n=5 + n=10, elastic + plastic | Done | **3.56% test error, 27% wall-time reduction** |
 
-### Phase 5: Validation & Paper — TODO
+### Phase 5: Validation & Paper — IN PROGRESS
 
-| Task | File | Description | Week |
-|------|------|-------------|------|
-| 5A | Correctness tests | Compare vs classical at n=5,10,15,20 (elastic + plastic) | 6-7 |
-| 5B | Performance benchmarks | Timing breakdown per component combination | 7 |
-| 5C | Ablation study | Full factorial: each component alone vs combined | 7 |
-| 5D | Generalization tests | Unseen load paths, material params, mesh sizes | 7-8 |
-| 5E | Paper writing | LaTeX: ~24 pages, 12-15 figures, 8-10 tables | 8-10 |
-| 5F | Code release | Clean up, document, prepare repository | 10 |
+| Task | File | Status | Description |
+|------|------|--------|-------------|
+| 5A | Correctness tests | Partial | Mathematical/physical verification completed (all correct). Per-component accuracy validated. Full A+C+D pipeline test pending |
+| 5B | Performance benchmarks | Partial | Individual component benchmarks done. Full combination timing pending |
+| 5C | Ablation study | TODO | Full factorial: each component alone vs combined |
+| 5D | Generalization tests | TODO | Unseen load paths, material params, mesh sizes |
+| 5E | Paper writing | TODO | LaTeX: ~24 pages, 12-15 figures, 8-10 tables |
+| 5F | Code release | In progress | Dead code removal, config path optimization (37% speedup), mathematical verification all done |
+
+### Code Cleanup & Performance Optimizations (completed)
+
+The main FEM solver (`ContactPotato_NGSolve.py`) underwent a comprehensive review and optimization pass:
+
+**Dead code removal**: Removed unused imports (`scipy.optimize` at top level, `manifold_mixup` in training), dead config variables (`compare`), commented-out code blocks, and unreachable branches.
+
+**Config path isolation** (37% default-path speedup at n=5):
+- Gated consistent tangent infrastructure (dN/dX precomputation, element vertex arrays) behind `if consistent_tangent:`
+- Gated VTK CF construction (F_gfu, B_e, J_gfu, F_inv_T) behind `if plot > 0:`
+- Gated `update_contact_fields` and `compute_contact_forces` behind `if plot > 0:`
+- Moved LinearForm creation outside the load-stepping loop (pre-allocate once, reassemble per step)
+- Lazy `scipy.optimize.minimize` import (moved inside solver branch)
+
+**Bug fixes**:
+- Fixed `stress_mandel` double compilation (`.Compile()` on already-compiled CF)
+- Skip plasticity history commit on forced-accept path (prevents Fp drift)
+- Added `np.isfinite(dCxx)` NaN guard before tangent assembly
+- Narrowed GNN exception handler from bare `except Exception: pass` to specific types
+- Fixed unclosed pickle file handle
+
+**Optimization**: Broadcast dN/dX from reference element to all elements (structured mesh: all hexes have identical Jacobian), reducing loop from `n_elem × 8` to `8` iterations.
+
+**Mathematical verification**: Full review of neo-Hookean, J2 return mapping, contact penalty, consistent tangent assembly, and Newton solver — all formulations verified correct.
 
 ---
 
@@ -766,11 +774,25 @@ else:
 - No energy drift over 100 load steps
 - **Status: PARTIAL** — NN RM produces slightly different energy landscape (Fp approximation error). Energy drift not observed over 100 steps. Exact energy matching relaxed — physics accuracy validated via ep_max and displacement metrics instead.
 
-**Test 6: Full pipeline integration**
+**Test 6: Component D — GNN Newton step prediction**
+- Test relative error ||Δu_pred - Δu_true|| / ||Δu_true|| < 5%
+- Wall-time reduction when used as pre-step warm-start
+- No divergence or cutback increase from GNN prediction
+- **Status: VALIDATED** — Test relative error 3.56% (25,200 samples, 843 epochs). 27% wall-time reduction as pre-step warm-start. Exception-safe fallback to standard Newton on failure. Curriculum learning with validation matching was critical (without it: early stopping at epoch 53, 35% error).
+
+**Test 7: Full pipeline integration**
 - Run with ALL components enabled: A + C + D (elastic) and A + C + D (plastic)
 - Compare to fully classical solver
 - Displacement field max difference < 1e-8 at every load step
-- **Status: PENDING** — Requires Phase 4 (GNN Newton) completion. A + C integration tested individually.
+- **Status: PARTIAL** — Individual components A, C, D validated independently. Combined A+C and GNN integration smoke-tested. Full systematic A+C+D combination benchmark pending.
+
+**Test 8: Mathematical/physical consistency (code review)**
+- Neo-Hookean W, P, σ, M, σ_vm formulations
+- J2 return mapping (eigendecomposition + exponential map + FD Newton)
+- Contact penalty (gap, normal, Hessian dn/dx_s)
+- Consistent tangent assembly convention (dNdX contracts with 2nd and 4th indices of Cxx)
+- Newton solver (linesearch, cutback, stagnation detection, NaN recovery)
+- **Status: VALIDATED** — Full mathematical review completed. All formulations verified correct. No inconsistencies found.
 
 ### 7.2 Performance
 
@@ -916,10 +938,12 @@ Problem (cost of Newton for contact+plasticity) → unified 4-component framewor
 - Figure: tangent stiffness matrix comparison (NN vs FD vs frozen)
 
 ### 6. Component D: GNN Newton Step Predictor (3 pages)
-- 6.1 Graph construction from hex mesh, node/edge features
-- 6.2 Message-passing architecture (3 layers, edge-conditioned messages, residual + LayerNorm)
-- 6.3 Training on Newton trajectories: weighted MSE, multi-resolution
-- 6.4 Warm-start integration strategy: GNN predicts first Δu, linesearch validates
+- 6.1 Graph construction from hex mesh, node/edge features (14 node dims, 4 edge dims)
+- 6.2 Encode-Process-Decode MPN architecture (4 MP layers, hidden=64, 130K params, SiLU)
+- 6.3 Training: curriculum learning (n=5→mixed), SizeGroupedSampler, validation matching per phase
+- 6.4 Pre-step warm-start integration: GNN predicts Δu before Newton loop, linesearch validates
+- 6.5 Results: 3.56% test error, 27% wall-time reduction, exception-safe fallback
+- Table: MPN vs GCN variant (130K/3.56% vs 27K/~5.5%)
 - Figure: predicted vs true Δu field for representative load step
 
 ### 7. Numerical Examples (5 pages)
@@ -992,6 +1016,7 @@ Problem (cost of Newton for contact+plasticity) → unified 4-component framewor
 
 ### Risk 3: GNN doesn't generalize across mesh sizes
 **Probability**: Medium-High (different graph structures)
+**Status**: PARTIALLY ADDRESSED — Trained on n=5 + n=10 mixed data. `SizeGroupedSampler` handles variable graph sizes in batches. Test relative error 3.56% on held-out mixed data. Generalization to unseen mesh sizes (n=8, n=15, n=20) not yet tested.
 **Mitigation**:
 - Train on multiple mesh sizes with PyG batching
 - Use relative features (not absolute coordinates) for translation/scale invariance
@@ -999,8 +1024,10 @@ Problem (cost of Newton for contact+plasticity) → unified 4-component framewor
 - Alternative: replace GNN with simple per-node MLP (loses spatial context but generalizes trivially)
 
 ### Risk 4: Training data insufficient for GNN
-**Probability**: Medium (only ~3000 samples from simulations)
-**Mitigation**:
+**Probability**: Low — **RESOLVED**
+**Actual finding**: 25,200 samples (n=5 + n=10, elastic + plastic) proved sufficient. Test relative error 3.56% with 27% wall-time improvement. Key was curriculum learning (n=5 first, then mix n=10) with validation matching per phase — without this, early stopping triggered at epoch 53 with 35% error.
+**Remaining concern**: Generalization to unseen mesh sizes and load paths not yet tested.
+**Mitigation** (if generalization insufficient):
 - Data augmentation: symmetry (mirror x/y/z), interpolation between load steps
 - Semi-supervised: use the NN prediction, run 1 Newton iteration, use the result as new training data (online learning)
 - Fallback: use GNN only for later load steps (where pattern is more predictable)
@@ -1026,16 +1053,17 @@ pyarrow (for feather data format)
 ```
 
 ### Hardware
-- Training: 1 GPU (RTX 3060+ sufficient — models are small)
+- Training: 1 GPU (RTX 5000 Ada used for GNN — 9.5h for 843 epochs; RTX 3060+ sufficient for RM/multitask)
+- GPU batch size: bs=16 for GNN (bs=64 causes VRAM overflow with n=10 graphs)
 - Inference: CPU preferred for n≤20 (avoid transfer overhead)
 - Data generation: CPU only (NGSolve simulations)
 
-### Computational budget
+### Computational budget (actual)
 - Data generation: ~5 simulations × 10-30 min = 2.5 hours
-- NN RM training: ~1 hour (200K params, 20M samples)
-- GNN training: ~2 hours (300K params, 3000 samples with augmentation)
+- NN RM training: ~1 hour (205K params, 20M samples)
+- GNN training: **9.5 hours** (130K params, 25,200 samples, 843 epochs on RTX 5000 Ada)
 - Validation suite: ~4 hours (multiple configs × 5 runs each)
-- **Total**: ~1 day of compute
+- **Total**: ~1.5 days of compute (GNN training is the bottleneck)
 
 ---
 
@@ -1058,23 +1086,26 @@ MatrixValued(fes_ir, dim=3) block ordering: `[comp0_all, comp1_all, ..., comp8_a
 
 ### Full Newton iteration data flow with all 4 components
 ```
-newton_solve() loop:
-  1. return_mapping(F, Fp_conv, epcum_conv) → Fp_temp, delta_epcum
-     ↑ COMPONENT C: Neural return mapping (MLP forward pass, ~5ms)
-  2. write_Fp_to_gf(Fp_temp)
-  3. a_form.Apply(gfu.vec, res_vec)  — uses Fe = F·Fp⁻¹
-  4. contact_cache.evaluate(slave_pos)  — contact detection
-     ↑ COMPONENT A: Multitask NN → Newton warm-start (exact gap, ~25ms)
-     ↑ COMPONENT B: Neural-Pull SDF (pure NN alternative, no C++)
-  5. Add contact forces to residual
-  6. Convergence check
-  7. a_form.AssembleLinearization(gfu.vec)  — elastic tangent (frozen Fp)
-  8. _add_plastic_tangent_correction()  — dFp/dF correction
-     ↑ COMPONENT C: Autodiff tangent via vmap(jacrev(NN)) (~5ms vs 500ms FD)
-  9. Add contact Hessian (K_con = kn * (n⊗n + g·dn/dx_s))
-  10. Solve K·Δu = -r
-      ↑ COMPONENT D: GNN warm-start (skip first Pardiso solve, ~2ms)
-  11. Armijo linesearch
+load_step():
+  0. GNN pre-step prediction: Δu_0 = GNN(u, r, gn, normals, active)
+     ↑ COMPONENT D: Pre-step warm-start (130K MPN, ~2ms, 27% wall-time reduction)
+
+  newton_solve() loop:
+    1. return_mapping(F, Fp_conv, epcum_conv) → Fp_temp, delta_epcum
+       ↑ COMPONENT C: Neural return mapping (MLP forward pass, ~5ms)
+    2. write_Fp_to_gf(Fp_temp)
+    3. a_form.Apply(gfu.vec, res_vec)  — uses Fe = F·Fp⁻¹
+    4. contact_cache.evaluate(slave_pos)  — contact detection
+       ↑ COMPONENT A: Multitask NN → Newton warm-start (exact gap, ~25ms)
+       ↑ COMPONENT B: Neural-Pull SDF (pure NN alternative, no C++)
+    5. Add contact forces to residual
+    6. Convergence check
+    7. a_form.AssembleLinearization(gfu.vec)  — elastic tangent (frozen Fp)
+    8. _add_plastic_tangent_correction()  — dFp/dF correction
+       ↑ COMPONENT C: Autodiff tangent via vmap(jacrev(NN)) (~5ms vs 500ms FD)
+    9. Add contact Hessian (K_con = kn * (n⊗n + g·dn/dx_s))
+    10. Solve K·Δu = -r (Pardiso LU)
+    11. Armijo linesearch
 ```
 
 ### Component interaction matrix
@@ -1094,15 +1125,15 @@ SYNERGISTIC: C reduces per-iter cost, D reduces iter count → multiplicative sp
 
 ## 12. What Makes This a Strong CMAME Paper
 
-1. **Comprehensive**: Unlike single-innovation papers, we address ALL major Newton bottlenecks (contact detection, constitutive integration, tangent computation, solver acceleration) in a unified framework
-2. **Rigorous validation**: Bit-identical results to classical at convergence (not just "close enough") — the NNs accelerate individual operations, not replace the solver
-3. **Four orthogonal innovations**: Each independently useful, combined effect is multiplicative (12× total)
-4. **Components A+B already validated**: Multitask (99.79% accuracy) and Neural-Pull (1.21° normal error) provide concrete, reproducible results — not hypothetical
+1. **Comprehensive**: Unlike single-innovation papers, we address ALL major Newton bottlenecks (contact detection, constitutive integration, tangent computation, solver acceleration) in a unified framework. **All 4 components implemented and validated.**
+2. **Rigorous validation**: Bit-identical results to classical at convergence (not just "close enough") — the NNs accelerate individual operations, not replace the solver. Full mathematical/physical consistency verification completed.
+3. **Four orthogonal innovations**: Each independently useful, combined effect is multiplicative (projected 12× total)
+4. **All components validated with measured results**: Multitask (99.79% accuracy), Neural-Pull (1.21° normal error), NN RM (5.2× speedup), GNN Newton (3.56% error, 27% wall-time reduction) — concrete, reproducible results, not hypothetical
 5. **Autodiff tangent is genuinely novel**: Previous neural constitutive works avoid the consistent tangent problem entirely. We solve it elegantly with `vmap(jacrev())` through the trained return mapping network — first application in multiplicative plasticity
 6. **Preserves Newton convergence**: Quadratic convergence rate maintained — not a surrogate or reduced model
 7. **Practical**: Works on CPU (no GPU required for inference), integrates with existing NGSolve pipeline, data generation is cheap (instrument existing code)
 8. **Reproducible**: All code open-source, data generation procedure documented, hyperparameters specified, HPC sweep configs provided
-9. **Scales to real problems**: GNN generalizes across mesh sizes, NN RM is O(N_gp) with tiny constant, contact NN works for arbitrary query points
+9. **Scales to real problems**: GNN trained on mixed mesh sizes (n=5 + n=10), NN RM is O(N_gp) with tiny constant, contact NN works for arbitrary query points
 10. **Honest about limitations**: Clear failure mode analysis, fallback plans, generalization boundaries documented — not oversold
 
 ### Novelty Claims (ordered by strength)

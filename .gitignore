@@ -39,3 +39,7 @@ ContactData*
 *.npy
 *.log
 *.npz
+paper_nn*
+*.sty
+*.cls
+*.bst
